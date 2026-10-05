@@ -22,6 +22,7 @@
 #include <linux/debugfs.h>
 #include <linux/regmap.h>
 #include <linux/seq_file.h>
+#include <net/tcp.h>
 
 #include "qca_ppe.h"
 
@@ -341,10 +342,52 @@ static void ppe_flow_age_timer_set(struct qca_ppe_priv *priv, u32 *ctrl)
 		 FIELD_PREP(PPE_FLOW_AGE_TIMER_UNIT, PPE_FLOW_AGE_UNIT_SEC);
 }
 
+/* A packet of an offloaded flow that the software fast path would leave to
+ * the stack goes to the CPU, and the entry keeps forwarding the rest: IPv4
+ * options, IPv6 extension headers, a TCP or UDP header cut short, and a FIN,
+ * RST or SYN, which the flowtable takes as a teardown or the reuse of a
+ * closing flow. Every exception is written, so none keeps what an earlier
+ * owner of the table set. A pattern left at its reset value matches every TCP
+ * packet, so the patterns are written before their exceptions are enabled.
+ */
+static void ppe_flow_excep_init(struct qca_ppe_priv *priv)
+{
+	static const u8 rdt[] = {
+		PPE_EXCEP_IPV4_OPTION, PPE_EXCEP_IPV6_EXT_HDR,
+		PPE_EXCEP_TCP_HDR_SHORT, PPE_EXCEP_UDP_HDR_SHORT,
+	};
+	DECLARE_BITMAP(on, PPE_L3_EXCEPTIONS) = {};
+	unsigned long trap = PPE_FLOW_TCP_TRAP;
+	u32 ctrl[2] = {};
+	int bit, n = 0;
+
+	for_each_set_bit(bit, &trap, BITS_PER_LONG) {
+		ctrl[n / 2] |= (FIELD_PREP(PPE_L4_EXCEP_FLAGS, BIT(bit)) |
+				FIELD_PREP(PPE_L4_EXCEP_MASK, BIT(bit)))
+			       << (n % 2 * PPE_L4_EXCEP_SLOT_SHIFT);
+		__set_bit(PPE_EXCEP_TCP_FLAGS(n), on);
+		n++;
+	}
+	regmap_write(priv->regmap, PPE_L4_EXCEP_TCP_FLAGS(0), ctrl[0]);
+	regmap_write(priv->regmap, PPE_L4_EXCEP_TCP_FLAGS(2), ctrl[1]);
+
+	for (n = 0; n < ARRAY_SIZE(rdt); n++)
+		__set_bit(rdt[n], on);
+
+	for (n = 0; n < PPE_L3_EXCEPTIONS; n++) {
+		bool en = test_bit(n, on);
+
+		regmap_write(priv->regmap, PPE_L3_EXCEP_CMD(n),
+			     en ? FIELD_PREP(PPE_L3_EXCEP_ACTION,
+					     PPE_L3_EXCEP_RDT_TO_CPU) : 0);
+		regmap_write(priv->regmap, PPE_L3_EXCEP_L3_FLOW_EN(n), en);
+	}
+}
+
 void ppe_flow_init(struct qca_ppe_priv *priv)
 {
-	u32 ctrl;
 	int type, dir;
+	u32 ctrl;
 
 	/* A miss has to forward: with the lookup enabled and no entry matching,
 	 * any other action would black-hole traffic the driver never saw.
@@ -355,9 +398,7 @@ void ppe_flow_init(struct qca_ppe_priv *priv)
 	 *
 	 * The neighbouring TCP_SPECIAL bypass stays off: on this generation it
 	 * takes every TCP packet out of the lookup, not just the flagged ones.
-	 * A connection's FIN and RST are therefore forwarded in hardware and its
-	 * entry goes on the flowtable's idle timeout, as it does on every driver
-	 * whose hardware never shows it the teardown.
+	 * FIN and RST reach the CPU through the TCP flag exceptions instead.
 	 */
 	for (type = 0; type < PPE_FLOW_PKT_TYPES; type++) {
 		u32 val = 0;
@@ -380,6 +421,8 @@ void ppe_flow_init(struct qca_ppe_priv *priv)
 
 		regmap_write(priv->regmap, PPE_FLOW_CTRL1(type), val);
 	}
+
+	ppe_flow_excep_init(priv);
 
 	/* Both hash blocks are searched on every op, so both bucket functions
 	 * place the entries here and both are set explicitly rather than
