@@ -482,6 +482,7 @@ static void nss_core_halt(struct nss_core *core)
 	nss_flow_flush();
 	nss_mc_flush();
 	nss_redir_halt(core);
+	nss_xlat_halt(core);
 
 	nss_log_shadow_stop(core);
 	nss_rings_stop(core);
@@ -1241,6 +1242,13 @@ static int nss_redir_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(nss_redir);
 
+static int nss_xlat_show(struct seq_file *s, void *unused)
+{
+	nss_xlat_print(s);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(nss_xlat);
+
 static int nss_mesh_show(struct seq_file *s, void *unused)
 {
 	nss_mesh_print(s);
@@ -1439,6 +1447,7 @@ static int nss_probe(struct platform_device *pdev)
 	nss_flow_bind(core);
 	nss_mc_bind(core);
 	nss_redir_bind(core);
+	nss_xlat_bind(core);
 
 	core->debugfs = debugfs_create_dir(dev_name(dev), NULL);
 	debugfs_create_file("boot", 0600, core->debugfs, core, &nss_boot_fops);
@@ -1466,6 +1475,8 @@ static int nss_probe(struct platform_device *pdev)
 			    &nss_mesh_fops);
 	debugfs_create_file("redir", 0400, core->debugfs, core,
 			    &nss_redir_fops);
+	debugfs_create_file("xlat", 0400, core->debugfs, core,
+			    &nss_xlat_fops);
 
 	return 0;
 }
@@ -1488,6 +1499,7 @@ static void nss_remove(struct platform_device *pdev)
 	flush_work(&core->edma_reset);
 	/* After the halt, which forgets the bound core's node pairs. */
 	nss_redir_bind(NULL);
+	nss_xlat_bind(NULL);
 	dev_put(core->conduit);
 	nss_clocks_disable(core);
 }
@@ -1527,12 +1539,18 @@ static int __init nss_module_init(void)
 	if (ret)
 		goto mc;
 
-	ret = platform_driver_register(&nss_driver);
+	ret = nss_xlat_init();
 	if (ret)
 		goto redir;
 
+	ret = platform_driver_register(&nss_driver);
+	if (ret)
+		goto xlat;
+
 	return 0;
 
+xlat:
+	nss_xlat_exit();
 redir:
 	nss_redir_exit();
 mc:
@@ -1547,6 +1565,7 @@ module_init(nss_module_init);
 static void __exit nss_module_exit(void)
 {
 	platform_driver_unregister(&nss_driver);
+	nss_xlat_exit();
 	nss_redir_exit();
 	nss_wifili_me_exit();
 	nss_mesh_exit();
