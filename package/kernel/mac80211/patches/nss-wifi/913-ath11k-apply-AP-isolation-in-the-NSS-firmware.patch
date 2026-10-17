@@ -1,0 +1,76 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] ath11k: apply AP isolation in the NSS firmware
+
+The NSS firmware forwards frames between the stations of an access point
+vdev, where mac80211's AP isolation does not reach. Send the vdev the
+client isolation command when AP isolation changes and whenever the vdev
+is registered, so a vdev registered again after a firmware restart does
+not start over forwarding.
+
+A vdev the command fails for keeps forwarding between stations that are
+meant to be isolated, so it is taken off the firmware instead, which
+stops its traffic, and the failure is logged.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -3512,6 +3512,36 @@ static bool ath11k_mac_supports_station_
+ 		chandef->chan->band == NL80211_BAND_6GHZ;
+ }
+ 
++/* The NSS firmware forwards between the stations of an access point vdev
++ * itself, where mac80211's AP isolation does not reach. An isolation the
++ * firmware was not given is one it does not apply, so a vdev that cannot be
++ * isolated is taken off the firmware, which stops its traffic, rather than
++ * left forwarding.
++ */
++static void ath11k_nss_vdev_isolate(struct ath11k_vif *arvif,
++				    struct ieee80211_vif *vif)
++{
++	struct wireless_dev *wdev = ieee80211_vif_to_wdev(vif);
++	bool isolate = vif->bss_conf.ap_isolate;
++	int ret;
++
++	if (arvif->nss_ifnum < 0 || vif->type != NL80211_IFTYPE_AP)
++		return;
++
++	ret = nss_wifi_vdev_ap_isolate(arvif->nss_ifnum, isolate);
++	if (!ret)
++		return;
++
++	ath11k_warn(arvif->ar->ab, "failed to %s AP isolation in the NSS firmware: %d\n",
++		    isolate ? "set" : "clear", ret);
++	if (!isolate)
++		return;
++
++	if (wdev && wdev->netdev)
++		nss_wifi_vdev_unregister(wdev->netdev);
++	arvif->nss_ifnum = -1;
++}
++
+ static void ath11k_mac_op_bss_info_changed(struct ieee80211_hw *hw,
+ 					   struct ieee80211_vif *vif,
+ 					   struct ieee80211_bss_conf *info,
+@@ -3871,6 +3901,9 @@ static void ath11k_mac_op_bss_info_chang
+ 			   vif->addr, arvif->arp_ns_offload.ipv4_addr);
+ 	}
+ 
++	if (changed & BSS_CHANGED_AP_ISOLATE)
++		ath11k_nss_vdev_isolate(arvif, vif);
++
+ 	mutex_unlock(&ar->conf_mutex);
+ }
+ 
+@@ -7110,6 +7143,11 @@ static int ath11k_nss_vdev_register(stru
+ 
+ 	arvif->nss_ifnum = ret;
+ 
++	/* A firmware restart registers the vdev again, and its isolation
++	 * starts over with it.
++	 */
++	ath11k_nss_vdev_isolate(arvif, vif);
++
+ 	return 0;
+ }
+ 
