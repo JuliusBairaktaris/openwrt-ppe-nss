@@ -366,7 +366,7 @@ static bool nss_flow_is_wireless(int ifindex)
  */
 static bool nss_flow_is_ours(int ifindex)
 {
-	return nss_flow_is_wireless(ifindex) || nss_rawip_bound(ifindex);
+	return nss_flow_is_wireless(ifindex) || nss_redir_bound(ifindex);
 }
 
 /* Everything the firmware is told about one direction, out of that
@@ -469,7 +469,7 @@ static int nss_flow_take_dir(struct nss_core *core, struct nss_flow_entry *e,
 	 * good as any.
 	 */
 	if (!is_valid_ether_addr(eth.h_dest) && out &&
-	    nss_rawip_bound(out->ifindex)) {
+	    out->type == ARPHRD_RAWIP && nss_redir_bound(out->ifindex)) {
 		ether_addr_copy(eth.h_dest, out->dev_addr);
 		if (!is_valid_ether_addr(eth.h_source))
 			ether_addr_copy(eth.h_source, out->dev_addr);
