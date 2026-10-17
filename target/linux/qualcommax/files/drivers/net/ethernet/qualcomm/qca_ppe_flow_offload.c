@@ -67,6 +67,7 @@ struct ppe_flow_entry {
 	u8 quiet;
 	bool sparse;
 	u8 src_if;
+	bool steer;
 	u32 host_index;
 	int nexthop;
 	int my_mac;
@@ -1217,7 +1218,8 @@ static void ppe_flow_account(struct qca_ppe_priv *priv,
 {
 	lockdep_assert_held(&priv->flow_lock);
 
-	if (!pkts)
+	/* The firmware forwards a steered flow and reports it itself. */
+	if (!pkts || entry->steer)
 		return;
 
 	entry->unread_packets += pkts;
@@ -1268,13 +1270,28 @@ static void ppe_flow_entry_destroy(struct qca_ppe_priv *priv,
 	ppe_flow_free_ingress(priv, entry);
 }
 
+/* Whether the NSS firmware forwards to @dev, which is then not a switch port. */
+static bool ppe_flow_fw_carries(struct qca_ppe_priv *priv,
+				struct net_device *dev)
+{
+	bool (*carries)(int ifindex);
+
+	if (ppe_flow_port_by_ifindex(priv, dev->ifindex) >= 0)
+		return false;
+
+	guard(rcu)();
+	carries = rcu_dereference(priv->fw_carries);
+
+	return carries && carries(dev->ifindex);
+}
+
 /* Encode the flow entry and its host half. The key is always the tuple as the
  * packet arrives: the destination address in the flow entry, the source address
  * in the host entry.
  */
 static void ppe_flow_encode(struct ppe_flow_data *data, bool v6, bool snat,
-			    bool dnat, u32 nexthop, u32 src_if, u32 *fw,
-			    u32 *hw)
+			    bool dnat, bool steer, u32 nexthop, u32 src_if,
+			    u32 *fw, u32 *hw)
 {
 	u32 fwd;
 
@@ -1296,11 +1313,18 @@ static void ppe_flow_encode(struct ppe_flow_data *data, bool v6, bool snat,
 	ppe_entry_set(fw, PPE_FLOW_E_PRI_PROFILE_OFF,
 		      PPE_FLOW_E_PRI_PROFILE_LEN, data->priority);
 
-	fwd = snat ? PPE_FLOW_FWD_SNAT : dnat ? PPE_FLOW_FWD_DNAT :
-						PPE_FLOW_FWD_ROUTE;
+	fwd = steer ? PPE_FLOW_FWD_BRIDGE : snat ? PPE_FLOW_FWD_SNAT :
+	      dnat ? PPE_FLOW_FWD_DNAT : PPE_FLOW_FWD_ROUTE;
 	ppe_entry_set(fw, PPE_FLOW_E_FWD_TYPE_OFF, PPE_FLOW_E_FWD_TYPE_LEN, fwd);
-	ppe_entry_set(fw, PPE_FLOW_E_NEXTHOP_OFF, PPE_FLOW_E_NEXTHOP_LEN,
-		      nexthop);
+	/* A bridged entry holds its egress port where a routed one holds
+	 * the nexthop, with no tag format to apply.
+	 */
+	if (steer)
+		ppe_entry_set(fw, PPE_FLOW_E_PORT_OFF, PPE_FLOW_E_PORT_LEN,
+			      QCA_PPE_CPU_PORT);
+	else
+		ppe_entry_set(fw, PPE_FLOW_E_NEXTHOP_OFF,
+			      PPE_FLOW_E_NEXTHOP_LEN, nexthop);
 	if (snat)
 		ppe_entry_set(fw, PPE_FLOW_E_NEW_PORT_OFF,
 			      PPE_FLOW_E_NEW_PORT_LEN, ntohs(data->sport_new));
@@ -1352,7 +1376,7 @@ static int ppe_flow_offload_replace(struct ppe_flow_block *fb,
 	struct ppe_flow_entry *entry;
 	struct ppe_flow_data data = {};
 	struct flow_action_entry *act;
-	bool snat, dnat, v6;
+	bool snat, dnat, v6, steer;
 	int i, ret, nfw, nhw, iport;
 
 	guard(mutex)(&priv->flow_lock);
@@ -1494,6 +1518,8 @@ static int ppe_flow_offload_replace(struct ppe_flow_block *fb,
 	    !is_valid_ether_addr(data.eth.h_dest))
 		return ppe_flow_reject(priv, PPE_REJECT_L2);
 
+	steer = ppe_flow_fw_carries(priv, data.odev);
+
 	switch (data.addr_type) {
 	case FLOW_DISSECTOR_KEY_IPV4_ADDRS: {
 		struct flow_match_ipv4_addrs match;
@@ -1533,8 +1559,11 @@ static int ppe_flow_offload_replace(struct ppe_flow_block *fb,
 	data.sport_new = data.sport;
 	data.dport_new = data.dport;
 
+	/* The firmware translates a steered connection; the switch only
+	 * hands it over.
+	 */
 	flow_action_for_each(i, act, &rule->action) {
-		if (act->id != FLOW_ACTION_MANGLE)
+		if (steer || act->id != FLOW_ACTION_MANGLE)
 			continue;
 
 		switch (act->mangle.htype) {
@@ -1594,15 +1623,19 @@ static int ppe_flow_offload_replace(struct ppe_flow_block *fb,
 		goto err_free;
 	}
 
-	ret = ppe_flow_alloc_egress(priv, &data, snat, dnat, entry);
+	entry->steer = steer;
+	if (steer)
+		entry->oport = QCA_PPE_CPU_PORT;
+	else
+		ret = ppe_flow_alloc_egress(priv, &data, snat, dnat, entry);
 	if (ret) {
 		priv->flow_reject[ret == -ENOSPC ? PPE_REJECT_RESOURCE :
 				  PPE_REJECT_EGRESS_PORT]++;
 		goto err_ingress;
 	}
 
-	ppe_flow_encode(&data, v6, snat, dnat, entry->nexthop, entry->src_if,
-			fw, hw);
+	ppe_flow_encode(&data, v6, snat, dnat, steer, entry->nexthop,
+			entry->src_if, fw, hw);
 
 	nfw = v6 ? PPE_FLOW_ENTRY_WORDS_V6 : PPE_FLOW_ENTRY_WORDS_V4;
 	nhw = v6 ? PPE_HOST_ENTRY_WORDS_V6 : PPE_HOST_ENTRY_WORDS_V4;
@@ -1691,6 +1724,8 @@ static int ppe_flow_offload_stats(struct qca_ppe_priv *priv,
 				       ppe_flow_ht_params);
 	if (!entry)
 		return -ENOENT;
+	if (entry->steer)
+		return 0;
 
 	/* The hit counter does not advance for every forwarding type, but any
 	 * hit rewinds the entry's age to its maximum while the hardware
