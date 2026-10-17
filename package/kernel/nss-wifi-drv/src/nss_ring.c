@@ -777,7 +777,7 @@ static int nss_poll_n2h(struct napi_struct *napi, int budget)
 				 * firmware did not route comes back in its own
 				 * buffer, as a packet rather than a completion.
 				 */
-				if (nss_rawip_recv(core, desc, skb))
+				if (nss_redir_recv(core, desc, skb))
 					goto next;
 				dma_unmap_single(core->dev, NSS_SKB_CB(skb)->dma,
 						 skb_end_pointer(skb) - skb->head,
@@ -790,7 +790,7 @@ static int nss_poll_n2h(struct napi_struct *napi, int budget)
 					goto next;
 				}
 				atomic_dec(&core->buffers_queued);
-				if (nss_rawip_recv(core, desc, skb) ||
+				if (nss_redir_recv(core, desc, skb) ||
 				    nss_mesh_recv(core, napi, desc, skb) ||
 				    nss_data_recv(core, napi, desc, skb))
 					goto next;
