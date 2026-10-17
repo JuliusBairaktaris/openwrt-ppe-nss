@@ -120,6 +120,18 @@ static u8 nss_wifili_pdevs;
 static int nss_wifili_radio_if[NSS_WIFILI_MAX_PDEV_NUM_MSG];
 static DEFINE_MUTEX(nss_wifili_lock);
 
+/* The device of the radio whose rings the firmware reaps. Every interface on
+ * it is the firmware's, with or without a virtual device of its own. It is a
+ * platform device, so it outlives the WLAN driver and its address stays its
+ * own.
+ */
+static struct device *nss_wifili_radio;
+
+bool nss_wifili_owns(const struct net_device *dev)
+{
+	return dev->dev.parent && dev->dev.parent == READ_ONCE(nss_wifili_radio);
+}
+
 void nss_wifili_bind(struct nss_core *core)
 {
 	guard(mutex)(&nss_wifili_lock);
@@ -879,6 +891,8 @@ int nss_wifi_vdev_register(struct net_device *dev, u8 radio, u32 vdev_id,
 	struct nss_core *core;
 	int if_num, ret, i;
 
+	WRITE_ONCE(nss_wifili_radio, dev->dev.parent);
+
 	/* A core the WLAN driver's reset brings back is restarted behind it,
 	 * while the subsystem is already adding the interfaces again.
 	 */
@@ -974,6 +988,8 @@ int nss_wifi_mesh_register(struct net_device *dev, u8 radio, u32 vdev_id,
 	struct nss_dynamic_interface_msg d = {};
 	struct nss_core *core;
 	int if_num, ret, i;
+
+	WRITE_ONCE(nss_wifili_radio, dev->dev.parent);
 
 	guard(mutex)(&nss_wifili_lock);
 
