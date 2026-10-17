@@ -494,6 +494,7 @@ void nss_wifili_vdev_notify(struct nss_core *core, const struct nss_cmn_msg *ncm
 void nss_wifili_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
 		       u32 len);
 void nss_wifili_bind(struct nss_core *core);
+bool nss_wifili_owns(const struct net_device *dev);
 void nss_wifili_me_snoop(u32 if_num, struct sk_buff *skb);
 bool nss_wifili_rx_80211(u32 if_num, struct net_device *dev,
 			 struct sk_buff *skb, struct napi_struct *napi);
@@ -562,15 +563,15 @@ void nss_flow_notify(const struct nss_cmn_msg *ncm, u32 len);
 void nss_flow_print(struct seq_file *s);
 int nss_flow_init(void);
 void nss_flow_exit(void);
-bool nss_rawip_bound(int ifindex);
-bool nss_rawip_recv(struct nss_core *core, const struct n2h_descriptor *desc,
+bool nss_redir_bound(int ifindex);
+bool nss_redir_recv(struct nss_core *core, const struct n2h_descriptor *desc,
 		    struct sk_buff *skb);
-void nss_rawip_bind(struct nss_core *core);
-void nss_rawip_arm(struct nss_core *core);
-void nss_rawip_halt(struct nss_core *core);
-void nss_rawip_print(struct seq_file *s);
-int nss_rawip_init(void);
-void nss_rawip_exit(void);
+void nss_redir_bind(struct nss_core *core);
+void nss_redir_arm(struct nss_core *core);
+void nss_redir_halt(struct nss_core *core);
+void nss_redir_print(struct seq_file *s);
+int nss_redir_init(void);
+void nss_redir_exit(void);
 void nss_mc_bind(struct nss_core *core);
 void nss_mc_flush(void);
 void nss_mc_print(struct seq_file *s);
