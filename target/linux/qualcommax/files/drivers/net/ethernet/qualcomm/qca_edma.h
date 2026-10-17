@@ -190,6 +190,8 @@
 #define EDMA_QID2RID_QUEUES_PER_ENTRY	8
 #define EDMA_RSS_QUEUES			4
 #define EDMA_RSS_HASHED_QUEUES		12
+/* The switch CPU port owns queues 0-15. */
+#define EDMA_CPU_QUEUES			16
 
 /* TXDESC to TXCMPL ring mapping */
 #define EDMA_REG_TXDESC2CMPL_MAP(n) (0x0c + 0x4 * (n))
