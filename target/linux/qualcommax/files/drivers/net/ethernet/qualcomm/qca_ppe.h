@@ -1523,6 +1523,7 @@ struct qca_ppe_priv {
 	/* The groups an active-backup bond owns, one bit each. */
 	u8 trunk_backup;
 	u32 trunk_hash;
+	u32 port_fw_vsi[QCA_PPE_MAX_PORTS];
 	struct qca_ppe_bridge_vsi bridges[QCA_PPE_MAX_BRIDGES];
 	struct qca_ppe_vlan_entry vlans[PPE_VSI_MAX];
 	struct net_device *port_br_dev[QCA_PPE_MAX_PORTS];
@@ -1736,6 +1737,9 @@ int qca_ppe_port_vlan_del(struct dsa_switch *ds, int port,
 			  const struct switchdev_obj_port_vlan *vlan);
 
 void ppe_flow_init(struct qca_ppe_priv *priv);
+void ppe_flow_excep_init(struct qca_ppe_priv *priv);
+void ppe_qm_pri_map_init(struct qca_ppe_priv *priv);
+void ppe_rss_hash_init(struct qca_ppe_priv *priv);
 int ppe_flow_op(struct qca_ppe_priv *priv, u32 op_type,
 		const u32 *entry, int nentry, const u32 *host, int nhost,
 		u32 *index, u32 *host_index);
