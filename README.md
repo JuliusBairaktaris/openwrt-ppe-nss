@@ -1,108 +1,104 @@
-![OpenWrt logo](include/logo.png)
+# OpenWrt with PPE and NSS offload for IPQ807x and IPQ60xx
 
-OpenWrt Project is a Linux operating system targeting embedded devices. Instead
-of trying to create a single, static firmware, OpenWrt provides a fully
-writable filesystem with package management. This frees you from the
-application selection and configuration provided by the vendor and allows you
-to customize the device through the use of packages to suit any application.
-For developers, OpenWrt is the framework to build an application without having
-to build a complete firmware around it; for users this means the ability for
-full customization, to use the device in ways never envisioned.
+OpenWrt main with hardware offload for Qualcomm IPQ807x and IPQ60xx routers
+in the `qualcommax` target, such as the Xiaomi AX3600, Redmi AX6, Linksys
+MX4300 and MR7350, Dynalink DL-WRX36 and GL.iNet GL-AX1800. It runs
+OpenWrt's upstream `qca_edma` and `qca_ppe` ethernet and DSA drivers on
+kernel 6.18 and uses only in-kernel offload interfaces: no ECM, no NSS
+qdiscs and no vendor NSS host driver.
 
-Sunshine!
+| Traffic | Engine | Kernel interface |
+|---|---|---|
+| Routed IPv4/IPv6, NAT, PPPoE, 802.1Q VLAN | PPE | fw4 flowtable (`flow_offloading_hw`) |
+| Bridging, VLAN filtering, multicast snooping | PPE | switchdev |
+| SQM shaping and queue classes | PPE | tc qdisc and flower offload, DCB |
+| Wi-Fi data path of the SoC radios | NSS | `nss-wifi-drv`, ath11k |
+| Routed and bridged flows with a Wi-Fi end | NSS | fw4 flowtable, bridge conntrack |
+| Routed multicast to Wi-Fi | NSS | kernel multicast routing (MFC) |
+| Routed flows over a cellular modem (raw-IP device) | NSS | fw4 flowtable |
 
-## Download
+The PPE is the packet engine in the SoC's switch; `qca_ppe` programs it
+without firmware. `nss-wifi-drv` is a small host driver that boots the NSS
+firmware and hands it the ath11k rings. The Wi-Fi offload is on by default
+and is turned off with:
 
-Built firmware images are available for many architectures and come with a
-package selection to be used as WiFi home router. To quickly find a factory
-image usable to migrate from a vendor stock firmware to OpenWrt, try the
-*Firmware Selector*.
-
-* [OpenWrt Firmware Selector](https://firmware-selector.openwrt.org/)
-
-If your device is supported, please follow the **Info** link to see install
-instructions or consult the support resources listed below.
-
-##
-
-An advanced user may require additional or specific package. (Toolchain, SDK, ...) For everything else than simple firmware download, try the wiki download page:
-
-* [OpenWrt Wiki Download](https://openwrt.org/downloads)
-
-## Development
-
-To build your own firmware you need a GNU/Linux, BSD or macOS system (case
-sensitive filesystem required). Cygwin is unsupported because of the lack of a
-case sensitive file system.
-
-### Requirements
-
-You need the following tools to compile OpenWrt, the package names vary between
-distributions. A complete list with distribution specific packages is found in
-the [Build System Setup](https://openwrt.org/docs/guide-developer/build-system/install-buildsystem)
-documentation.
-
-```
-binutils bzip2 diff find flex gawk gcc-6+ getopt grep install libc-dev libz-dev
-make4.1+ perl python3.8+ rsync subversion unzip which
+```sh
+uci set nss-wifi.general.offload='0'; uci commit nss-wifi; reboot
 ```
 
-### Quickstart
+The Xiaomi AX3600 is the test board. Other boards are built but not tested
+by the maintainer, and IPQ60xx is not tested at all. Reports are welcome.
 
-1. Run `./scripts/feeds update -a` to obtain all the latest package definitions
-   defined in feeds.conf / feeds.conf.default
+## Images
 
-2. Run `./scripts/feeds install -a` to install symlinks for all obtained
-   packages into package/feeds/
+Find your router on **[ppenss.github.io](https://ppenss.github.io/)**:
+sysupgrade images for 41 IPQ807x and 24 IPQ60xx boards, custom images,
+the kernel modules of each release and updates. The images carry NSS
+firmware 12.5 and 11.4, the last line that supports 802.11s mesh, and boot
+12.5.
 
-3. Run `make menuconfig` to select your preferred configuration for the
-   toolchain, target system & firmware packages.
+The [wiki](https://github.com/JuliusBairaktaris/openwrt-ppe-nss/wiki)
+covers each part of the offload, SQM, bug reports and
+[migrating from edma-nss](https://github.com/JuliusBairaktaris/openwrt-ppe-nss/wiki/Migrating-from-edma-nss).
+[Benchmarks](https://github.com/JuliusBairaktaris/openwrt-ppe-nss/wiki/Benchmarks)
+has the throughput and router CPU of every flow class measured on the AX3600.
 
-4. Run `make` to build your firmware. This will download all sources, build the
-   cross-compile toolchain and then cross-compile the GNU/Linux kernel & all chosen
-   applications for your target system.
+## Branches
 
-### Related Repositories
+| Branch | Contents |
+|---|---|
+| `ppe-nss` | The default. [openwrt/openwrt](https://github.com/openwrt/openwrt) `main`, which carries the PPE flowtable, tc and switchdev offload since [openwrt/openwrt#24806](https://github.com/openwrt/openwrt/pull/24806), plus the NSS Wi-Fi series. |
+| `nss-edma-rework` | Archived. The vendor NSS stack (qca-nss-drv, ECM, NSS qdiscs). Final state: tag `archive/nss-edma-rework-final`. |
 
-The main repository uses multiple sub-repositories to manage packages of
-different categories. All packages are installed via the OpenWrt package
-manager called `opkg`. If you're looking to develop the web interface or port
-packages to OpenWrt, please find the fitting repository below.
+The NSS Wi-Fi series on `ppe-nss` adds the NSS device tree nodes, the
+`qca_edma` and `qca_ppe` changes that let the NSS firmware share the EDMA
+and PPE with the host, `nss-wifi-drv`, and the ath11k patches that hand the
+data-path rings to the firmware. The only package taken from the
+[nss-packages](https://github.com/JuliusBairaktaris/nss-packages) feed
+(branch `ppe-nss`) is `nss-firmware`.
 
-* [LuCI Web Interface](https://github.com/openwrt/luci): Modern and modular
-  interface to control the device via a web browser.
+## Building
 
-* [OpenWrt Packages](https://github.com/openwrt/packages): Community repository
-  of ported packages.
+```sh
+git clone -b ppe-nss https://github.com/JuliusBairaktaris/openwrt-ppe-nss.git
+cd openwrt-ppe-nss
+cp feeds.conf.default feeds.conf
+echo "src-git nss https://github.com/JuliusBairaktaris/nss-packages.git;ppe-nss" >> feeds.conf
+./scripts/feeds update -a && ./scripts/feeds install -a
+cat seeds/qualcommax-nss-wifi.seed >> .config
+make defconfig
+make -j"$(nproc)"
+```
 
-* [OpenWrt Routing](https://github.com/openwrt/routing): Packages specifically
-  focused on (mesh) routing.
+[`seeds/qualcommax-nss-wifi.seed`](seeds/qualcommax-nss-wifi.seed) selects
+`kmod-nss-wifi-drv`, `ATH11K_NSS_WIFI` and `wpad-openssl`, which supports
+802.11s mesh. `kmod-nss-wifi-drv` pulls in the NSS firmware of the subtarget,
+both firmware lines included. The rest of the seed is marked optional: the PPE
+SQM and QoS packages, the tc and sched modules, DCB, devlink and routed
+multicast that the release images add.
 
-* [OpenWrt Video](https://github.com/openwrt/video): Packages specifically
-  focused on display servers and clients (Xorg and Wayland).
+`hw_ppe.qos` for SQM and the PPE QoS LuCI page come from a feed patch and
+a luci fork in the builder. Its
+[README](https://github.com/JuliusBairaktaris/Qualcommax_NSS_Builder#build-it-yourself)
+builds the exact release images.
 
-## Support Information
+`ppe-nss` is rebased often. Update with
+`git fetch origin && git reset --hard origin/ppe-nss`, not `git pull`.
 
-For a list of supported devices see the [OpenWrt Hardware Database](https://openwrt.org/supported_devices)
+## Acknowledgements
 
-### Documentation
+- [Christian Marangi (Ansuel)](https://github.com/Ansuel) for the upstream
+  EDMA and PPE drivers.
+- [Robert Marko (robimarko)](https://github.com/robimarko) for maintaining the
+  OpenWrt qualcommax target.
+- [qosmio](https://github.com/qosmio/openwrt-ipq) for the NSS firmware
+  packaging the feed builds on.
 
-* [Quick Start Guide](https://openwrt.org/docs/guide-quick-start/start)
-* [User Guide](https://openwrt.org/docs/guide-user/start)
-* [Developer Documentation](https://openwrt.org/docs/guide-developer/start)
-* [Technical Reference](https://openwrt.org/docs/techref/start)
+## Support
 
-### Support Community
-
-* [Forum](https://forum.openwrt.org): For usage, projects, discussions and hardware advise.
-* [Support Chat](https://webchat.oftc.net/#openwrt): Channel `#openwrt` on **oftc.net**.
-
-### Developer Community
-
-* [Bug Reports](https://bugs.openwrt.org): Report bugs in OpenWrt
-* [Dev Mailing List](https://lists.openwrt.org/mailman/listinfo/openwrt-devel): Send patches
-* [Dev Chat](https://webchat.oftc.net/#openwrt-devel): Channel `#openwrt-devel` on **oftc.net**.
+[GitHub Sponsors](https://github.com/sponsors/JuliusBairaktaris) or
+[PayPal](https://paypal.me/JuliusBairaktaris).
 
 ## License
 
-OpenWrt is licensed under GPL-2.0
+GPL-2.0, see [COPYING](COPYING). The NSS firmware keeps its own license.
