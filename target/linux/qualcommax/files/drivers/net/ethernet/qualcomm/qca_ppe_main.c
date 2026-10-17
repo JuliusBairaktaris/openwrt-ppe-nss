@@ -14,6 +14,7 @@
 #include <linux/reset.h>
 #include <linux/if_bridge.h>
 #include <linux/if_vlan.h>
+#include <linux/soc/qcom/qca_ppe.h>
 
 #include "qca_ppe.h"
 
@@ -181,11 +182,13 @@ static void ppe_port_cnt_enable(struct qca_ppe_priv *priv, int port)
  * alone leaves the write staged. Word 1 holds the counter enables and the
  * source profile and goes back unchanged.
  */
-static void ppe_port_mtu_set(struct qca_ppe_priv *priv, int port,
-			     u32 frame_size)
+static void ppe_port_mtu_write(struct qca_ppe_priv *priv, int port)
 {
 	u32 reg = PPE_MRU_MTU_CTRL(port, priv->data->mru_mtu_ctrl_stride);
+	u32 frame_size = priv->port_frame_size[port];
 	u32 w1;
+
+	lockdep_assert_held(&priv->mtu_lock);
 
 	regmap_read(priv->regmap, reg + 4, &w1);
 	regmap_write(priv->regmap, reg,
@@ -201,6 +204,23 @@ static void ppe_port_mtu_set(struct qca_ppe_priv *priv, int port,
 			   FIELD_PREP(PPE_MC_MTU_CTRL_MTU, frame_size) |
 			   FIELD_PREP(PPE_MC_MTU_CTRL_MTU_CMD,
 				      PPE_SIZE_CMD_DROP));
+}
+
+static void ppe_ports_mtu_write(struct qca_ppe_priv *priv)
+{
+	int port;
+
+	guard(mutex)(&priv->mtu_lock);
+	for (port = 0; port < priv->data->num_ports; port++)
+		ppe_port_mtu_write(priv, port);
+}
+
+static void ppe_port_mtu_set(struct qca_ppe_priv *priv, int port,
+			     u32 frame_size)
+{
+	guard(mutex)(&priv->mtu_lock);
+	priv->port_frame_size[port] = frame_size;
+	ppe_port_mtu_write(priv, port);
 }
 
 int ppe_vsi_alloc(struct qca_ppe_priv *priv)
@@ -2954,6 +2974,83 @@ static const struct dsa_switch_ops qca_ppe_ops = {
 	.devlink_sb_occ_tc_port_bind_get = qca_ppe_devlink_sb_occ_tc_port_bind_get,
 };
 
+/*
+ * qca_ppe_fw_booted - write back the tables the NSS firmware set at boot
+ * @conduit: the conduit of a qca-ppe switch
+ *
+ * The firmware writes its own priority maps, flow QoS profiles and flow
+ * exceptions when it boots, which gives every priority a queue of its own
+ * across the bands, sends every flow entry's traffic at priority 0 and removes
+ * a flow entry on any exception. Put the driver's back. The RSS hash stays the
+ * firmware's: it looks up its connections by the hash the switch delivers.
+ */
+int qca_ppe_fw_booted(struct net_device *conduit)
+{
+	struct qca_ppe_priv *priv;
+
+	if (!conduit || !netdev_uses_dsa(conduit) ||
+	    conduit->dsa_ptr->ds->ops != &qca_ppe_ops)
+		return -ENODEV;
+
+	priv = ds_to_priv(conduit->dsa_ptr->ds);
+	ppe_qm_pri_map_init(priv);
+	ppe_flow_qos_init(priv);
+	ppe_flow_excep_init(priv);
+	ppe_ports_mtu_write(priv);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qca_ppe_fw_booted);
+
+/*
+ * qca_ppe_fw_ports_set - write back the port frame sizes after the NSS firmware
+ * @conduit: the conduit of a qca-ppe switch
+ *
+ * Arming ports rewrites the MRU and MTU of ports the firmware was not given
+ * as well, with its own size and actions. Put the driver's back.
+ */
+int qca_ppe_fw_ports_set(struct net_device *conduit)
+{
+	if (!conduit || !netdev_uses_dsa(conduit) ||
+	    conduit->dsa_ptr->ds->ops != &qca_ppe_ops)
+		return -ENODEV;
+
+	ppe_ports_mtu_write(ds_to_priv(conduit->dsa_ptr->ds));
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qca_ppe_fw_ports_set);
+
+/*
+ * qca_ppe_fw_carrier_set - name the devices the NSS firmware forwards to
+ * @conduit: the conduit of a qca-ppe switch
+ * @carries: whether the firmware forwards to the device of an ifindex, or NULL
+ *	     once it stops
+ *
+ * A routed flow from a switch port to such a device is the firmware's to
+ * forward, but its frames still cross the switch's L3 stage, where a miss
+ * reaches the CPU port as an exception the firmware hands to the host. The
+ * switch therefore takes that direction too, and bridges it to the CPU port
+ * unchanged.
+ */
+int qca_ppe_fw_carrier_set(struct net_device *conduit,
+			   bool (*carries)(int ifindex))
+{
+	struct qca_ppe_priv *priv;
+
+	if (!conduit || !netdev_uses_dsa(conduit) ||
+	    conduit->dsa_ptr->ds->ops != &qca_ppe_ops)
+		return -ENODEV;
+
+	priv = ds_to_priv(conduit->dsa_ptr->ds);
+	rcu_assign_pointer(priv->fw_carries, carries);
+	if (!carries)
+		synchronize_rcu();
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qca_ppe_fw_carrier_set);
+
 static void ppe_mac_hw_init(struct qca_ppe_priv *priv)
 {
 	const struct ppe_data *d = priv->data;
@@ -3149,6 +3246,7 @@ static int qca_ppe_probe(struct platform_device *pdev)
 	spin_lock_init(&priv->mib_lock);
 	mutex_init(&priv->flow_lock);
 	mutex_init(&priv->vlan_lock);
+	mutex_init(&priv->mtu_lock);
 	INIT_DELAYED_WORK(&priv->mib_work, ppe_mib_work);
 
 	priv->port_mib = devm_kcalloc(&pdev->dev,
