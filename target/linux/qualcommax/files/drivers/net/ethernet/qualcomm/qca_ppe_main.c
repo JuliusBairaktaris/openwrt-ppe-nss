@@ -14,6 +14,7 @@
 #include <linux/reset.h>
 #include <linux/if_bridge.h>
 #include <linux/if_vlan.h>
+#include <linux/soc/qcom/qca_ppe.h>
 
 #include "qca_ppe.h"
 
@@ -3353,6 +3354,63 @@ static const struct dsa_switch_ops qca_ppe_ops = {
 	.devlink_trap_policer_counter_get = qca_ppe_devlink_trap_policer_counter_get,
 	.devlink_trap_drop_counter_get = qca_ppe_devlink_trap_drop_counter_get,
 };
+
+/*
+ * qca_ppe_fw_booted - write back the tables the NSS firmware set at boot
+ * @conduit: the conduit of a qca-ppe switch
+ *
+ * The firmware writes its own priority maps, flow QoS profiles and flow
+ * exceptions when it boots, which gives every priority a queue of its own
+ * across the bands, sends every flow entry's traffic at priority 0 and removes
+ * a flow entry on any exception. Put the driver's back. The RSS hash stays the
+ * firmware's: it looks up its connections by the hash the switch delivers.
+ */
+int qca_ppe_fw_booted(struct net_device *conduit)
+{
+	struct qca_ppe_priv *priv;
+
+	if (!conduit || !netdev_uses_dsa(conduit) ||
+	    conduit->dsa_ptr->ds->ops != &qca_ppe_ops)
+		return -ENODEV;
+
+	priv = ds_to_priv(conduit->dsa_ptr->ds);
+	ppe_qm_pri_map_init(priv);
+	ppe_flow_qos_init(priv);
+	ppe_flow_excep_init(priv);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qca_ppe_fw_booted);
+
+/*
+ * qca_ppe_fw_carrier_set - name the devices the NSS firmware forwards to
+ * @conduit: the conduit of a qca-ppe switch
+ * @carries: whether the firmware forwards to the device of an ifindex, or NULL
+ *	     once it stops
+ *
+ * A routed flow from a switch port to such a device is the firmware's to
+ * forward, but its frames still cross the switch's L3 stage, where a miss
+ * reaches the CPU port as an exception the firmware hands to the host. The
+ * switch therefore takes that direction too, and bridges it to the CPU port
+ * unchanged.
+ */
+int qca_ppe_fw_carrier_set(struct net_device *conduit,
+			   bool (*carries)(int ifindex))
+{
+	struct qca_ppe_priv *priv;
+
+	if (!conduit || !netdev_uses_dsa(conduit) ||
+	    conduit->dsa_ptr->ds->ops != &qca_ppe_ops)
+		return -ENODEV;
+
+	priv = ds_to_priv(conduit->dsa_ptr->ds);
+	rcu_assign_pointer(priv->fw_carries, carries);
+	if (!carries)
+		synchronize_rcu();
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qca_ppe_fw_carrier_set);
 
 static void ppe_mac_hw_init(struct qca_ppe_priv *priv)
 {
