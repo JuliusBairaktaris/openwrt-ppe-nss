@@ -370,7 +370,7 @@ static void ppe_flow_age_timer_set(struct qca_ppe_priv *priv, u32 *ctrl)
  * the table set. A pattern left at its reset value matches every TCP packet,
  * so the patterns are written before their exceptions are enabled.
  */
-static void ppe_flow_excep_init(struct qca_ppe_priv *priv)
+void ppe_flow_excep_init(struct qca_ppe_priv *priv)
 {
 	static const u8 rdt[] = {
 		0, 1, 2, 3,				/* L2 protocol, PPPoE */
