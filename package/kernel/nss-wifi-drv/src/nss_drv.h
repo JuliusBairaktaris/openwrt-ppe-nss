@@ -360,6 +360,25 @@ struct nss_fw_line {
 	bool mesh;
 };
 
+/* The firmware's own load, while it reports it. */
+struct nss_core_load {
+	bool on;
+	u32 khz;		/* the core's clock */
+	u32 cycles;		/* the core's cycles in one report, measured */
+	u64 sum;
+	u32 n;			/* reports in this window */
+	u32 kept;		/* of them, not discarded */
+	u32 pct;		/* the last full window */
+	u32 min;
+	u32 max;
+	u64 start;		/* ns */
+	u32 window_ms;
+	u64 windows;
+	u64 reports;
+	u64 discarded;
+	u64 total;		/* every kept report's load, summed */
+};
+
 struct nss_core {
 	struct device *dev;
 	const struct nss_soc *soc;
@@ -433,6 +452,7 @@ struct nss_core {
 	u8 ext_seen;
 	u64 rx_type[8];
 	u64 notify;
+	struct nss_core_load load;
 	u64 tx_posted;
 	/* Several receive polls at once. */
 	atomic64_t tx_done;
@@ -563,6 +583,8 @@ void nss_flow_withdraw_dev(const struct net_device *dev);
 int nss_flow_dyn_alloc(struct nss_core *core, u32 type);
 void nss_flow_dyn_free(struct nss_core *core, u32 type, int if_num);
 void nss_flow_notify(const struct nss_cmn_msg *ncm, u32 len);
+bool nss_core_load_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
+			  u32 len);
 void nss_flow_print(struct seq_file *s);
 int nss_flow_init(void);
 void nss_flow_exit(void);
