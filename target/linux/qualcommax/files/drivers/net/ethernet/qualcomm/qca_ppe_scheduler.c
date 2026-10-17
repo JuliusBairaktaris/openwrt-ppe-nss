@@ -500,21 +500,9 @@ static u32 ppe_ac_uni_default(struct qca_ppe_priv *priv)
 	       FIELD_PREP(PPE_AC_SHARED_CEILING, priv->data->qm_ceiling);
 }
 
-static void ppe_qm_init(struct qca_ppe_priv *priv)
+void ppe_qm_pri_map_init(struct qca_ppe_priv *priv)
 {
-	const struct ppe_data *d = priv->data;
 	int i, pri;
-
-	ppe_qm_map_set(priv, QM_SERVICE_CODE_OFFSET + 2, 0, 0);
-	ppe_qm_map_set(priv, QM_SERVICE_CODE_OFFSET + 3, 128, 8);
-	ppe_qm_map_set(priv, QM_SERVICE_CODE_OFFSET + 4, 128, 8);
-	ppe_qm_map_set(priv, QM_SERVICE_CODE_OFFSET + 5, 0, 0);
-	ppe_qm_map_set(priv, QM_SERVICE_CODE_OFFSET + 6, 0, 0);
-	ppe_qm_map_set(priv, QM_SERVICE_CODE_OFFSET + 7, 240, 0);
-
-	for (i = 0; i < PPE_NUM_PORTS; i++)
-		ppe_qm_map_set(priv, QM_VP_PORT_OFFSET + i,
-			       port_queue_base[i], i);
 
 	for (i = 0; i < PPE_NUM_PORTS; i++) {
 		for (pri = 0; pri < 16; pri++) {
@@ -566,6 +554,29 @@ static void ppe_qm_init(struct qca_ppe_priv *priv)
 				     FIELD_PREP(PPE_QM_PRI_CLASS, cls));
 		}
 	}
+
+	/* Profiles no port uses add no offset. */
+	for (i = PPE_NUM_PORTS * 16; i < 15 * 16; i++)
+		regmap_write(priv->regmap, PPE_QM_UCAST_PRI_MAP(i), 0);
+}
+
+static void ppe_qm_init(struct qca_ppe_priv *priv)
+{
+	const struct ppe_data *d = priv->data;
+	int i;
+
+	ppe_qm_map_set(priv, QM_SERVICE_CODE_OFFSET + 2, 0, 0);
+	ppe_qm_map_set(priv, QM_SERVICE_CODE_OFFSET + 3, 128, 8);
+	ppe_qm_map_set(priv, QM_SERVICE_CODE_OFFSET + 4, 128, 8);
+	ppe_qm_map_set(priv, QM_SERVICE_CODE_OFFSET + 5, 0, 0);
+	ppe_qm_map_set(priv, QM_SERVICE_CODE_OFFSET + 6, 0, 0);
+	ppe_qm_map_set(priv, QM_SERVICE_CODE_OFFSET + 7, 240, 0);
+
+	for (i = 0; i < PPE_NUM_PORTS; i++)
+		ppe_qm_map_set(priv, QM_VP_PORT_OFFSET + i,
+			       port_queue_base[i], i);
+
+	ppe_qm_pri_map_init(priv);
 
 	/* The 5-tuple hash picks the queue inside a band on every port; profile
 	 * id equals port id. On the CPU port the EDMA driver maps the four
@@ -1683,6 +1694,23 @@ int qca_ppe_port_del_pcp_prio(struct dsa_switch *ds, int port, u8 pcp,
 /* Which classifier's internal priority wins when several offer one: the flow
  * table first, then the CPU preheader, ACL, DSCP and last a VLAN's PCP.
  */
+/* A flow entry names a profile, not a priority, so give the profiles the
+ * identity mapping and let the entry carry the number itself. Profile 0 is
+ * left at priority 0: it is what an entry given no priority holds, and leaving
+ * it there is what lets DSCP still decide those. The sparse list sits above
+ * the bands and takes its own.
+ */
+void ppe_flow_qos_init(struct qca_ppe_priv *priv)
+{
+	int i;
+
+	for (i = 1; i <= PPE_QOS_MAX_PRI; i++)
+		regmap_write(priv->regmap, PPE_FLOW_QOS_GROUP(0, i),
+			     FIELD_PREP(PPE_QOS_INFO_PRI, i));
+	regmap_write(priv->regmap, PPE_FLOW_QOS_GROUP(0, PPE_QOS_SPARSE_PRI),
+		     FIELD_PREP(PPE_QOS_INFO_PRI, PPE_QOS_SPARSE_PRI));
+}
+
 static void ppe_qos_init(struct qca_ppe_priv *priv)
 {
 	int i;
@@ -1709,17 +1737,7 @@ static void ppe_qos_init(struct qca_ppe_priv *priv)
 		regmap_write(priv->regmap, PPE_PCP_QOS_GROUP(0, i),
 			     FIELD_PREP(PPE_QOS_INFO_PRI, i >> 1));
 
-	/* A flow entry names a profile, not a priority, so give the profiles
-	 * the identity mapping and let the entry carry the number itself.
-	 * Profile 0 is left at priority 0: it is what an entry given no
-	 * priority holds, and leaving it there is what lets DSCP still decide
-	 * those. The sparse list sits above the bands and takes its own.
-	 */
-	for (i = 1; i <= PPE_QOS_MAX_PRI; i++)
-		regmap_write(priv->regmap, PPE_FLOW_QOS_GROUP(0, i),
-			     FIELD_PREP(PPE_QOS_INFO_PRI, i));
-	regmap_write(priv->regmap, PPE_FLOW_QOS_GROUP(0, PPE_QOS_SPARSE_PRI),
-		     FIELD_PREP(PPE_QOS_INFO_PRI, PPE_QOS_SPARSE_PRI));
+	ppe_flow_qos_init(priv);
 }
 
 const struct psch_tdm_data cppe_psch_tdm_data = {
@@ -1870,7 +1888,7 @@ static u32 ppe_port_frame_len(struct qca_ppe_priv *priv, int port)
 #define PPE_AC_MIN_FRAMES	8
 
 /* The CPU port's third band: the queues priorities eight and up select
- * (ppe_qm_init()), on the L1 node cpu_port_rate shapes.
+ * (ppe_qm_pri_map_init()), on the L1 node cpu_port_rate shapes.
  */
 #define PPE_CPU_PORT_DL_QUEUE	(2 * PPE_FLOW_SPREAD_QUEUES)
 #define PPE_CPU_PORT_DL_NODE	1
@@ -3527,9 +3545,10 @@ static void ppe_rate_limit_init(struct qca_ppe_priv *priv)
  * meter drops where this delays.
  *
  * What is shaped is the port's third band, the queue priorities eight and up
- * select (ppe_qm_init()): the traffic a rule marks into it, which is a routed
- * download when the rule is on the uplink, and nothing else. A bridged
- * transfer to a Wi-Fi client crosses this port unmarked and is not held.
+ * select (ppe_qm_pri_map_init()): the traffic a rule marks into it, which is
+ * a routed download when the rule is on the uplink, and nothing else. A
+ * bridged transfer to a Wi-Fi client crosses this port unmarked and is not
+ * held.
  */
 static int ppe_cpu_port_dl_set(struct qca_ppe_priv *priv, u64 rate_bps)
 {

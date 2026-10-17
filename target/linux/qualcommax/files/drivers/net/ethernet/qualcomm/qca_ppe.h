@@ -819,6 +819,8 @@
 #define   PPE_FLOW_E_FWD_TYPE_LEN	3
 #define   PPE_FLOW_E_NEXTHOP_OFF	32
 #define   PPE_FLOW_E_NEXTHOP_LEN	12
+#define   PPE_FLOW_E_PORT_OFF	32
+#define   PPE_FLOW_E_PORT_LEN	8
 #define   PPE_FLOW_E_NEW_PORT_OFF	44
 #define   PPE_FLOW_E_NEW_PORT_LEN	16
 #define   PPE_FLOW_E_IPV4_OFF		76
@@ -1454,6 +1456,8 @@ struct qca_ppe_priv {
 	struct ppe_uplink uplink[PPE_PPPOE_SESSIONS];
 	struct ppe_pppoe_session pppoe[PPE_PPPOE_SESSIONS];
 	u32 flow_reject[PPE_REJECT_MAX];
+	/* Which devices the NSS firmware forwards to, while it runs. */
+	bool (__rcu *fw_carries)(int ifindex);
 	u32 flow_offloaded;
 	u32 flow_reinstalled;
 	u32 flow_destroy_miss;
@@ -1735,6 +1739,9 @@ int qca_ppe_port_vlan_del(struct dsa_switch *ds, int port,
 			  const struct switchdev_obj_port_vlan *vlan);
 
 void ppe_flow_init(struct qca_ppe_priv *priv);
+void ppe_flow_excep_init(struct qca_ppe_priv *priv);
+void ppe_qm_pri_map_init(struct qca_ppe_priv *priv);
+void ppe_flow_qos_init(struct qca_ppe_priv *priv);
 int ppe_flow_op(struct qca_ppe_priv *priv, u32 op_type,
 		const u32 *entry, int nentry, const u32 *host, int nhost,
 		u32 *index, u32 *host_index);
