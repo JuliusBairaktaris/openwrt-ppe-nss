@@ -196,6 +196,7 @@ void nss_phys_arm_ports(struct nss_core *core)
 		}
 		nss_phys_arm(core, mask & nss_phys_allowed);
 	}
+	nss_rawip_arm(core);
 	mutex_unlock(&core->lock);
 	rtnl_unlock();
 }
