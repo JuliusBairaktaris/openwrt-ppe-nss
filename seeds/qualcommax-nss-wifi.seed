@@ -1,0 +1,42 @@
+CONFIG_TARGET_qualcommax=y
+CONFIG_TARGET_qualcommax_ipq807x=y
+CONFIG_PACKAGE_kmod-nss-wifi-drv=y
+CONFIG_ATH11K_NSS_WIFI=y
+CONFIG_PACKAGE_wpad-openssl=y
+# CONFIG_PACKAGE_wpad-basic-mbedtls is not set
+
+## Optional: everything below is what the release images add for the PPE
+## offload. Delete any line you do not want.
+
+## Optional: SQM through the PPE shaper, and the PPE QoS page. hw_ppe.qos
+## needs sqm-scripts from the builder's feed patch, and luci-app-qca-ppe-qos
+## needs the builder's luci fork; with the stock feeds defconfig drops it.
+CONFIG_PACKAGE_sqm-scripts=y
+CONFIG_PACKAGE_luci-app-sqm=y
+CONFIG_PACKAGE_qca-ppe-qos=y
+CONFIG_PACKAGE_luci-app-qca-ppe-qos=y
+
+## Optional: the tc userspace and sched modules the PPE offloads are driven
+## from (flower classifier, prio/mqprio/ets/red/gred qdiscs, police, pedit and
+## vlan actions).
+CONFIG_PACKAGE_tc-tiny=y
+CONFIG_PACKAGE_kmod-sched-flower=y
+CONFIG_PACKAGE_kmod-sched-prio=y
+CONFIG_PACKAGE_kmod-sched-act-police=y
+CONFIG_PACKAGE_kmod-sched-act-pedit=y
+CONFIG_PACKAGE_kmod-sched-act-vlan=y
+CONFIG_PACKAGE_kmod-sched-mqprio=y
+CONFIG_PACKAGE_kmod-sched-ets=y
+CONFIG_PACKAGE_kmod-sched-red=y
+CONFIG_PACKAGE_kmod-sched-gred=y
+
+## Optional: DCB for the DSCP-to-priority maps qca-ppe-qos programs, and
+## the devlink and full ethtool tools.
+CONFIG_PACKAGE_dcb=y
+CONFIG_PACKAGE_devlink=y
+CONFIG_PACKAGE_ethtool-full=y
+CONFIG_KERNEL_DCB=y
+
+## Optional: routed multicast. Also needs a daemon such as igmpproxy.
+CONFIG_KERNEL_IP_MROUTE=y
+CONFIG_KERNEL_IPV6_MROUTE=y
