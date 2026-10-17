@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Carrying a cellular modem's connections in the firmware.
+/* Carrying the connections of devices the firmware has no interface for.
  *
- * A modem's raw-IP device has no switch port behind it, so the firmware
- * reaches it through a generic redirect node pair: what the host hands to one
+ * A modem's raw-IP device has no switch port behind it, and a radio whose
+ * rings the firmware does not reap - a PCIe ath10k beside the SoC's own
+ * radios - hands every frame to the host. The firmware reaches such a device
+ * through a generic redirect node pair: what the host hands to one
  * node is routed as if it had arrived on the device, and what the firmware
  * routes to the other comes back to be sent there. Core 0 refuses the
  * rmnet_rx node type, which exists only in core 1's image; the redirect pair
@@ -10,7 +12,11 @@
  *
  * Packets cross the pair framed as Ethernet. One the firmware does not route
  * comes back still framed and goes up the stack; nothing the modem sends or
- * receives carries the frame.
+ * receives carries the frame, and a radio's frames are Ethernet already.
+ *
+ * Only a packet as the device received it fits one firmware buffer, so a
+ * radio's GRO is off while a core carries the device: coalesced, a station's
+ * upload would never reach the firmware.
  *
  * A core that restarts loses its nodes, so the pair is made wherever a
  * running core meets a device that is up: when the device comes up and when
@@ -20,6 +26,7 @@
 #include <linux/cleanup.h>
 #include <linux/etherdevice.h>
 #include <linux/if_arp.h>
+#include <linux/if_vlan.h>
 #include <linux/ipv6.h>
 #include <linux/netdevice.h>
 #include <linux/netfilter.h>
@@ -33,70 +40,82 @@
 
 #include "nss_drv.h"
 
-/* ponytail: one device per multiplexed channel; a router uses one or two */
-#define NSS_RAWIP_MAX	4
+/* ponytail: a modem has one device per multiplexed channel and a router uses
+ * one or two; a radio has one per network it serves.
+ */
+#define NSS_REDIR_MAX	8
 
 /* The source address of the frame around a modem's packet; the modem driver
  * uses it for its own Ethernet mode.
  */
-static const u8 nss_rawip_peer[ETH_ALEN] = { 0x02, 0x50, 0xf3, 0x00, 0x00, 0x00 };
+static const u8 nss_redir_peer[ETH_ALEN] = { 0x02, 0x50, 0xf3, 0x00, 0x00, 0x00 };
 
-struct nss_rawip {
+struct nss_redir {
 	struct net_device *dev;	/* NULL: slot free */
 	int ifindex;
 	int n2h;		/* -1 until a running core gives the pair */
 	int h2n;
 	struct nf_hook_ops ops;	/* ahead of the flow table on the device */
+	bool eth;		/* frames are Ethernet, not bare IP */
+	bool gro;		/* GRO turned off here */
 	u64 inject;
 	u64 inject_fail;
 	u64 back;		/* came back unrouted, delivered up */
-	u64 xmit;		/* routed to the modem by the firmware */
+	u64 xmit;		/* routed to the device by the firmware */
 	u64 drop;
 };
 
 /* Written under the RTNL, read from the receive paths. */
-static struct nss_rawip nss_rawip_tbl[NSS_RAWIP_MAX];
-static struct nss_core *nss_rawip_core;
+static struct nss_redir nss_redir_tbl[NSS_REDIR_MAX];
+static struct nss_core *nss_redir_core;
 
 /* Set while a packet the firmware gave back goes up the stack, so it is not
  * handed down again. The delivery stays on this CPU.
  */
-static DEFINE_PER_CPU(bool, nss_rawip_reinject);
+static DEFINE_PER_CPU(bool, nss_redir_reinject);
 
-static bool nss_rawip_enable = true;
-module_param_named(rawip, nss_rawip_enable, bool, 0644);
-MODULE_PARM_DESC(rawip, "carry raw-IP (cellular) devices in the firmware; read when a device comes up");
+static bool nss_redir_enable = true;
+module_param_named(redir, nss_redir_enable, bool, 0644);
+MODULE_PARM_DESC(redir, "carry raw-IP (cellular) devices and radios the firmware does not drive; read when a device comes up");
 
-static bool nss_rawip_wanted(const struct net_device *dev)
+static bool nss_redir_wanted(const struct net_device *dev)
 {
-	return dev->type == ARPHRD_RAWIP && dev->addr_len == ETH_ALEN;
+	/* The firmware routes in this namespace only; a device anywhere else
+	 * would have its frames forwarded by flows it does not belong to.
+	 */
+	if (dev->addr_len != ETH_ALEN || !net_eq(dev_net(dev), &init_net))
+		return false;
+
+	return dev->type == ARPHRD_RAWIP ||
+	       (dev->type == ARPHRD_ETHER && dev->ieee80211_ptr &&
+		!nss_wifili_owns(dev));
 }
 
-static struct nss_rawip *nss_rawip_find(const struct net_device *dev)
+static struct nss_redir *nss_redir_find(const struct net_device *dev)
 {
 	int i;
 
-	for (i = 0; i < NSS_RAWIP_MAX; i++)
-		if (nss_rawip_tbl[i].dev == dev)
-			return &nss_rawip_tbl[i];
+	for (i = 0; i < NSS_REDIR_MAX; i++)
+		if (nss_redir_tbl[i].dev == dev)
+			return &nss_redir_tbl[i];
 
 	return NULL;
 }
 
 /* Whether the firmware can route to @ifindex. */
-bool nss_rawip_bound(int ifindex)
+bool nss_redir_bound(int ifindex)
 {
 	int i;
 
-	for (i = 0; i < NSS_RAWIP_MAX; i++)
-		if (READ_ONCE(nss_rawip_tbl[i].ifindex) == ifindex &&
-		    READ_ONCE(nss_rawip_tbl[i].n2h) >= 0)
+	for (i = 0; i < NSS_REDIR_MAX; i++)
+		if (READ_ONCE(nss_redir_tbl[i].ifindex) == ifindex &&
+		    READ_ONCE(nss_redir_tbl[i].n2h) >= 0)
 			return true;
 
 	return false;
 }
 
-static int nss_rawip_config(struct nss_core *core, int if_num, int sibling,
+static int nss_redir_config(struct nss_core *core, int if_num, int sibling,
 			    int nexthop, const u8 *mac)
 {
 	struct nss_virt_if_config_msg c = {};
@@ -112,7 +131,7 @@ static int nss_rawip_config(struct nss_core *core, int if_num, int sibling,
 /* The host-to-firmware node feeds the Ethernet node, where the connection
  * engines are; the other hands what the firmware routes there to the host.
  */
-static int nss_rawip_pair(struct nss_core *core, struct nss_rawip *r)
+static int nss_redir_pair(struct nss_core *core, struct nss_redir *r)
 {
 	int n2h, h2n, ret;
 
@@ -126,11 +145,11 @@ static int nss_rawip_pair(struct nss_core *core, struct nss_rawip *r)
 		goto n2h;
 	}
 
-	ret = nss_rawip_config(core, n2h, h2n, NSS_INTERFACE_N2H,
+	ret = nss_redir_config(core, n2h, h2n, NSS_INTERFACE_N2H,
 			       r->dev->dev_addr);
 	if (ret)
 		goto h2n;
-	ret = nss_rawip_config(core, h2n, n2h, NSS_INTERFACE_ETH_RX,
+	ret = nss_redir_config(core, h2n, n2h, NSS_INTERFACE_ETH_RX,
 			       r->dev->dev_addr);
 	if (ret)
 		goto h2n;
@@ -155,7 +174,7 @@ n2h:
 	return ret;
 }
 
-static void nss_rawip_unpair(struct nss_core *core, struct nss_rawip *r)
+static void nss_redir_unpair(struct nss_core *core, struct nss_redir *r)
 {
 	int n2h = r->n2h, h2n = r->h2n;
 	struct net_device *dev;
@@ -189,7 +208,7 @@ static void nss_rawip_unpair(struct nss_core *core, struct nss_rawip *r)
  * connection stays with the host: no rule waits for the first, and conntrack
  * must see the second.
  */
-static bool nss_rawip_routable(struct sk_buff *skb, __be16 proto)
+static bool nss_redir_routable(struct sk_buff *skb, __be16 proto)
 {
 	unsigned int thoff;
 	u8 l4;
@@ -227,7 +246,7 @@ static bool nss_rawip_routable(struct sk_buff *skb, __be16 proto)
 	return !(tcp_hdr(skb)->syn || tcp_hdr(skb)->fin || tcp_hdr(skb)->rst);
 }
 
-static __be16 nss_rawip_proto(const struct sk_buff *skb, unsigned int off)
+static __be16 nss_redir_proto(const struct sk_buff *skb, unsigned int off)
 {
 	if (skb->len <= off)
 		return 0;
@@ -242,12 +261,12 @@ static __be16 nss_rawip_proto(const struct sk_buff *skb, unsigned int off)
 	}
 }
 
-/* Hand a packet from the modem to the firmware. False leaves it with the
+/* Hand a packet from the device to the firmware. False leaves it with the
  * host; @skb must not be shared.
  */
-static bool nss_rawip_inject(struct nss_rawip *r, struct sk_buff *skb)
+static bool nss_redir_inject(struct nss_redir *r, struct sk_buff *skb)
 {
-	struct nss_core *core = READ_ONCE(nss_rawip_core);
+	struct nss_core *core = READ_ONCE(nss_redir_core);
 	int h2n = READ_ONCE(r->h2n);
 	struct ethhdr *eth;
 	__be16 proto;
@@ -255,14 +274,32 @@ static bool nss_rawip_inject(struct nss_rawip *r, struct sk_buff *skb)
 	if (!core || h2n < 0 || !READ_ONCE(core->running))
 		return false;
 
-	if (!pskb_may_pull(skb, 1))
-		return false;
-	proto = nss_rawip_proto(skb, 0);
-	if (!proto || skb->len > skb->dev->mtu)
+	if (r->eth) {
+		/* The device's own header and nothing between it and IP. */
+		/* A frame for another host is the host's to forward only
+		 * when the device is a bridge port.
+		 */
+		if (skb->pkt_type != PACKET_HOST &&
+		    (skb->pkt_type != PACKET_OTHERHOST ||
+		     !netif_is_bridge_port(skb->dev)))
+			return false;
+		if (skb_vlan_tag_present(skb) || skb->mac_len != ETH_HLEN)
+			return false;
+		proto = skb->protocol;
+		if (proto != htons(ETH_P_IP) && proto != htons(ETH_P_IPV6))
+			return false;
+	} else {
+		if (!pskb_may_pull(skb, 1))
+			return false;
+		proto = nss_redir_proto(skb, 0);
+		if (!proto)
+			return false;
+	}
+	if (skb->len > skb->dev->mtu)
 		return false;
 
 	skb_reset_network_header(skb);
-	if (!nss_rawip_routable(skb, proto))
+	if (!nss_redir_routable(skb, proto))
 		return false;
 
 	/* Four more than the frame, for the word alignment the send may need. */
@@ -272,15 +309,19 @@ static bool nss_rawip_inject(struct nss_rawip *r, struct sk_buff *skb)
 	}
 
 	eth = skb_push(skb, ETH_HLEN);
-	ether_addr_copy(eth->h_dest, skb->dev->dev_addr);
-	ether_addr_copy(eth->h_source, nss_rawip_peer);
-	eth->h_proto = proto;
+	if (!r->eth) {
+		ether_addr_copy(eth->h_dest, skb->dev->dev_addr);
+		ether_addr_copy(eth->h_source, nss_redir_peer);
+		eth->h_proto = proto;
+	}
 
 	if (nss_data_send(core, skb, h2n, NSS_H2N_FLAG_VIRTUAL_BUFFER)) {
 		/* The send may have moved the data to a word boundary. */
+		skb_reset_mac_header(skb);
 		skb_pull(skb, ETH_HLEN);
 		skb_reset_network_header(skb);
-		skb_reset_mac_header(skb);
+		if (!r->eth)
+			skb_reset_mac_header(skb);
 		r->inject_fail++;
 		return false;
 	}
@@ -293,21 +334,21 @@ static bool nss_rawip_inject(struct nss_rawip *r, struct sk_buff *skb)
 /* Ahead of the flow table's hook, which would otherwise forward an
  * offloaded connection's packets before the receive handler saw them.
  */
-static unsigned int nss_rawip_hook(void *priv, struct sk_buff *skb,
+static unsigned int nss_redir_hook(void *priv, struct sk_buff *skb,
 				   const struct nf_hook_state *state)
 {
-	if (__this_cpu_read(nss_rawip_reinject) || skb_shared(skb))
+	if (__this_cpu_read(nss_redir_reinject) || skb_shared(skb))
 		return NF_ACCEPT;
 
-	return nss_rawip_inject(priv, skb) ? NF_STOLEN : NF_ACCEPT;
+	return nss_redir_inject(priv, skb) ? NF_STOLEN : NF_ACCEPT;
 }
 
 /* A packet an ingress shaper redirected and gives back skips the hooks. */
-static rx_handler_result_t nss_rawip_rx(struct sk_buff **pskb)
+static rx_handler_result_t nss_redir_rx(struct sk_buff **pskb)
 {
 	struct sk_buff *skb = *pskb;
 
-	if (__this_cpu_read(nss_rawip_reinject) ||
+	if (__this_cpu_read(nss_redir_reinject) ||
 	    skb->pkt_type == PACKET_LOOPBACK)
 		return RX_HANDLER_PASS;
 
@@ -316,35 +357,35 @@ static rx_handler_result_t nss_rawip_rx(struct sk_buff **pskb)
 		return RX_HANDLER_CONSUMED;
 	*pskb = skb;
 
-	if (!nss_rawip_inject(rcu_dereference(skb->dev->rx_handler_data), skb))
+	if (!nss_redir_inject(rcu_dereference(skb->dev->rx_handler_data), skb))
 		return RX_HANDLER_PASS;
 
 	return RX_HANDLER_CONSUMED;
 }
 
-static struct nss_rawip *nss_rawip_of_node(u32 if_num)
+static struct nss_redir *nss_redir_of_node(u32 if_num)
 {
 	int i;
 
-	for (i = 0; i < NSS_RAWIP_MAX; i++)
-		if (READ_ONCE(nss_rawip_tbl[i].n2h) == (int)if_num ||
-		    READ_ONCE(nss_rawip_tbl[i].h2n) == (int)if_num)
-			return &nss_rawip_tbl[i];
+	for (i = 0; i < NSS_REDIR_MAX; i++)
+		if (READ_ONCE(nss_redir_tbl[i].n2h) == (int)if_num ||
+		    READ_ONCE(nss_redir_tbl[i].h2n) == (int)if_num)
+			return &nss_redir_tbl[i];
 
 	return NULL;
 }
 
 /* A packet the firmware did not route, to go up the stack, or one it routed
- * to the modem, to be sent there. Either may be in a lent buffer or in one
+ * to the device, to be sent there. Either may be in a lent buffer or in one
  * the host sent; the descriptor says where the packet is.
  */
-bool nss_rawip_recv(struct nss_core *core, const struct n2h_descriptor *desc,
+bool nss_redir_recv(struct nss_core *core, const struct n2h_descriptor *desc,
 		    struct sk_buff *skb)
 {
 	bool tx = NSS_SKB_CB(skb)->tx;
 	u32 end = (u32)desc->payload_offs + desc->payload_len;
 	struct net_device *dev;
-	struct nss_rawip *r;
+	struct nss_redir *r;
 	__be16 proto;
 	u32 size;
 	int n2h;
@@ -356,7 +397,7 @@ bool nss_rawip_recv(struct nss_core *core, const struct n2h_descriptor *desc,
 	if (tx && !NSS_SKB_CB(skb)->bidir)
 		return false;
 
-	r = nss_rawip_of_node(desc->interface_num);
+	r = nss_redir_of_node(desc->interface_num);
 	if (!r)
 		return false;
 
@@ -382,23 +423,31 @@ bool nss_rawip_recv(struct nss_core *core, const struct n2h_descriptor *desc,
 	skb->len = desc->payload_len;
 	skb_set_tail_pointer(skb, skb->len);
 
-	/* A packet that comes back bare is taken as it is. */
-	proto = nss_rawip_proto(skb, ETH_HLEN);
-	if (proto && skb->len >= ETH_HLEN &&
-	    ((struct ethhdr *)skb->data)->h_proto == proto)
+	/* A modem's packet that comes back bare is taken as it is; a radio's
+	 * frame keeps its header.
+	 */
+	proto = nss_redir_proto(skb, ETH_HLEN);
+	if (proto && ((struct ethhdr *)skb->data)->h_proto != proto)
+		proto = 0;
+	if (r->eth) {
+		if (!proto)
+			goto drop;
+	} else if (proto) {
 		skb_pull(skb, ETH_HLEN);
-	else
-		proto = nss_rawip_proto(skb, 0);
-	if (!proto)
-		goto drop;
+	} else {
+		proto = nss_redir_proto(skb, 0);
+		if (!proto)
+			goto drop;
+	}
 
 	memset(skb->cb, 0, sizeof(skb->cb));
 	skb->dev = dev;
 	skb->protocol = proto;
 	skb->ip_summed = CHECKSUM_NONE;
 	skb_reset_mac_header(skb);
-	skb_reset_network_header(skb);
-	skb->mac_len = 0;
+	skb->mac_len = r->eth ? ETH_HLEN : 0;
+	/* Where the radio's queue selection reads the DSCP from. */
+	skb_set_network_header(skb, skb->mac_len);
 
 	if (desc->buffer_type == NSS_N2H_BUFFER_PACKET_VIRTUAL) {
 		r->xmit++;
@@ -411,12 +460,17 @@ bool nss_rawip_recv(struct nss_core *core, const struct n2h_descriptor *desc,
 	 */
 	nf_reset_ct(skb);
 	skb_dst_drop(skb);
-	skb->pkt_type = PACKET_HOST;
+	if (r->eth) {
+		skb->protocol = eth_type_trans(skb, dev);
+		skb_reset_network_header(skb);
+	} else {
+		skb->pkt_type = PACKET_HOST;
+	}
 
 	skb->skb_iif = dev->ifindex;
 
 	r->back++;
-	__this_cpu_write(nss_rawip_reinject, true);
+	__this_cpu_write(nss_redir_reinject, true);
 	/* The flow table's hook runs again, so a reply passing it lets it
 	 * offload that direction too. An ingress shaper saw the packet
 	 * already and is skipped.
@@ -425,7 +479,7 @@ bool nss_rawip_recv(struct nss_core *core, const struct n2h_descriptor *desc,
 		skb->tc_skip_classify = 1;
 		netif_receive_skb_core(skb);
 	}
-	__this_cpu_write(nss_rawip_reinject, false);
+	__this_cpu_write(nss_redir_reinject, false);
 
 	return true;
 
@@ -437,34 +491,39 @@ drop:
 }
 
 /* Under the RTNL, and under the core's lock when there is one. */
-static void nss_rawip_add(struct nss_core *core, struct net_device *dev)
+static void nss_redir_add(struct nss_core *core, struct net_device *dev)
 {
-	struct nss_rawip *r;
+	struct nss_redir *r;
 	int i;
 
-	if (!nss_rawip_enable || !nss_rawip_wanted(dev))
+	if (!nss_redir_enable || !nss_redir_wanted(dev))
 		return;
 
-	r = nss_rawip_find(dev);
+	r = nss_redir_find(dev);
 	if (!r) {
-		for (i = 0; i < NSS_RAWIP_MAX && !r; i++)
-			if (!nss_rawip_tbl[i].dev)
-				r = &nss_rawip_tbl[i];
+		for (i = 0; i < NSS_REDIR_MAX && !r; i++)
+			if (!nss_redir_tbl[i].dev)
+				r = &nss_redir_tbl[i];
 		if (!r) {
-			netdev_warn(dev, "no room for another raw-IP device\n");
+			netdev_warn(dev, "no room for another redirected device\n");
 			return;
 		}
 
-		*r = (struct nss_rawip){ .dev = dev, .n2h = -1, .h2n = -1 };
-		if (netdev_rx_handler_register(dev, nss_rawip_rx, r)) {
+		*r = (struct nss_redir){ .dev = dev, .n2h = -1, .h2n = -1,
+					 .eth = dev->type == ARPHRD_ETHER };
+		/* A radio's device is usually a bridge port, and the receive
+		 * handler is the bridge's; the ingress hook alone takes its
+		 * packets.
+		 */
+		if (!r->eth && netdev_rx_handler_register(dev, nss_redir_rx, r)) {
 			netdev_warn(dev, "has a receive handler already\n");
-			*r = (struct nss_rawip){ .n2h = -1, .h2n = -1 };
+			*r = (struct nss_redir){ .n2h = -1, .h2n = -1 };
 			return;
 		}
 		WRITE_ONCE(r->ifindex, dev->ifindex);
 
 		r->ops = (struct nf_hook_ops){
-			.hook = nss_rawip_hook,
+			.hook = nss_redir_hook,
 			.pf = NFPROTO_NETDEV,
 			.hooknum = NF_NETDEV_INGRESS,
 			.priority = INT_MIN + 1,
@@ -472,101 +531,119 @@ static void nss_rawip_add(struct nss_core *core, struct net_device *dev)
 			.priv = r,
 		};
 		if (nf_register_net_hook(dev_net(dev), &r->ops)) {
-			netdev_rx_handler_unregister(dev);
-			*r = (struct nss_rawip){ .n2h = -1, .h2n = -1 };
+			if (!r->eth)
+				netdev_rx_handler_unregister(dev);
+			*r = (struct nss_redir){ .n2h = -1, .h2n = -1 };
 			return;
 		}
 	}
 
-	if (core && core->running && r->n2h < 0)
-		nss_rawip_pair(core, r);
+	if (!core)
+		return;
+
+	if (r->eth && !r->gro && (dev->wanted_features & NETIF_F_GRO)) {
+		dev->wanted_features &= ~NETIF_F_GRO;
+		netdev_update_features(dev);
+		r->gro = true;
+	}
+
+	if (core->running && r->n2h < 0)
+		nss_redir_pair(core, r);
 }
 
-static void nss_rawip_del(struct nss_core *core, struct net_device *dev)
+static void nss_redir_del(struct nss_core *core, struct net_device *dev)
 {
-	struct nss_rawip *r = nss_rawip_find(dev);
+	struct nss_redir *r = nss_redir_find(dev);
 
 	if (!r)
 		return;
 
 	nf_unregister_net_hook(dev_net(dev), &r->ops);
 	if (core)
-		nss_rawip_unpair(core, r);
-	netdev_rx_handler_unregister(dev);
+		nss_redir_unpair(core, r);
+	if (r->gro) {
+		dev->wanted_features |= NETIF_F_GRO;
+		netdev_update_features(dev);
+	}
+	if (!r->eth)
+		netdev_rx_handler_unregister(dev);
 	WRITE_ONCE(r->ifindex, 0);
 	WRITE_ONCE(r->n2h, -1);
 	WRITE_ONCE(r->h2n, -1);
 	r->dev = NULL;
 }
 
-/* The core the modems are paired on, which is the one the flow rules go
+/* The core the devices are paired on, which is the one the flow rules go
  * to. Neither the notifier nor the receive handler reaches a core after it
  * is unbound.
  */
-void nss_rawip_bind(struct nss_core *core)
+void nss_redir_bind(struct nss_core *core)
 {
 	rtnl_lock();
-	WRITE_ONCE(nss_rawip_core, core);
+	WRITE_ONCE(nss_redir_core, core);
 	rtnl_unlock();
 	synchronize_net();
 }
 
 /* Under the RTNL and the core's lock, as the arming is. */
-void nss_rawip_arm(struct nss_core *core)
+void nss_redir_arm(struct nss_core *core)
 {
 	struct net_device *dev;
 
 	ASSERT_RTNL();
 
-	if (core != nss_rawip_core || !core->running)
+	if (core != nss_redir_core || !core->running)
 		return;
 
 	for_each_netdev(&init_net, dev)
 		if (dev->flags & IFF_UP)
-			nss_rawip_add(core, dev);
+			nss_redir_add(core, dev);
 }
 
 /* The nodes go with the core; the halt empties its interface table. */
-void nss_rawip_halt(struct nss_core *core)
+void nss_redir_halt(struct nss_core *core)
 {
 	int i;
 
-	if (READ_ONCE(nss_rawip_core) != core)
+	if (READ_ONCE(nss_redir_core) != core)
 		return;
 
-	for (i = 0; i < NSS_RAWIP_MAX; i++) {
-		WRITE_ONCE(nss_rawip_tbl[i].h2n, -1);
-		WRITE_ONCE(nss_rawip_tbl[i].n2h, -1);
+	for (i = 0; i < NSS_REDIR_MAX; i++) {
+		WRITE_ONCE(nss_redir_tbl[i].h2n, -1);
+		WRITE_ONCE(nss_redir_tbl[i].n2h, -1);
 	}
 }
 
-static int nss_rawip_event(struct notifier_block *nb, unsigned long event,
+static int nss_redir_event(struct notifier_block *nb, unsigned long event,
 			   void *ptr)
 {
 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
-	struct nss_core *core = READ_ONCE(nss_rawip_core);
+	struct nss_core *core = READ_ONCE(nss_redir_core);
+
+	if (core)
+		nss_phys_event(core, event, dev);
 
 	switch (event) {
 	case NETDEV_UP:
-		if (!nss_rawip_wanted(dev))
+		if (!nss_redir_wanted(dev))
 			break;
 		if (core) {
 			guard(mutex)(&core->lock);
-			nss_rawip_add(core, dev);
+			nss_redir_add(core, dev);
 		} else {
-			nss_rawip_add(NULL, dev);
+			nss_redir_add(NULL, dev);
 		}
 		break;
 	case NETDEV_GOING_DOWN:
 	case NETDEV_UNREGISTER:
 		/* Gone from the table by its slot, not by what it is now. */
-		if (!nss_rawip_find(dev))
+		if (!nss_redir_find(dev))
 			break;
 		if (core) {
 			guard(mutex)(&core->lock);
-			nss_rawip_del(core, dev);
+			nss_redir_del(core, dev);
 		} else {
-			nss_rawip_del(NULL, dev);
+			nss_redir_del(NULL, dev);
 		}
 		break;
 	}
@@ -574,19 +651,19 @@ static int nss_rawip_event(struct notifier_block *nb, unsigned long event,
 	return NOTIFY_DONE;
 }
 
-static struct notifier_block nss_rawip_nb = {
-	.notifier_call = nss_rawip_event,
+static struct notifier_block nss_redir_nb = {
+	.notifier_call = nss_redir_event,
 };
 
-void nss_rawip_print(struct seq_file *s)
+void nss_redir_print(struct seq_file *s)
 {
 	int i;
 
-	seq_printf(s, "enabled %d\n", nss_rawip_enable);
+	seq_printf(s, "enabled %d\n", nss_redir_enable);
 
 	rtnl_lock();
-	for (i = 0; i < NSS_RAWIP_MAX; i++) {
-		const struct nss_rawip *r = &nss_rawip_tbl[i];
+	for (i = 0; i < NSS_REDIR_MAX; i++) {
+		const struct nss_redir *r = &nss_redir_tbl[i];
 
 		if (!r->dev)
 			continue;
@@ -598,21 +675,21 @@ void nss_rawip_print(struct seq_file *s)
 	rtnl_unlock();
 }
 
-int nss_rawip_init(void)
+int nss_redir_init(void)
 {
 	int i;
 
 	/* A free slot must not match node 0. */
-	for (i = 0; i < NSS_RAWIP_MAX; i++)
-		nss_rawip_tbl[i] = (struct nss_rawip){ .n2h = -1, .h2n = -1 };
+	for (i = 0; i < NSS_REDIR_MAX; i++)
+		nss_redir_tbl[i] = (struct nss_redir){ .n2h = -1, .h2n = -1 };
 
-	return register_netdevice_notifier(&nss_rawip_nb);
+	return register_netdevice_notifier(&nss_redir_nb);
 }
 
 /* After the cores are gone. Unregistering replays every device's going-down
  * and unregister events, which give back each slot.
  */
-void nss_rawip_exit(void)
+void nss_redir_exit(void)
 {
-	unregister_netdevice_notifier(&nss_rawip_nb);
+	unregister_netdevice_notifier(&nss_redir_nb);
 }
