@@ -36,7 +36,7 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  static void ath11k_dp_htt_htc_tx_complete(struct ath11k_base *ab,
  					  struct sk_buff *skb)
  {
-@@ -869,6 +875,173 @@ done:
+@@ -869,6 +875,174 @@ done:
  }
  EXPORT_SYMBOL(ath11k_dp_service_srng);
  
@@ -165,7 +165,8 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 +	ath11k_nss_wifi_ring(&soc->reo_exception, ab,
 +			     dp->reo_except_ring.ring_id, reg_base);
 +
-+	if (nss_wifi_soc_register(soc))
++	ab->nss_soc = nss_wifi_soc_register(soc);
++	if (ab->nss_soc < 0)
 +		ath11k_warn(ab, "NSS firmware would not take the ring description\n");
 +
 +	kfree(soc);
@@ -178,7 +179,7 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 +	struct nss_wifi_pdev pdev = {};
 +	struct resource *res;
 +
-+	if (!ath11k_nss_target(ab))
++	if (ab->nss_soc < 0)
 +		return;
 +
 +	res = platform_get_resource(to_platform_device(ab->dev),
@@ -203,14 +204,14 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 +	pdev.num_rx_swdesc = 3 * DP_RXDMA_BUF_RING_SIZE;
 +	pdev.target_pdev_id = ar->pdev->pdev_id;
 +
-+	if (nss_wifi_pdev_register(&pdev))
++	if (nss_wifi_pdev_register(ab->nss_soc, &pdev))
 +		ath11k_warn(ab, "NSS firmware would not take radio %d\n", id);
 +}
 +
  void ath11k_dp_pdev_free(struct ath11k_base *ab)
  {
  	struct ath11k *ar;
-@@ -914,6 +1087,14 @@ int ath11k_dp_pdev_alloc(struct ath11k_b
+@@ -914,6 +1088,14 @@ int ath11k_dp_pdev_alloc(struct ath11k_b
  	int ret;
  	int i;
  
@@ -225,7 +226,7 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  	/* TODO:Per-pdev rx ring unlike tx ring which is mapped to different AC's */
  	for (i = 0; i < ab->num_radios; i++) {
  		ar = ab->pdevs[i].ar;
-@@ -929,6 +1110,8 @@ int ath11k_dp_pdev_alloc(struct ath11k_b
+@@ -929,6 +1111,8 @@ int ath11k_dp_pdev_alloc(struct ath11k_b
  				    i);
  			goto err;
  		}
@@ -234,13 +235,35 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  	}
  
  	return 0;
-@@ -1025,6 +1208,9 @@ void ath11k_dp_free(struct ath11k_base *
+@@ -1025,6 +1209,10 @@ void ath11k_dp_free(struct ath11k_base *
  	struct ath11k_dp *dp = &ab->dp;
  	int i;
  
-+	if (ath11k_nss_target(ab))
-+		nss_wifi_soc_unregister();
++	if (ab->nss_soc >= 0)
++		nss_wifi_soc_unregister(ab->nss_soc);
++	ab->nss_soc = -1;
 +
  	ath11k_dp_link_desc_cleanup(ab, dp->link_desc_banks,
  				    HAL_WBM_IDLE_LINK, &dp->wbm_idle_ring);
+ 
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
+@@ -2962,6 +2962,7 @@ struct ath11k_base *ath11k_core_alloc(st
+ 	init_completion(&ab->restart_completed);
+ 
+ 	ab->dev = dev;
++	ab->nss_soc = -1;
+ 	ab->hif.bus = bus;
+ 
+ 	return ab;
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -935,6 +935,8 @@ struct ath11k_base {
+ 	struct ath11k_wmi_base wmi_ab;
+ 	struct completion fw_ready;
+ 	int num_radios;
++	/* The NSS firmware's instance for these radios, or negative. */
++	int nss_soc;
+ 	/* HW channel counters frequency value in hertz common to all MACs */
+ 	u32 cc_freq_hz;
  

@@ -14,10 +14,8 @@ builds the airtime metric from is taken from the PPDU statistics instead.
 
 Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 ---
-Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp_rx.c
-===================================================================
---- backports-7.2.orig/drivers/net/wireless/ath/ath11k/dp_rx.c
-+++ backports-7.2/drivers/net/wireless/ath/ath11k/dp_rx.c
+--- a/drivers/net/wireless/ath/ath11k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
 @@ -1381,6 +1381,9 @@ ath11k_update_per_peer_tx_stats(struct a
  	u32 tx_duration = 0;
  	u8 tid = HTT_PPDU_STATS_NON_QOS_TID;
@@ -56,10 +54,8 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp_rx.c
  	rcu_read_unlock();
  }
  
-Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
-===================================================================
---- backports-7.2.orig/drivers/net/wireless/ath/ath11k/mac.c
-+++ backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
 @@ -3570,6 +3570,14 @@ static void ath11k_mac_op_bss_info_chang
  					    ret);
  		}
@@ -150,29 +146,31 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
 +	.rx = ath11k_nss_mesh_rx,
 +};
 +
- static void ath11k_nss_vdev_register(struct ath11k_vif *arvif,
- 				     struct ieee80211_vif *vif)
- {
-@@ -6996,13 +7068,20 @@ static void ath11k_nss_vdev_register(str
+ /* The firmware owns the radio's rings, so an interface it does not take
+  * cannot carry data at all and is refused.
+  */
+@@ -6996,13 +7069,22 @@ static int ath11k_nss_vdev_register(stru
  	if (!wdev || !wdev->netdev)
- 		return;
+ 		return 0;
  
--	ret = nss_wifi_vdev_register(wdev->netdev, ar->pdev_idx, arvif->vdev_id,
--				     vif->addr,
+-	ret = nss_wifi_vdev_register(ar->ab->nss_soc, wdev->netdev,
+-				     ar->pdev_idx, arvif->vdev_id, vif->addr,
 -				     vif->type == NL80211_IFTYPE_AP,
 -				     ath11k_nss_vdev_mode(ar->ab, vif,
 -							  IEEE80211_OFFLOAD_ENCAP_ENABLED),
 -				     ath11k_nss_vdev_mode(ar->ab, vif,
 -							  IEEE80211_OFFLOAD_DECAP_ENABLED));
 +	if (vif->type == NL80211_IFTYPE_MESH_POINT)
-+		ret = nss_wifi_mesh_register(wdev->netdev, ar->pdev_idx,
-+					     arvif->vdev_id, vif->addr,
++		ret = nss_wifi_mesh_register(ar->ab->nss_soc, wdev->netdev,
++					     ar->pdev_idx, arvif->vdev_id,
++					     vif->addr,
 +					     ath11k_nss_vdev_mode(ar->ab, vif,
 +								  IEEE80211_OFFLOAD_ENCAP_ENABLED),
 +					     &ath11k_nss_mesh_ops, arvif);
 +	else
-+		ret = nss_wifi_vdev_register(wdev->netdev, ar->pdev_idx,
-+					     arvif->vdev_id, vif->addr,
++		ret = nss_wifi_vdev_register(ar->ab->nss_soc, wdev->netdev,
++					     ar->pdev_idx, arvif->vdev_id,
++					     vif->addr,
 +					     vif->type == NL80211_IFTYPE_AP,
 +					     ath11k_nss_vdev_mode(ar->ab, vif,
 +								  IEEE80211_OFFLOAD_ENCAP_ENABLED),
@@ -181,33 +179,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
  	if (ret < 0) {
  		ath11k_warn(ar->ab, "failed to give vdev %d to the NSS firmware: %d\n",
  			    arvif->vdev_id, ret);
-@@ -10127,6 +10206,7 @@ static int ath11k_mac_op_sta_state(struc
- 	enum ieee80211_ap_reg_power power_type;
- 	struct cur_regulatory_info *reg_info;
- 	struct ath11k_peer *peer;
-+	u16 peer_id;
- 	int ret = 0;
- 
- 	/* cancel must be done outside the mutex to avoid deadlock */
-@@ -10195,9 +10275,17 @@ static int ath11k_mac_op_sta_state(struc
- 		peer = ath11k_peer_find(ar->ab, arvif->vdev_id, sta->addr);
- 		if (peer)
- 			peer->is_authorized = true;
-+		peer_id = peer ? peer->peer_id : 0;
- 
- 		spin_unlock_bh(&ar->ab->base_lock);
- 
-+		/* An open mesh installs no key, which is where the firmware
-+		 * is otherwise told a peer may pass frames.
-+		 */
-+		if (ar->ab->nss_offload && peer_id &&
-+		    vif->type == NL80211_IFTYPE_MESH_POINT)
-+			nss_wifi_peer_authorize(peer_id);
-+
- 		if (vif->type == NL80211_IFTYPE_STATION && arvif->is_up) {
- 			ret = ath11k_wmi_set_peer_param(ar, sta->addr,
- 							arvif->vdev_id,
-@@ -10283,6 +10371,44 @@ static int ath11k_mac_op_net_setup_tc(st
+@@ -10302,6 +10384,44 @@ static int ath11k_mac_op_net_setup_tc(st
   * The subsystem only asks once it has resolved the destination to a
   * station it holds.
   */
@@ -252,7 +224,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
  static int ath11k_mac_op_net_fill_forward_path(struct ieee80211_hw *hw,
  					       struct ieee80211_vif *vif,
  					       struct ieee80211_sta *sta,
-@@ -10339,6 +10465,7 @@ static const struct ieee80211_ops ath11k
+@@ -10358,6 +10478,7 @@ static const struct ieee80211_ops ath11k
  	.flush_sta			= ath11k_mac_op_flush_sta,
  	.sta_statistics			= ath11k_mac_op_sta_statistics,
  	.net_setup_tc			= ath11k_mac_op_net_setup_tc,
