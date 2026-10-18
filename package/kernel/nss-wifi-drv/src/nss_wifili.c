@@ -108,28 +108,92 @@ struct nss_wifili_ctx {
 	struct nss_wifili_mem txdescext;
 };
 
-/* The one core that runs wifili, and what the WLAN driver said about its
- * rings. The WLAN driver is loaded and unloaded independently of this one and
- * knows nothing about which core is which, so the binding lives here.
+/* The one core that runs wifili. The WLAN driver is loaded and unloaded
+ * independently of this one and knows nothing about which core is which, so
+ * the binding lives here.
  */
 static struct nss_core *nss_wifili_core;
-static struct nss_wifi_soc nss_wifili_soc;
-static struct nss_wifi_pdev nss_wifili_pdev[NSS_WIFILI_MAX_PDEV_NUM_MSG];
-static bool nss_wifili_have_soc;
-static u8 nss_wifili_pdevs;
-static int nss_wifili_radio_if[NSS_WIFILI_MAX_PDEV_NUM_MSG];
 static DEFINE_MUTEX(nss_wifili_lock);
 
-/* The device of the radio whose rings the firmware reaps. Every interface on
- * it is the firmware's, with or without a virtual device of its own. It is a
- * platform device, so it outlives the WLAN driver and its address stays its
- * own.
+/* One wifili instance: what the WLAN driver said about its rings, and what
+ * the firmware made of them. Instance 0 carries the radios inside the SoC,
+ * the others radios on their own chip, each under an interface and a node
+ * type of its own.
  */
-static struct device *nss_wifili_radio;
+struct nss_wifili_soc {
+	struct nss_wifi_soc desc;
+	struct nss_wifi_pdev pdev[NSS_WIFILI_MAX_PDEV_NUM_MSG];
+	int radio_if[NSS_WIFILI_MAX_PDEV_NUM_MSG];
+	u8 pdevs;
+	bool used;
+	bool started;
+	/* The device of the radios whose rings the firmware reaps. Every
+	 * interface on it is the firmware's, with or without a virtual device
+	 * of its own. The bus device outlives the WLAN driver, so its address
+	 * stays its own.
+	 */
+	struct device *radio;
+	struct nss_wifili_mem txdesc;
+	struct nss_wifili_mem txdescext;
+};
+
+static const struct {
+	u32 if_num;
+	u32 node;
+} nss_wifili_soc_if[] = {
+	{ NSS_INTERFACE_WIFILI, NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_INTERNAL },
+	{ NSS_INTERFACE_WIFILI_EXT0, NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_EXTERNAL0 },
+	{ NSS_INTERFACE_WIFILI_EXT1, NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_EXTERNAL1 },
+};
+
+static struct nss_wifili_soc nss_wifili_socs[ARRAY_SIZE(nss_wifili_soc_if)];
+
+static u32 nss_wifili_soc_ifnum(const struct nss_wifili_soc *soc)
+{
+	return nss_wifili_soc_if[soc - nss_wifili_socs].if_num;
+}
+
+/* A registered instance, under nss_wifili_lock. */
+static struct nss_wifili_soc *nss_wifili_soc_get(int id)
+{
+	if (id < 0 || id >= ARRAY_SIZE(nss_wifili_socs) ||
+	    !nss_wifili_socs[id].used)
+		return NULL;
+
+	return &nss_wifili_socs[id];
+}
+
+/* The instance a firmware message is about, from the softirq that delivers
+ * it. The callbacks it carries are withdrawn before the instance is reused.
+ */
+static struct nss_wifili_soc *nss_wifili_soc_of(u32 if_num)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(nss_wifili_soc_if); i++)
+		if (nss_wifili_soc_if[i].if_num == NSS_INTERFACE_NUM_GET(if_num))
+			return &nss_wifili_socs[i];
+
+	return NULL;
+}
+
+bool nss_wifili_is_soc(u32 if_num)
+{
+	return nss_wifili_soc_of(if_num);
+}
 
 bool nss_wifili_owns(const struct net_device *dev)
 {
-	return dev->dev.parent && dev->dev.parent == READ_ONCE(nss_wifili_radio);
+	int i;
+
+	if (!dev->dev.parent)
+		return false;
+
+	for (i = 0; i < ARRAY_SIZE(nss_wifili_socs); i++)
+		if (dev->dev.parent == READ_ONCE(nss_wifili_socs[i].radio))
+			return true;
+
+	return false;
 }
 
 void nss_wifili_bind(struct nss_core *core)
@@ -139,65 +203,111 @@ void nss_wifili_bind(struct nss_core *core)
 }
 
 /* Keep what the WLAN driver says; starting the firmware is a separate act,
- * because a running core takes the hardware with it.
+ * because a running core takes the hardware with it. Returns the instance.
  */
-int nss_wifi_soc_register(const struct nss_wifi_soc *soc)
+int nss_wifi_soc_register(const struct nss_wifi_soc *desc)
 {
+	struct nss_wifili_soc *soc;
+	int i;
+
 	guard(mutex)(&nss_wifili_lock);
 
-	if (soc->num_tcl > NSS_WIFI_MAX_TCL_RINGS ||
-	    soc->num_reo > NSS_WIFI_MAX_REO_RINGS)
+	if (desc->num_tcl > NSS_WIFI_MAX_TCL_RINGS ||
+	    desc->num_reo > NSS_WIFI_MAX_REO_RINGS ||
+	    desc->num_pdevs > NSS_WIFILI_MAX_PDEV_NUM_MSG)
 		return -EINVAL;
 
-	nss_wifili_soc = *soc;
-	nss_wifili_pdevs = 0;
-	nss_wifili_have_soc = true;
+	for (i = desc->external; i < ARRAY_SIZE(nss_wifili_socs); i++)
+		if (!nss_wifili_socs[i].used)
+			break;
+	if (i == ARRAY_SIZE(nss_wifili_socs) || (!desc->external && i))
+		return -EBUSY;
 
-	return 0;
+	soc = &nss_wifili_socs[i];
+	soc->desc = *desc;
+	soc->pdevs = 0;
+	memset(soc->radio_if, 0xff, sizeof(soc->radio_if));
+	soc->used = true;
+
+	return i;
 }
 EXPORT_SYMBOL_GPL(nss_wifi_soc_register);
 
-void nss_wifi_soc_unregister(void)
+static void nss_wifili_soc_stop(struct nss_core *core,
+				struct nss_wifili_soc *soc);
+
+static bool nss_wifili_any_started(void)
 {
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(nss_wifili_socs); i++)
+		if (nss_wifili_socs[i].started)
+			return true;
+
+	return false;
+}
+
+void nss_wifi_soc_unregister(int id)
+{
+	struct nss_core *core;
+	struct nss_wifili_soc *soc;
+
 	guard(mutex)(&nss_wifili_lock);
-	nss_wifili_have_soc = false;
-	nss_wifili_pdevs = 0;
+
+	soc = nss_wifili_soc_get(id);
+	if (!soc)
+		return;
 
 	/* The WLAN driver is about to free the rings this reaches into, and a
 	 * receive poll that read the callback a moment ago is still holding
 	 * it, so the withdrawal is not complete until that poll has ended.
-	 *
-	 * A firmware started on those rings keeps reaping them after they are
+	 */
+	WRITE_ONCE(soc->desc.link_desc_return, NULL);
+	WRITE_ONCE(soc->desc.rx_80211, NULL);
+	WRITE_ONCE(soc->desc.peer_stats, NULL);
+	soc->used = false;
+	soc->pdevs = 0;
+
+	core = nss_wifili_core;
+	if (!core)
+		return;
+
+	/* A firmware started on those rings keeps reaping them after they are
 	 * freed and after they are allocated again for the next WLAN
 	 * instance, whose entries it then resolves against descriptors it
-	 * never issued. It is stopped with them.
+	 * never issued. A running one is told to let go of them. A dead one
+	 * is halted, but only once every radio it lent buffers to has
+	 * stopped, which is when the last of their resets gets here.
 	 */
-	WRITE_ONCE(nss_wifili_soc.link_desc_return, NULL);
-	WRITE_ONCE(nss_wifili_soc.rx_80211, NULL);
-	WRITE_ONCE(nss_wifili_soc.peer_stats, NULL);
-	if (!nss_wifili_core)
-		return;
-	if (nss_wifili_core->wifili_started)
-		nss_core_stop(nss_wifili_core);
-	else
-		nss_rings_quiesce(nss_wifili_core);
+	if (soc->started && core->running) {
+		scoped_guard(mutex, &core->lock)
+			nss_wifili_soc_stop(core, soc);
+	} else if (soc->started) {
+		soc->started = false;
+		if (!nss_wifili_any_started())
+			nss_core_stop(core);
+	} else {
+		nss_rings_quiesce(core);
+	}
 }
 EXPORT_SYMBOL_GPL(nss_wifi_soc_unregister);
 
-static bool nss_wifili_described(void)
+static bool nss_wifili_described(const struct nss_wifili_soc *soc)
 {
-	return nss_wifili_have_soc &&
-	       nss_wifili_pdevs == nss_wifili_soc.num_pdevs;
+	return soc->used && soc->pdevs == soc->desc.num_pdevs;
 }
 
-int nss_wifi_pdev_register(const struct nss_wifi_pdev *pdev)
+int nss_wifi_pdev_register(int id, const struct nss_wifi_pdev *pdev)
 {
+	struct nss_wifili_soc *soc;
+
 	guard(mutex)(&nss_wifili_lock);
 
-	if (!nss_wifili_have_soc || nss_wifili_pdevs >= ARRAY_SIZE(nss_wifili_pdev))
+	soc = nss_wifili_soc_get(id);
+	if (!soc || soc->pdevs >= soc->desc.num_pdevs)
 		return -EINVAL;
 
-	nss_wifili_pdev[nss_wifili_pdevs++] = *pdev;
+	soc->pdev[soc->pdevs++] = *pdev;
 
 	pr_info("nss-wifi-drv: radio %u rxdma id %u base %#x x%u hw %#x/%#x swdesc %u\n",
 		pdev->radio_id, pdev->rxdma.id, pdev->rxdma.base,
@@ -207,7 +317,7 @@ int nss_wifi_pdev_register(const struct nss_wifi_pdev *pdev)
 	/* After a reset of the WLAN driver, which is the last thing it does
 	 * before its interfaces come back.
 	 */
-	if (nss_wifili_core && nss_wifili_described())
+	if (nss_wifili_core && nss_wifili_described(soc))
 		nss_core_resume(nss_wifili_core);
 
 	return 0;
@@ -221,16 +331,27 @@ EXPORT_SYMBOL_GPL(nss_wifi_pdev_register);
  */
 bool nss_wifili_reset(struct nss_core *core, bool started)
 {
+	bool reset = false;
+	int i;
+
 	guard(mutex)(&nss_wifili_lock);
 
 	if (!core->wifi_on || core->wifili_started != started ||
-	    (!started && !core->running) ||
-	    !nss_wifili_have_soc || !nss_wifili_soc.reset)
+	    (!started && !core->running))
 		return false;
 
-	nss_wifili_soc.reset(nss_wifili_soc.priv);
+	for (i = 0; i < ARRAY_SIZE(nss_wifili_socs); i++) {
+		struct nss_wifili_soc *soc = &nss_wifili_socs[i];
 
-	return true;
+		if (!soc->used || !soc->desc.reset ||
+		    (started && !soc->started))
+			continue;
+
+		soc->desc.reset(soc->desc.priv);
+		reset = true;
+	}
+
+	return reset;
 }
 
 /* The one message the firmware sends unasked that must be acted on.
@@ -287,7 +408,8 @@ void nss_wifili_stats_print(struct seq_file *s)
 		   st.rxwbm_stats.err_src_invalid);
 }
 
-static void nss_wifili_peer_stats(const struct nss_cmn_msg *ncm, u32 len)
+static void nss_wifili_peer_stats(const struct nss_wifili_soc *soc,
+				  const struct nss_cmn_msg *ncm, u32 len)
 {
 	void (*report)(void *priv, u16 peer_id,
 		       const struct nss_wifi_peer_stats *st);
@@ -295,7 +417,7 @@ static void nss_wifili_peer_stats(const struct nss_cmn_msg *ncm, u32 len)
 	u32 body, n, stride, i;
 	const u8 *p;
 
-	report = READ_ONCE(nss_wifili_soc.peer_stats);
+	report = READ_ONCE(soc->desc.peer_stats);
 	body = len - sizeof(*ncm);
 	if (!report || body < sizeof(*m) || ncm->len < sizeof(*m))
 		return;
@@ -325,18 +447,19 @@ static void nss_wifili_peer_stats(const struct nss_cmn_msg *ncm, u32 len)
 		for (j = 0; j < ARRAY_SIZE(c->tx.drop_stats); j++)
 			st.tx_failed += c->tx.drop_stats[j];
 
-		report(nss_wifili_soc.priv, c->peer_id, &st);
+		report(soc->desc.priv, c->peer_id, &st);
 	}
 }
 
 void nss_wifili_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
 		       u32 len)
 {
+	struct nss_wifili_soc *soc = nss_wifili_soc_of(ncm->interface);
 	void (*home)(void *priv, const u32 *buf_addr_info);
 	const struct nss_wifili_msg *m;
 
 	if (ncm->type == NSS_WIFILI_PEER_STATS_MSG) {
-		nss_wifili_peer_stats(ncm, len);
+		nss_wifili_peer_stats(soc, ncm, len);
 		return;
 	}
 
@@ -375,12 +498,12 @@ void nss_wifili_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
 	 */
 	core->link_desc_seen++;
 
-	home = READ_ONCE(nss_wifili_soc.link_desc_return);
+	home = READ_ONCE(soc->desc.link_desc_return);
 	if (!home)
 		return;
 
 	m = container_of_const(ncm, struct nss_wifili_msg, cm);
-	home(nss_wifili_soc.priv, (const u32 *)&m->msg.linkdescinfomsg);
+	home(soc->desc.priv, (const u32 *)&m->msg.linkdescinfomsg);
 	core->link_desc_returned++;
 }
 
@@ -599,7 +722,7 @@ out:
 
 /* Give the firmware a node for one radio and return the number it chose. */
 static int nss_wifili_radio_alloc(struct nss_core *core,
-				  struct nss_wifili_msg *scratch)
+				  const struct nss_wifili_soc *soc)
 {
 	struct nss_dynamic_interface_msg d;
 	int ret;
@@ -607,7 +730,7 @@ static int nss_wifili_radio_alloc(struct nss_core *core,
 	memset(&d, 0, sizeof(d));
 	d.cm.interface = NSS_INTERFACE_DYNAMIC;
 	d.cm.type = NSS_DYNAMIC_INTERFACE_ALLOC_NODE;
-	d.msg.alloc_node.type = NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_INTERNAL;
+	d.msg.alloc_node.type = nss_wifili_soc_if[soc - nss_wifili_socs].node;
 
 	ret = nss_msg_send(core, &d, sizeof(d));
 	if (ret)
@@ -659,11 +782,15 @@ struct nss_wifili_vdev {
 	struct net_device *dev;
 	int if_num;
 	u32 vdev_id;
+	struct nss_wifili_soc *soc;
 };
 
 static struct nss_wifili_vdev nss_wifili_vdev_tbl[NSS_WIFILI_VDEV_MAX];
-/* Interface numbers whose receive the WLAN driver gets to look at first. */
+/* Interface numbers whose receive the WLAN driver gets to look at first, and
+ * the instance whose driver that is.
+ */
 static DECLARE_BITMAP(nss_wifili_vdev_on, NSS_INTERFACE_MAX);
+static struct nss_wifili_soc *nss_wifili_vdev_soc[NSS_INTERFACE_MAX];
 
 static struct {
 	int if_num;
@@ -867,15 +994,15 @@ static void nss_me_peer_gone(const u8 *mac);
  * and a frame that is not what the WLAN firmware expects is released instead
  * of transmitted.
  */
-int nss_wifi_vdev_register(struct net_device *dev, u8 radio, u32 vdev_id,
-			   const u8 *mac, bool ap, u8 encap, u8 decap)
+int nss_wifi_vdev_register(int id, struct net_device *dev, u8 radio,
+			   u32 vdev_id, const u8 *mac, bool ap, u8 encap,
+			   u8 decap)
 {
 	struct nss_wifi_vdev_config_msg cfg = {};
 	struct nss_dynamic_interface_msg d;
+	struct nss_wifili_soc *soc;
 	struct nss_core *core;
 	int if_num, ret, i;
-
-	WRITE_ONCE(nss_wifili_radio, dev->dev.parent);
 
 	/* A core the WLAN driver's reset brings back is restarted behind it,
 	 * while the subsystem is already adding the interfaces again.
@@ -886,11 +1013,16 @@ int nss_wifi_vdev_register(struct net_device *dev, u8 radio, u32 vdev_id,
 
 	guard(mutex)(&nss_wifili_lock);
 
+	soc = nss_wifili_soc_get(id);
+	if (!soc)
+		return -ENODEV;
+	WRITE_ONCE(soc->radio, dev->dev.parent);
+
 	core = nss_wifili_core;
-	if (!core || !core->wifili_started)
+	if (!core || !soc->started)
 		return -EAGAIN;
 
-	if (radio >= nss_wifili_pdevs || nss_wifili_radio_if[radio] < 0)
+	if (radio >= soc->pdevs || soc->radio_if[radio] < 0)
 		return -ENODEV;
 
 	for (i = 0; i < ARRAY_SIZE(nss_wifili_vdev_tbl); i++)
@@ -912,7 +1044,7 @@ int nss_wifi_vdev_register(struct net_device *dev, u8 radio, u32 vdev_id,
 		return -ERANGE;
 
 	ether_addr_copy(cfg.mac_addr, mac);
-	cfg.radio_ifnum = nss_wifili_radio_if[radio];
+	cfg.radio_ifnum = soc->radio_if[radio];
 	cfg.vdev_id = vdev_id;
 	cfg.opmode = ap ? nss_wifili_ap_opmode : NSS_WIFI_VDEV_OPMODE_STA;
 
@@ -943,8 +1075,11 @@ int nss_wifi_vdev_register(struct net_device *dev, u8 radio, u32 vdev_id,
 	nss_wifili_vdev_tbl[i].dev = dev;
 	nss_wifili_vdev_tbl[i].if_num = if_num;
 	nss_wifili_vdev_tbl[i].vdev_id = vdev_id;
+	nss_wifili_vdev_tbl[i].soc = soc;
 
 	dev_hold(dev);
+	/* Before the device: the receive poll finds the instance by it. */
+	WRITE_ONCE(nss_wifili_vdev_soc[if_num], soc);
 	rcu_assign_pointer(core->iface[if_num], dev);
 	set_bit(if_num, nss_wifili_vdev_on);
 
@@ -962,26 +1097,31 @@ EXPORT_SYMBOL_GPL(nss_wifi_vdev_register);
  * it receives goes on to the mesh decapsulation node rather than to the host,
  * so the network device is bound to the mesh nodes, not to it.
  */
-int nss_wifi_mesh_register(struct net_device *dev, u8 radio, u32 vdev_id,
-			   const u8 *mac, u8 mode,
+int nss_wifi_mesh_register(int id, struct net_device *dev, u8 radio,
+			   u32 vdev_id, const u8 *mac, u8 mode,
 			   const struct nss_wifi_mesh_ops *ops, void *priv)
 {
 	struct nss_wifi_vdev_config_msg cfg = {};
 	struct nss_wifi_vdev_enable_msg up = {};
 	struct nss_dynamic_interface_msg d = {};
+	struct nss_wifili_soc *soc;
 	struct nss_core *core;
 	int if_num, ret, i;
 
-	WRITE_ONCE(nss_wifili_radio, dev->dev.parent);
-
 	guard(mutex)(&nss_wifili_lock);
 
+	soc = nss_wifili_soc_get(id);
+	if (!soc)
+		return -ENODEV;
+	WRITE_ONCE(soc->radio, dev->dev.parent);
+
 	core = nss_wifili_core;
-	if (!core || !core->wifili_started)
+	if (!core || !soc->started)
 		return -EAGAIN;
-	if (!core->mesh_capable)
+	/* The capability is asked of the internal instance alone. */
+	if (!core->mesh_capable || id)
 		return -EOPNOTSUPP;
-	if (radio >= nss_wifili_pdevs || nss_wifili_radio_if[radio] < 0)
+	if (radio >= soc->pdevs || soc->radio_if[radio] < 0)
 		return -ENODEV;
 
 	for (i = 0; i < ARRAY_SIZE(nss_wifili_vdev_tbl); i++)
@@ -1011,7 +1151,7 @@ int nss_wifi_mesh_register(struct net_device *dev, u8 radio, u32 vdev_id,
 	}
 
 	ether_addr_copy(cfg.mac_addr, mac);
-	cfg.radio_ifnum = nss_wifili_radio_if[radio];
+	cfg.radio_ifnum = soc->radio_if[radio];
 	cfg.vdev_id = vdev_id;
 	cfg.opmode = NSS_WIFI_VDEV_OPMODE_AP;
 	cfg.vap_ext_mode = WIFI_VDEV_EXT_MODE_MESH_LINK;
@@ -1043,6 +1183,7 @@ int nss_wifi_mesh_register(struct net_device *dev, u8 radio, u32 vdev_id,
 	nss_wifili_vdev_tbl[i].dev = dev;
 	nss_wifili_vdev_tbl[i].if_num = if_num;
 	nss_wifili_vdev_tbl[i].vdev_id = vdev_id;
+	nss_wifili_vdev_tbl[i].soc = soc;
 
 	dev_info(core->dev, "mesh vdev %u on radio %u is interface %d\n",
 		 vdev_id, radio, if_num);
@@ -1051,7 +1192,42 @@ int nss_wifi_mesh_register(struct net_device *dev, u8 radio, u32 vdev_id,
 }
 EXPORT_SYMBOL_GPL(nss_wifi_mesh_register);
 
-static void nss_wifili_peer_flush(struct nss_core *core, u32 vdev_id);
+static void nss_wifili_peer_flush(struct nss_core *core,
+				  const struct nss_wifili_soc *soc,
+				  u32 vdev_id);
+
+static void nss_wifili_vdev_release(struct nss_core *core, int i)
+{
+	struct net_device *dev = nss_wifili_vdev_tbl[i].dev;
+	int if_num = nss_wifili_vdev_tbl[i].if_num;
+
+	/* The frame table first, and a grace period, so no receive poll is
+	 * still holding the device when it goes. Halting a core clears the
+	 * whole table on its own, so the reference is dropped against what was
+	 * there rather than against this having been the one to remove it.
+	 */
+	clear_bit(if_num, nss_wifili_vdev_on);
+	if (rcu_replace_pointer(core->iface[if_num], NULL, true)) {
+		synchronize_rcu();
+		dev_put(dev);
+	}
+	nss_me_drop(if_num);
+
+	nss_wifili_vdev_tbl[i].dev = NULL;
+	nss_wifili_vdev_tbl[i].if_num = -1;
+
+	nss_wifili_peer_flush(core, nss_wifili_vdev_tbl[i].soc,
+			      nss_wifili_vdev_tbl[i].vdev_id);
+	nss_mesh_stop(core, if_num);
+
+	/* Down before the node goes: a virtual device released while it is
+	 * still up faults the firmware.
+	 */
+	nss_wifili_vdev_msg(core, if_num, NSS_WIFI_VDEV_INTERFACE_DOWN_MSG,
+			    NULL, sizeof(struct nss_wifi_vdev_disable_msg));
+	nss_wifili_vdev_free(core, if_num);
+	nss_mesh_del(core, if_num);
+}
 
 void nss_wifi_vdev_unregister(struct net_device *dev)
 {
@@ -1064,40 +1240,9 @@ void nss_wifi_vdev_unregister(struct net_device *dev)
 	if (!core)
 		return;
 
-	for (i = 0; i < ARRAY_SIZE(nss_wifili_vdev_tbl); i++) {
-		int if_num = nss_wifili_vdev_tbl[i].if_num;
-
-		if (nss_wifili_vdev_tbl[i].dev != dev)
-			continue;
-
-		/* The frame table first, and a grace period, so no receive
-		 * poll is still holding the device when it goes. Halting a
-		 * core clears the whole table on its own, so the reference is
-		 * dropped against what was there rather than against this
-		 * having been the one to remove it.
-		 */
-		clear_bit(if_num, nss_wifili_vdev_on);
-		if (rcu_replace_pointer(core->iface[if_num], NULL, true)) {
-			synchronize_rcu();
-			dev_put(dev);
-		}
-		nss_me_drop(if_num);
-
-		nss_wifili_vdev_tbl[i].dev = NULL;
-		nss_wifili_vdev_tbl[i].if_num = -1;
-
-		nss_wifili_peer_flush(core, nss_wifili_vdev_tbl[i].vdev_id);
-		nss_mesh_stop(core, if_num);
-
-		/* Down before the node goes: a virtual device released while
-		 * it is still up faults the firmware.
-		 */
-		nss_wifili_vdev_msg(core, if_num,
-				    NSS_WIFI_VDEV_INTERFACE_DOWN_MSG, NULL,
-				    sizeof(struct nss_wifi_vdev_disable_msg));
-		nss_wifili_vdev_free(core, if_num);
-		nss_mesh_del(core, if_num);
-	}
+	for (i = 0; i < ARRAY_SIZE(nss_wifili_vdev_tbl); i++)
+		if (nss_wifili_vdev_tbl[i].dev == dev)
+			nss_wifili_vdev_release(core, i);
 }
 EXPORT_SYMBOL_GPL(nss_wifi_vdev_unregister);
 
@@ -1234,6 +1379,7 @@ MODULE_PARM_DESC(peer_mem, "bytes given to the firmware for each peer record");
 #define NSS_WIFILI_PEER_MEM	nss_wifili_peer_mem
 
 struct nss_wifili_peer {
+	const struct nss_wifili_soc *soc;
 	u16 peer_id;
 	u32 vdev_id;
 	u8 mac[ETH_ALEN];
@@ -1248,7 +1394,8 @@ static struct nss_wifili_peer nss_wifili_peer_tbl[NSS_WIFILI_PEER_MAX];
  * the virtual device's do: the firmware reads the body it expects where it
  * expects it, and a length borrowed from another message is not refused.
  */
-static int nss_wifili_soc_msg(struct nss_core *core, u32 type,
+static int nss_wifili_soc_msg(struct nss_core *core,
+			      const struct nss_wifili_soc *soc, u32 type,
 			      const void *body, size_t len)
 {
 	struct nss_wifili_msg *m;
@@ -1258,9 +1405,10 @@ static int nss_wifili_soc_msg(struct nss_core *core, u32 type,
 	if (!m)
 		return -ENOMEM;
 
-	m->cm.interface = NSS_INTERFACE_WIFILI;
+	m->cm.interface = nss_wifili_soc_ifnum(soc);
 	m->cm.type = type;
-	memcpy(&m->msg, body, len);
+	if (len)
+		memcpy(&m->msg, body, len);
 
 	ret = nss_msg_send(core, m,
 			   offsetof(struct nss_wifili_msg, msg) + len);
@@ -1272,18 +1420,20 @@ static int nss_wifili_soc_msg(struct nss_core *core, u32 type,
 	return ret;
 }
 
-static int nss_wifili_peer_msg(struct nss_core *core, u32 type,
+static int nss_wifili_peer_msg(struct nss_core *core,
+			       const struct nss_wifili_soc *soc, u32 type,
 			       const struct nss_wifili_peer_msg *pm)
 {
-	return nss_wifili_soc_msg(core, type, pm, core->fw->peer_msg_len);
+	return nss_wifili_soc_msg(core, soc, type, pm, core->fw->peer_msg_len);
 }
 
 static void nss_wifili_peer_release(struct nss_core *core, int i);
 
-int nss_wifi_peer_create(u32 vdev_id, const u8 *mac, u16 peer_id,
+int nss_wifi_peer_create(int id, u32 vdev_id, const u8 *mac, u16 peer_id,
 			 u16 hw_ast_idx, u32 tx_ast_hash)
 {
 	struct nss_wifili_peer_msg pm = {};
+	struct nss_wifili_soc *soc;
 	struct nss_core *core;
 	dma_addr_t dma;
 	size_t size;
@@ -1295,8 +1445,9 @@ int nss_wifi_peer_create(u32 vdev_id, const u8 *mac, u16 peer_id,
 	if (!nss_wifili_peers)
 		return 0;
 
+	soc = nss_wifili_soc_get(id);
 	core = nss_wifili_core;
-	if (!core || !core->wifili_started)
+	if (!core || !soc || !soc->started)
 		return -EAGAIN;
 
 	/* The WLAN driver drops a station's record on paths that never reach a
@@ -1307,6 +1458,7 @@ int nss_wifi_peer_create(u32 vdev_id, const u8 *mac, u16 peer_id,
 	 */
 	for (i = 0; i < ARRAY_SIZE(nss_wifili_peer_tbl); i++)
 		if (nss_wifili_peer_tbl[i].mem &&
+		    nss_wifili_peer_tbl[i].soc == soc &&
 		    nss_wifili_peer_tbl[i].vdev_id == vdev_id &&
 		    ether_addr_equal(nss_wifili_peer_tbl[i].mac, mac))
 			nss_wifili_peer_release(core, i);
@@ -1334,7 +1486,7 @@ int nss_wifi_peer_create(u32 vdev_id, const u8 *mac, u16 peer_id,
 	 */
 	pm.peer_memory_size = 0;
 
-	ret = nss_wifili_peer_msg(core, NSS_WIFILI_PEER_CREATE_MSG, &pm);
+	ret = nss_wifili_peer_msg(core, soc, NSS_WIFILI_PEER_CREATE_MSG, &pm);
 	if (ret) {
 		dma_free_coherent(core->dev, size, mem, dma);
 		return ret;
@@ -1347,6 +1499,7 @@ int nss_wifi_peer_create(u32 vdev_id, const u8 *mac, u16 peer_id,
 	dev_info(core->dev, "peer %pM: id %u ast_idx %u ast_hash %#x vdev %u\n",
 		 mac, peer_id, hw_ast_idx, tx_ast_hash, vdev_id);
 
+	nss_wifili_peer_tbl[i].soc = soc;
 	nss_wifili_peer_tbl[i].peer_id = peer_id;
 	nss_wifili_peer_tbl[i].vdev_id = vdev_id;
 	ether_addr_copy(nss_wifili_peer_tbl[i].mac, mac);
@@ -1370,7 +1523,8 @@ static void nss_wifili_peer_release(struct nss_core *core, int i)
 	ether_addr_copy(pm.peer_mac_addr, nss_wifili_peer_tbl[i].mac);
 	pm.vdev_id = nss_wifili_peer_tbl[i].vdev_id;
 	pm.peer_id = nss_wifili_peer_tbl[i].peer_id;
-	ret = nss_wifili_peer_msg(core, NSS_WIFILI_PEER_DELETE_MSG, &pm);
+	ret = nss_wifili_peer_msg(core, nss_wifili_peer_tbl[i].soc,
+				  NSS_WIFILI_PEER_DELETE_MSG, &pm);
 	/* -ENODEV is a core that is no longer running the record. */
 	if (ret && ret != -ENODEV) {
 		dev_warn(core->dev, "peer %pM: delete failed: %d, record kept\n",
@@ -1394,12 +1548,15 @@ static void nss_wifili_peer_release(struct nss_core *core, int i)
  * peer released that way is never named here, and both this table and the
  * firmware's would keep it for as long as the driver stayed loaded.
  */
-static void nss_wifili_peer_flush(struct nss_core *core, u32 vdev_id)
+static void nss_wifili_peer_flush(struct nss_core *core,
+				  const struct nss_wifili_soc *soc,
+				  u32 vdev_id)
 {
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(nss_wifili_peer_tbl); i++)
 		if (nss_wifili_peer_tbl[i].mem &&
+		    nss_wifili_peer_tbl[i].soc == soc &&
 		    nss_wifili_peer_tbl[i].vdev_id == vdev_id)
 			nss_wifili_peer_release(core, i);
 }
@@ -1411,16 +1568,18 @@ static void nss_wifili_peer_flush(struct nss_core *core, u32 vdev_id)
  * itself, which is every fragment and every message integrity check. Without
  * it those frames are handled as though they were in the clear.
  */
-int nss_wifi_peer_security(u16 peer_id, bool group, u32 cipher,
+int nss_wifi_peer_security(int id, u16 peer_id, bool group, u32 cipher,
 			   const u8 *mic_key)
 {
 	struct nss_wifili_peer_security_type_msg sm = {};
+	struct nss_wifili_soc *soc;
 	struct nss_core *core;
 
 	guard(mutex)(&nss_wifili_lock);
 
+	soc = nss_wifili_soc_get(id);
 	core = nss_wifili_core;
-	if (!core || !core->wifili_started)
+	if (!core || !soc || !soc->started)
 		return -EAGAIN;
 
 	sm.peer_id = peer_id;
@@ -1429,7 +1588,7 @@ int nss_wifi_peer_security(u16 peer_id, bool group, u32 cipher,
 	if (mic_key)
 		memcpy(sm.mic_key, mic_key, sizeof(sm.mic_key));
 
-	return nss_wifili_soc_msg(core, NSS_WIFILI_PEER_SECURITY_TYPE_MSG,
+	return nss_wifili_soc_msg(core, soc, NSS_WIFILI_PEER_SECURITY_TYPE_MSG,
 				  &sm, sizeof(sm));
 }
 EXPORT_SYMBOL_GPL(nss_wifi_peer_security);
@@ -1437,38 +1596,43 @@ EXPORT_SYMBOL_GPL(nss_wifi_peer_security);
 /* A peer the firmware holds unauthorised has its received frames counted and
  * dropped rather than delivered.
  */
-int nss_wifi_peer_authorize(u16 peer_id)
+int nss_wifi_peer_authorize(int id, u16 peer_id)
 {
 	struct nss_wifili_peer_update_auth_flag au = {};
+	struct nss_wifili_soc *soc;
 	struct nss_core *core;
 
 	guard(mutex)(&nss_wifili_lock);
 
+	soc = nss_wifili_soc_get(id);
 	core = nss_wifili_core;
-	if (!core || !core->wifili_started)
+	if (!core || !soc || !soc->started)
 		return -EAGAIN;
 
 	au.peer_id = peer_id;
 	au.auth_flag = 1;
 
-	return nss_wifili_soc_msg(core, NSS_WIFILI_PEER_UPDATE_AUTH_FLAG,
+	return nss_wifili_soc_msg(core, soc, NSS_WIFILI_PEER_UPDATE_AUTH_FLAG,
 				  &au, sizeof(au));
 }
 EXPORT_SYMBOL_GPL(nss_wifi_peer_authorize);
 
-void nss_wifi_peer_delete(u32 vdev_id, const u8 *mac, u16 peer_id)
+void nss_wifi_peer_delete(int id, u32 vdev_id, const u8 *mac, u16 peer_id)
 {
+	struct nss_wifili_soc *soc;
 	struct nss_core *core;
 	int i;
 
 	guard(mutex)(&nss_wifili_lock);
 
+	soc = nss_wifili_soc_get(id);
 	core = nss_wifili_core;
-	if (!core)
+	if (!core || !soc)
 		return;
 
 	for (i = 0; i < ARRAY_SIZE(nss_wifili_peer_tbl); i++) {
 		if (!nss_wifili_peer_tbl[i].mem ||
+		    nss_wifili_peer_tbl[i].soc != soc ||
 		    nss_wifili_peer_tbl[i].peer_id != peer_id)
 			continue;
 
@@ -1711,13 +1875,15 @@ bool nss_wifili_rx_80211(u32 if_num, struct net_device *dev,
 {
 	bool (*rx)(void *priv, struct net_device *dev, struct sk_buff *skb,
 		   struct napi_struct *napi);
+	struct nss_wifili_soc *soc;
 
 	if (!test_bit(if_num, nss_wifili_vdev_on))
 		return false;
 
-	rx = READ_ONCE(nss_wifili_soc.rx_80211);
+	soc = READ_ONCE(nss_wifili_vdev_soc[if_num]);
+	rx = READ_ONCE(soc->desc.rx_80211);
 
-	return rx && rx(nss_wifili_soc.priv, dev, skb, napi);
+	return rx && rx(soc->desc.priv, dev, skb, napi);
 }
 
 /* From the receive poll, for a multicast frame a vdev handed up. */
@@ -1761,6 +1927,7 @@ static int nss_me_peer_id(int if_num, const u8 *mac)
 
 	for (i = 0; i < ARRAY_SIZE(nss_wifili_peer_tbl); i++)
 		if (nss_wifili_peer_tbl[i].mem &&
+		    nss_wifili_peer_tbl[i].soc == nss_wifili_vdev_tbl[v].soc &&
 		    nss_wifili_peer_tbl[i].vdev_id == nss_wifili_vdev_tbl[v].vdev_id &&
 		    ether_addr_equal(nss_wifili_peer_tbl[i].mac, mac))
 			return nss_wifili_peer_tbl[i].peer_id;
@@ -2116,7 +2283,8 @@ MODULE_PARM_DESC(mem_profile, "memory profile the firmware sizes its pools from"
  */
 #define NSS_WIFILI_BUF_RANGES	4
 
-static int nss_wifili_radio_buf_cfg(struct nss_core *core, int if_num,
+static int nss_wifili_radio_buf_cfg(struct nss_core *core,
+				    const struct nss_wifili_soc *soc, int if_num,
 				    u32 bufs)
 {
 	struct nss_wifili_msg *m __free(kfree) = kzalloc(sizeof(*m), GFP_KERNEL);
@@ -2128,7 +2296,7 @@ static int nss_wifili_radio_buf_cfg(struct nss_core *core, int if_num,
 
 	for (range = 0; range < NSS_WIFILI_BUF_RANGES; range++) {
 		memset(m, 0, sizeof(*m));
-		m->cm.interface = NSS_INTERFACE_WIFILI;
+		m->cm.interface = nss_wifili_soc_ifnum(soc);
 		m->cm.type = NSS_WIFILI_RADIO_BUF_CFG;
 		m->msg.radiocfgmsg.radio_if_num = if_num;
 		m->msg.radiocfgmsg.radiomsg.radiobufcfgmsg.buf_cnt = bufs;
@@ -2144,78 +2312,120 @@ static int nss_wifili_radio_buf_cfg(struct nss_core *core, int if_num,
 	return 0;
 }
 
-static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s)
+static void nss_wifili_radio_free(struct nss_core *core,
+				  const struct nss_wifili_soc *soc, int if_num)
 {
-	struct nss_wifili_ctx *w;
-	struct nss_wifili_msg *m;
+	struct nss_dynamic_interface_msg d = {};
+
+	d.cm.interface = NSS_INTERFACE_DYNAMIC;
+	d.cm.type = NSS_DYNAMIC_INTERFACE_DEALLOC_NODE;
+	d.msg.dealloc_node.type = nss_wifili_soc_if[soc - nss_wifili_socs].node;
+	d.msg.dealloc_node.if_num = if_num;
+	nss_msg_send(core, &d, sizeof(d));
+}
+
+/* The transmit descriptors go back to the core's memory once the firmware
+ * has let the instance go.
+ */
+static void nss_wifili_txdesc_free(struct nss_core *core,
+				   struct nss_wifili_soc *soc)
+{
+	nss_mem_free(core, soc->txdesc.cpu);
+	nss_mem_free(core, soc->txdescext.cpu);
+	memset(&soc->txdesc, 0, sizeof(soc->txdesc));
+	memset(&soc->txdescext, 0, sizeof(soc->txdescext));
+}
+
+/* Take one instance off its rings while the core runs on for the others: its
+ * virtual devices and peers first, then the instance in the order the
+ * firmware tears one down, stop, each radio, reset. The WLAN driver's next
+ * description starts it again.
+ */
+static void nss_wifili_soc_stop(struct nss_core *core,
+				struct nss_wifili_soc *soc)
+{
 	int i, ret;
 
-	/* Against a halt freeing the memory this hands over. */
-	guard(mutex)(&core->lock);
-
-	if (!core->running)
-		return -ENODEV;
-
-	if (!nss_wifili_have_soc || !nss_wifili_pdevs) {
-		seq_puts(s, "no WLAN driver has described its rings\n");
-		return 0;
-	}
-
-	/* One initialisation per core, whichever asks for it: an accepted one
-	 * leaves the radio in a state the next is judged against.
-	 */
-	if (core->wifili_probed) {
-		seq_puts(s, "wifili is already initialised on this core\n");
-		return 0;
-	}
-	core->wifili_probed = true;
-
-	/* What a halted core held went with it. Its records are freed here
-	 * rather than deleted, because the new firmware never knew them.
-	 */
-	for (i = 0; i < ARRAY_SIZE(nss_wifili_peer_tbl); i++) {
-		struct nss_wifili_peer *p = &nss_wifili_peer_tbl[i];
-
-		if (p->mem)
-			dma_free_coherent(core->dev, p->size, p->mem, p->dma);
-		p->mem = NULL;
-	}
 	for (i = 0; i < ARRAY_SIZE(nss_wifili_vdev_tbl); i++)
-		nss_wifili_vdev_tbl[i].dev = NULL;
-	nss_me_drop(-1);
-	nss_mesh_reset();
+		if (nss_wifili_vdev_tbl[i].dev &&
+		    nss_wifili_vdev_tbl[i].soc == soc)
+			nss_wifili_vdev_release(core, i);
+	for (i = 0; i < ARRAY_SIZE(nss_wifili_peer_tbl); i++)
+		if (nss_wifili_peer_tbl[i].mem &&
+		    nss_wifili_peer_tbl[i].soc == soc)
+			nss_wifili_peer_release(core, i);
+
+	if (soc->started) {
+		ret = nss_wifili_soc_msg(core, soc, NSS_WIFILI_STOP_MSG, NULL, 0);
+		if (ret)
+			dev_warn(core->dev, "wifili %u: stop failed: %d\n",
+				 nss_wifili_soc_ifnum(soc), ret);
+	}
+
+	for (i = 0; i < ARRAY_SIZE(soc->radio_if); i++) {
+		struct nss_wifili_pdev_deinit_msg d = {
+			.ifnum = soc->pdev[i].radio_id,
+		};
+
+		if (soc->radio_if[i] < 0)
+			continue;
+
+		ret = nss_wifili_soc_msg(core, soc, NSS_WIFILI_PDEV_DEINIT_MSG,
+					 &d, sizeof(d));
+		if (ret)
+			dev_warn(core->dev, "wifili %u: radio %u deinit failed: %d\n",
+				 nss_wifili_soc_ifnum(soc), d.ifnum, ret);
+		nss_wifili_radio_free(core, soc, soc->radio_if[i]);
+		soc->radio_if[i] = -1;
+	}
+
+	ret = nss_wifili_soc_msg(core, soc, NSS_WIFILI_SOC_RESET_MSG, NULL, 0);
+	dev_info(core->dev, "wifili %u: stopped, reset rc %d\n",
+		 nss_wifili_soc_ifnum(soc), ret);
+
+	soc->started = false;
+	core->wifili_started = nss_wifili_any_started();
+	nss_wifili_txdesc_free(core, soc);
+}
+
+static int nss_wifili_soc_start(struct nss_core *core,
+				struct nss_wifili_soc *soc, struct seq_file *s)
+{
+	const struct nss_wifi_soc *desc = &soc->desc;
+	u32 ifnum = nss_wifili_soc_ifnum(soc);
+	struct nss_wifili_msg *m;
+	bool first = !core->wifili_probed;
+	bool inited = false;
+	int i, ret;
 
 	m = kzalloc(sizeof(*m), GFP_KERNEL);
-	w = kzalloc(sizeof(*w), GFP_KERNEL);
-	if (!m || !w) {
-		ret = -ENOMEM;
-		goto out;
-	}
+	if (!m)
+		return -ENOMEM;
 
 	/* The transmit descriptors are the firmware's to carve up and the
 	 * host's to provide, so they are not part of what the WLAN driver
 	 * describes.
 	 */
-	ret = nss_wifili_mem_get(core, &w->txdesc,
-				 NSS_WIFILI_TX_DESC_MEM(nss_wifili_pdevs,
+	ret = nss_wifili_mem_get(core, &soc->txdesc,
+				 NSS_WIFILI_TX_DESC_MEM(soc->pdevs,
 							NSS_WIFILI_TX_DESC_STRIDE));
 	if (ret)
 		goto out;
 
-	ret = nss_wifili_mem_get(core, &w->txdescext,
-				 NSS_WIFILI_TX_DESC_MEM(nss_wifili_pdevs,
+	ret = nss_wifili_mem_get(core, &soc->txdescext,
+				 NSS_WIFILI_TX_DESC_MEM(soc->pdevs,
 							NSS_WIFILI_TX_DESC_EXT_STRIDE));
 	if (ret)
 		goto out;
 
-	m->cm.interface = NSS_INTERFACE_WIFILI;
+	m->cm.interface = ifnum;
 	m->cm.type = NSS_WIFILI_INIT_MSG;
-	m->msg.init.hssm.dev_base_addr = nss_wifili_soc.dev_base;
-	m->msg.init.hssm.shadow_rdptr_mem_addr = nss_wifili_soc.shadow_rd;
-	m->msg.init.hssm.shadow_wrptr_mem_addr = nss_wifili_soc.shadow_wr;
-	m->msg.init.hssm.lmac_rings_start_id = nss_wifili_soc.lmac_ring_start;
-	m->msg.init.num_tcl_data_rings = nss_wifili_soc.num_tcl;
-	m->msg.init.num_reo_dest_rings = nss_wifili_soc.num_reo;
+	m->msg.init.hssm.dev_base_addr = desc->dev_base;
+	m->msg.init.hssm.shadow_rdptr_mem_addr = desc->shadow_rd;
+	m->msg.init.hssm.shadow_wrptr_mem_addr = desc->shadow_wr;
+	m->msg.init.hssm.lmac_rings_start_id = desc->lmac_ring_start;
+	m->msg.init.num_tcl_data_rings = desc->num_tcl;
+	m->msg.init.num_reo_dest_rings = desc->num_reo;
 
 	/* How much memory the firmware sizes its own pools from. Nothing here
 	 * has ever set it, so it has always said zero, and a receive path with
@@ -2226,55 +2436,55 @@ static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s)
 	 */
 	m->msg.init.soc_mem_profile = nss_wifili_mem_profile;
 
-	for (i = 0; i < nss_wifili_soc.num_tcl; i++) {
+	for (i = 0; i < desc->num_tcl; i++) {
 		nss_wifili_ring_fill(&m->msg.init.tcl_ring_info[i],
-				     &nss_wifili_soc.tcl[i]);
+				     &desc->tcl[i]);
 		nss_wifili_ring_fill(&m->msg.init.tx_comp_ring[i],
-				     &nss_wifili_soc.txcomp[i]);
+				     &desc->txcomp[i]);
 	}
 
-	for (i = 0; i < nss_wifili_soc.num_reo; i++)
+	for (i = 0; i < desc->num_reo; i++)
 		nss_wifili_ring_fill(&m->msg.init.reo_dest_ring[i],
-				     &nss_wifili_soc.reo_dest[i]);
+				     &desc->reo_dest[i]);
 
 	nss_wifili_ring_fill(&m->msg.init.reo_reinject_ring,
-			     &nss_wifili_soc.reo_reinject);
-	nss_wifili_ring_fill(&m->msg.init.rx_rel_ring, &nss_wifili_soc.rx_rel);
+			     &desc->reo_reinject);
+	nss_wifili_ring_fill(&m->msg.init.rx_rel_ring, &desc->rx_rel);
 	nss_wifili_ring_fill(&m->msg.init.reo_exception_ring,
-			     &nss_wifili_soc.reo_exception);
+			     &desc->reo_exception);
 
 	/* One descriptor pool per radio. The message carries a separate count
 	 * for each, and the firmware reaps a pool per radio whatever the count
 	 * says, so a pool left at zero is one it reaps against and never
 	 * sized.
 	 */
-	m->msg.init.wtdim.num_pool = nss_wifili_pdevs;
+	m->msg.init.wtdim.num_pool = soc->pdevs;
 	m->msg.init.wtdim.num_tx_desc = NSS_WIFILI_TX_DESC;
 	m->msg.init.wtdim.num_tx_desc_ext = NSS_WIFILI_TX_DESC;
-	if (nss_wifili_pdevs > 1) {
+	if (soc->pdevs > 1) {
 		m->msg.init.wtdim.num_tx_desc_2 = NSS_WIFILI_TX_DESC;
 		m->msg.init.wtdim.num_tx_desc_ext_2 = NSS_WIFILI_TX_DESC;
 	}
-	if (nss_wifili_pdevs > 2) {
+	if (soc->pdevs > 2) {
 		m->msg.init.wtdim.num_tx_desc_3 = NSS_WIFILI_TX_DESC;
 		m->msg.init.wtdim.num_tx_desc_ext_3 = NSS_WIFILI_TX_DESC;
 	}
 
 	m->msg.init.wtdim.num_memaddr = 2;
-	m->msg.init.wtdim.memory_addr[0] = w->txdesc.dma;
-	m->msg.init.wtdim.memory_size[0] = w->txdesc.size;
-	m->msg.init.wtdim.memory_addr[1] = w->txdescext.dma;
-	m->msg.init.wtdim.memory_size[1] = w->txdescext.size;
+	m->msg.init.wtdim.memory_addr[0] = soc->txdesc.dma;
+	m->msg.init.wtdim.memory_size[0] = soc->txdesc.size;
+	m->msg.init.wtdim.memory_addr[1] = soc->txdescext.dma;
+	m->msg.init.wtdim.memory_size[1] = soc->txdescext.size;
 	m->msg.init.wtdim.ext_desc_page_num = 1;
 	m->msg.init.wtdim.num_tx_device_limit = NSS_WIFILI_TX_DESC *
-						nss_wifili_pdevs;
+						soc->pdevs;
 
 	/* Left at zero, the core takes a range trap seconds after it starts. */
 	m->msg.init.tx_sw_internode_queue_size = NSS_WIFILI_TX_PROCESSQ;
 
-	m->msg.init.target_type = nss_wifili_soc.target_type;
-	m->msg.init.wrip.tlv_size = nss_wifili_soc.tlv_size;
-	m->msg.init.wrip.rx_buf_len = nss_wifili_soc.rx_buf_len;
+	m->msg.init.target_type = desc->target_type;
+	m->msg.init.wrip.tlv_size = desc->tlv_size;
+	m->msg.init.wrip.rx_buf_len = desc->rx_buf_len;
 
 	/* A fault in the firmware's transmit path names a descriptor by a page
 	 * and an offset within it, both of which are the host's. Print what was
@@ -2282,23 +2492,23 @@ static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s)
 	 */
 	dev_info(core->dev,
 		 "wifili: txdesc %pad+%zx ext %pad+%zx, %u pools, %u tcl, %u reo\n",
-		 &w->txdesc.dma, w->txdesc.size, &w->txdescext.dma,
-		 w->txdescext.size, nss_wifili_pdevs, nss_wifili_soc.num_tcl,
-		 nss_wifili_soc.num_reo);
-	for (i = 0; i < nss_wifili_soc.num_tcl; i++)
+		 &soc->txdesc.dma, soc->txdesc.size, &soc->txdescext.dma,
+		 soc->txdescext.size, soc->pdevs, desc->num_tcl,
+		 desc->num_reo);
+	for (i = 0; i < desc->num_tcl; i++)
 		dev_info(core->dev,
 			 "wifili: tcl%d id %u base %#x x%u  txcomp id %u base %#x x%u hw %#x/%#x  tclhw %#x/%#x tcle %u\n",
-			 i, nss_wifili_soc.tcl[i].id,
-			 nss_wifili_soc.tcl[i].base,
-			 nss_wifili_soc.tcl[i].num_entries,
-			 nss_wifili_soc.txcomp[i].id,
-			 nss_wifili_soc.txcomp[i].base,
-			 nss_wifili_soc.txcomp[i].num_entries,
-			 nss_wifili_soc.txcomp[i].hwreg[0],
-			 nss_wifili_soc.txcomp[i].hwreg[1],
-			 nss_wifili_soc.tcl[i].hwreg[0],
-			 nss_wifili_soc.tcl[i].hwreg[1],
-			 nss_wifili_soc.tcl[i].entry_size);
+			 i, desc->tcl[i].id,
+			 desc->tcl[i].base,
+			 desc->tcl[i].num_entries,
+			 desc->txcomp[i].id,
+			 desc->txcomp[i].base,
+			 desc->txcomp[i].num_entries,
+			 desc->txcomp[i].hwreg[0],
+			 desc->txcomp[i].hwreg[1],
+			 desc->tcl[i].hwreg[0],
+			 desc->tcl[i].hwreg[1],
+			 desc->tcl[i].entry_size);
 	/* Where the ring pointers really live. A ring's head and tail are not
 	 * all in its registers: the pointer the other side publishes is in one
 	 * of two shared arrays, indexed by the ring's own number in one and by
@@ -2308,31 +2518,31 @@ static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s)
 	 */
 	dev_info(core->dev,
 		 "wifili: shadow rd %#x wr %#x lmac from %u\n",
-		 nss_wifili_soc.shadow_rd, nss_wifili_soc.shadow_wr,
-		 nss_wifili_soc.lmac_ring_start);
+		 desc->shadow_rd, desc->shadow_wr,
+		 desc->lmac_ring_start);
 	/* The receive rings, for the same reason and one more: whether the
 	 * firmware ever puts a buffer in the ring the hardware writes into is
 	 * the difference between a receive path that is misrouted and one
 	 * that never starts, and the two look identical from the host.
 	 */
-	for (i = 0; i < nss_wifili_soc.num_reo; i++)
+	for (i = 0; i < desc->num_reo; i++)
 		dev_info(core->dev,
 			 "wifili: reo%d id %u base %#x x%u hw %#x/%#x\n",
-			 i, nss_wifili_soc.reo_dest[i].id,
-			 nss_wifili_soc.reo_dest[i].base,
-			 nss_wifili_soc.reo_dest[i].num_entries,
-			 nss_wifili_soc.reo_dest[i].hwreg[0],
-			 nss_wifili_soc.reo_dest[i].hwreg[1]);
-	for (i = 0; i < nss_wifili_pdevs; i++)
+			 i, desc->reo_dest[i].id,
+			 desc->reo_dest[i].base,
+			 desc->reo_dest[i].num_entries,
+			 desc->reo_dest[i].hwreg[0],
+			 desc->reo_dest[i].hwreg[1]);
+	for (i = 0; i < soc->pdevs; i++)
 		dev_info(core->dev,
 			 "wifili: radio %u rxdma id %u base %#x x%u hw %#x/%#x swdesc %u\n",
-			 nss_wifili_pdev[i].radio_id,
-			 nss_wifili_pdev[i].rxdma.id,
-			 nss_wifili_pdev[i].rxdma.base,
-			 nss_wifili_pdev[i].rxdma.num_entries,
-			 nss_wifili_pdev[i].rxdma.hwreg[0],
-			 nss_wifili_pdev[i].rxdma.hwreg[1],
-			 nss_wifili_pdev[i].num_rx_swdesc);
+			 soc->pdev[i].radio_id,
+			 soc->pdev[i].rxdma.id,
+			 soc->pdev[i].rxdma.base,
+			 soc->pdev[i].rxdma.num_entries,
+			 soc->pdev[i].rxdma.hwreg[0],
+			 soc->pdev[i].rxdma.hwreg[1],
+			 soc->pdev[i].num_rx_swdesc);
 
 	ret = nss_msg_send(core, m, offsetof(struct nss_wifili_msg, msg) +
 				    sizeof(m->msg.init));
@@ -2340,48 +2550,52 @@ static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s)
 		   m->cm.response, m->cm.error);
 	if (ret)
 		goto out;
+	inited = true;
 
 	/* The receive rings are filled from the firmware's Wi-Fi share of the
 	 * payload pool, one payload per entry for as long as the radio is up.
 	 * Declared before the radios are initialised, because the first fill
-	 * runs when they are.
+	 * runs when they are. The share is the core's, set once per boot.
 	 */
-	ret = nss_wifi_pool_set(core, nss_wifili_payloads);
-	seq_printf(s, "%-14s rc %d (%u payloads)\n", "wifi pool:", ret,
-		   nss_wifili_payloads);
-	if (ret)
-		goto out;
+	if (first) {
+		ret = nss_wifi_pool_set(core, nss_wifili_payloads);
+		seq_printf(s, "%-14s rc %d (%u payloads)\n", "wifi pool:", ret,
+			   nss_wifili_payloads);
+		if (ret)
+			goto out;
+	}
+	core->wifili_probed = true;
 
-	for (i = 0; i < nss_wifili_pdevs; i++) {
+	for (i = 0; i < soc->pdevs; i++) {
 		int if_num;
 
 		/* A radio is a node before it is a radio. The initialisation
 		 * that follows is addressed to the SoC but names the radio,
 		 * and the firmware has nothing to name until one exists.
 		 */
-		if_num = nss_wifili_radio_alloc(core, m);
-		nss_wifili_radio_if[i] = if_num;
+		if_num = nss_wifili_radio_alloc(core, soc);
+		soc->radio_if[i] = if_num;
 		seq_printf(s, "radio %u node:  if_num %d\n",
-			   nss_wifili_pdev[i].radio_id, if_num);
+			   soc->pdev[i].radio_id, if_num);
 		if (if_num < 0) {
 			ret = if_num;
 			goto out;
 		}
 
 		memset(m, 0, sizeof(*m));
-		m->cm.interface = NSS_INTERFACE_WIFILI;
+		m->cm.interface = ifnum;
 		m->cm.type = NSS_WIFILI_PDEV_INIT_MSG;
 		nss_wifili_ring_fill(&m->msg.pdevmsg.rxdma_ring,
-				     &nss_wifili_pdev[i].rxdma);
-		m->msg.pdevmsg.radio_id = nss_wifili_pdev[i].radio_id;
-		m->msg.pdevmsg.lmac_id = nss_wifili_pdev[i].lmac_id;
-		m->msg.pdevmsg.target_pdev_id = nss_wifili_pdev[i].target_pdev_id;
-		m->msg.pdevmsg.num_rx_swdesc = nss_wifili_pdev[i].num_rx_swdesc;
+				     &soc->pdev[i].rxdma);
+		m->msg.pdevmsg.radio_id = soc->pdev[i].radio_id;
+		m->msg.pdevmsg.lmac_id = soc->pdev[i].lmac_id;
+		m->msg.pdevmsg.target_pdev_id = soc->pdev[i].target_pdev_id;
+		m->msg.pdevmsg.num_rx_swdesc = soc->pdev[i].num_rx_swdesc;
 		ret = nss_msg_send(core, m,
 				   offsetof(struct nss_wifili_msg, msg) +
 				   sizeof(m->msg.pdevmsg));
 		seq_printf(s, "radio %u init:  rc %d response %u error %u\n",
-			   nss_wifili_pdev[i].radio_id, ret, m->cm.response,
+			   soc->pdev[i].radio_id, ret, m->cm.response,
 			   m->cm.error);
 		if (ret)
 			goto out;
@@ -2394,39 +2608,44 @@ static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s)
 		 * between initialising a radio and starting it.
 		 */
 		memset(m, 0, sizeof(*m));
-		m->cm.interface = NSS_INTERFACE_WIFILI;
+		m->cm.interface = ifnum;
 		m->cm.type = NSS_WIFILI_STATS_V2_CFG_MSG;
 		m->msg.scm.cfg = 0;
 		ret = nss_msg_send(core, m,
 				   offsetof(struct nss_wifili_msg, msg) +
 				   sizeof(m->msg.scm));
 		seq_printf(s, "radio %u v2stats: rc %d\n",
-			   nss_wifili_pdev[i].radio_id, ret);
+			   soc->pdev[i].radio_id, ret);
 		if (ret)
 			goto out;
 
-		ret = nss_wifili_radio_buf_cfg(core, if_num,
+		ret = nss_wifili_radio_buf_cfg(core, soc, if_num,
 					       nss_wifili_radio_bufs);
 		seq_printf(s, "radio %u bufs:  rc %d (%u per range)\n",
-			   nss_wifili_pdev[i].radio_id, ret,
+			   soc->pdev[i].radio_id, ret,
 			   nss_wifili_radio_bufs);
 		if (ret)
 			goto out;
 	}
 
 	memset(m, 0, sizeof(*m));
-	m->cm.interface = NSS_INTERFACE_WIFILI;
+	m->cm.interface = ifnum;
 	m->cm.type = NSS_WIFILI_START_MSG;
 	ret = nss_msg_send(core, m, offsetof(struct nss_wifili_msg, msg));
 	seq_printf(s, "%-14s rc %d response %u error %u\n", "start:", ret,
 		   m->cm.response, m->cm.error);
 	if (!ret) {
+		soc->started = true;
 		core->wifili_started = true;
-		core->mesh_capable = core->fw->mesh && nss_mesh_probe(core);
+		if (ifnum == NSS_INTERFACE_WIFILI)
+			core->mesh_capable = core->fw->mesh &&
+					     nss_mesh_probe(core);
 		core->wifi_on = true;
 
-		ret = nss_wifili_vdev_next_hop(core);
-		seq_printf(s, "%-14s rc %d\n", "next hop:", ret);
+		if (first) {
+			ret = nss_wifili_vdev_next_hop(core);
+			seq_printf(s, "%-14s rc %d\n", "next hop:", ret);
+		}
 
 		/* Ask for the statistics push. The firmware raises no wifili
 		 * message at all until it is asked, so a receive path that
@@ -2440,7 +2659,7 @@ static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s)
 			goto out;
 
 		memset(m, 0, sizeof(*m));
-		m->cm.interface = NSS_INTERFACE_WIFILI;
+		m->cm.interface = ifnum;
 		m->cm.type = NSS_WIFILI_STATS_CFG_MSG;
 		m->msg.scm.cfg = 1;
 		ret = nss_msg_send(core, m,
@@ -2451,10 +2670,72 @@ static int nss_wifili_start_locked(struct nss_core *core, struct seq_file *s)
 		ret = 0;
 	}
 out:
-	kfree(w);
+	/* Nothing the firmware has been given rings for is left half
+	 * started: it is told to let them go, as on a reset.
+	 */
+	if (!soc->started && inited)
+		nss_wifili_soc_stop(core, soc);
+	else if (!soc->started)
+		nss_wifili_txdesc_free(core, soc);
 	kfree(m);
 
-	return 0;
+	return soc->started ? 0 : ret;
+}
+
+/* Start every instance that has described its radios and is not running yet.
+ * A resume waits for every radio of an instance; a start asked for by hand
+ * takes the radios there are.
+ */
+static void nss_wifili_start_locked(struct nss_core *core, struct seq_file *s,
+				    bool resume)
+{
+	struct nss_wifili_soc *soc;
+	int i, ret;
+
+	/* Against a halt freeing the memory this hands over. */
+	guard(mutex)(&core->lock);
+
+	if (!core->running)
+		return;
+
+	/* What a halted core held went with it. Its records are freed here
+	 * rather than deleted, because the new firmware never knew them.
+	 */
+	if (!core->wifili_started) {
+		for (i = 0; i < ARRAY_SIZE(nss_wifili_peer_tbl); i++) {
+			struct nss_wifili_peer *p = &nss_wifili_peer_tbl[i];
+
+			if (p->mem)
+				dma_free_coherent(core->dev, p->size, p->mem,
+						  p->dma);
+			p->mem = NULL;
+		}
+		for (i = 0; i < ARRAY_SIZE(nss_wifili_vdev_tbl); i++)
+			nss_wifili_vdev_tbl[i].dev = NULL;
+		nss_me_drop(-1);
+		nss_mesh_reset();
+	}
+
+	for (i = 0; i < ARRAY_SIZE(nss_wifili_socs); i++) {
+		soc = &nss_wifili_socs[i];
+
+		/* A halt freed what the firmware held, this instance's
+		 * descriptors with it.
+		 */
+		if (!core->wifili_probed) {
+			soc->started = false;
+			memset(&soc->txdesc, 0, sizeof(soc->txdesc));
+			memset(&soc->txdescext, 0, sizeof(soc->txdescext));
+		}
+
+		if (!soc->used || soc->started || !soc->pdevs ||
+		    (resume && !nss_wifili_described(soc)))
+			continue;
+
+		ret = nss_wifili_soc_start(core, soc, s);
+		seq_printf(s, "%-14s %u rc %d\n", "instance:",
+			   nss_wifili_soc_ifnum(soc), ret);
+	}
 }
 
 int nss_wifili_start(struct seq_file *s)
@@ -2464,7 +2745,9 @@ int nss_wifili_start(struct seq_file *s)
 	if (!nss_wifili_core)
 		return -ENODEV;
 
-	return nss_wifili_start_locked(nss_wifili_core, s);
+	nss_wifili_start_locked(nss_wifili_core, s, false);
+
+	return 0;
 }
 
 /* Start Wi-Fi again on a core that ran it before it was restarted. */
@@ -2475,10 +2758,10 @@ void nss_wifili_resume(struct nss_core *core)
 
 	guard(mutex)(&nss_wifili_lock);
 
-	if (!core->wifi_on || core->wifili_started || !nss_wifili_described())
+	if (!core->wifi_on)
 		return;
 
-	nss_wifili_start_locked(core, &s);
+	nss_wifili_start_locked(core, &s, true);
 	dev_info(core->dev, "Wi-Fi data plane %s\n",
 		 core->wifili_started ? "restarted" : "did not restart");
 }
