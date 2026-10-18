@@ -30,7 +30,7 @@ wifi_load_host() {
 }
 
 start_service() {
-	local dir fw i param
+	local dev dir fw i param qcn want
 
 	[ "$(uci -q get nss-wifi.general.offload)" = "1" ] || {
 		wifi_load_host
@@ -43,9 +43,9 @@ start_service() {
 		return 0
 	}
 
-	# ath11k offloads only the IPQ8074 and IPQ6018 radios; elsewhere none
-	# would ever hand its rings over and the wait below would only delay
-	# the boot.
+	# ath11k offloads the IPQ8074 and IPQ6018 radios and a QCN9074 beside
+	# them; elsewhere none would ever hand its rings over and the wait
+	# below would only delay the boot.
 	grep -qsE 'qcom,ipq(8074|6018)-wifi' /proc/device-tree/soc*/wifi@*/compatible || {
 		wifi_load_host
 		return 0
@@ -91,6 +91,7 @@ start_service() {
 	fi
 	echo 2 > /sys/module/ath11k/parameters/frame_mode 2>/dev/null
 	modprobe ath11k_ahb 2>/dev/null
+	modprobe ath11k_pci 2>/dev/null
 
 	# A radio describes its rings from its own probe, which loading the
 	# bus module only begins, so the bring-up waits for that rather than
@@ -99,10 +100,18 @@ start_service() {
 	# A radio logs its rings as it hands them over, and that line is the
 	# only thing that says the description is complete: the phy appears
 	# early in the probe, well before it. Releasing the core while a radio
-	# is still probing hangs the board.
+	# is still probing hangs the board. A QCN9074 is one radio, and boots
+	# its own firmware first, so it finishes well after the SoC radios.
+	qcn=0
+	for dev in /sys/bus/pci/devices/*; do
+		[ "$(cat "$dev/vendor"):$(cat "$dev/device")" = 0x17cb:0x1104 ] &&
+			qcn=$((qcn + 1))
+	done
 	i=0
 	while [ $i -lt 60 ]; do
-		[ "$(dmesg | grep -c 'nss-wifi-drv: radio')" -gt 0 ] && break
+		want=$(ls -d /sys/bus/platform/drivers/ath11k/*/ieee80211/phy* 2>/dev/null | wc -l)
+		[ "$want" -gt 0 ] &&
+			[ "$(dmesg | grep -c 'nss-wifi-drv: radio')" -ge $((want + qcn)) ] && break
 		sleep 1
 		i=$((i + 1))
 	done
