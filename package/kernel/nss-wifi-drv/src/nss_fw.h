@@ -66,6 +66,8 @@ enum nss_dynamic_interface_type {
 	NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_INTERNAL = 19,
 	NSS_DYNAMIC_INTERFACE_TYPE_GENERIC_REDIR_N2H = 32,
 	NSS_DYNAMIC_INTERFACE_TYPE_GENERIC_REDIR_H2N = 33,
+	NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_EXTERNAL0 = 61,
+	NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_EXTERNAL1 = 62,
 	NSS_DYNAMIC_INTERFACE_TYPE_WIFI_MESH_INNER = 70,
 	NSS_DYNAMIC_INTERFACE_TYPE_WIFI_MESH_OUTER = 71,
 };
@@ -519,8 +521,11 @@ struct nss_ipv6_msg {
 /* The wifili node: the Wi-Fi SoC and its radios. */
 
 #define NSS_WIFILI_INIT_MSG			0
+#define NSS_WIFILI_SOC_RESET_MSG		1
 #define NSS_WIFILI_PDEV_INIT_MSG		2
+#define NSS_WIFILI_PDEV_DEINIT_MSG		3
 #define NSS_WIFILI_START_MSG			4
+#define NSS_WIFILI_STOP_MSG			5
 #define NSS_WIFILI_PEER_CREATE_MSG		6
 #define NSS_WIFILI_PEER_DELETE_MSG		7
 #define NSS_WIFILI_STATS_MSG			10
@@ -606,6 +611,11 @@ struct nss_wifili_pdev_init_msg {
 	u32 target_pdev_id;
 	u8 scheme_id;
 	u8 reserved[3];
+};
+
+/* Names the radio by its index in the instance, not by its node. */
+struct nss_wifili_pdev_deinit_msg {
+	u32 ifnum;
 };
 
 struct nss_wifili_peer_msg {
@@ -766,6 +776,7 @@ struct nss_wifili_msg {
 	union {
 		struct nss_wifili_init_msg init;
 		struct nss_wifili_pdev_init_msg pdevmsg;
+		struct nss_wifili_pdev_deinit_msg pdevdeinit;
 		struct nss_wifili_stats_sync_msg wlsoc_stats;
 		struct nss_wifili_stats_cfg_msg scm;
 		struct nss_wifili_radio_cfg_msg radiocfgmsg;
