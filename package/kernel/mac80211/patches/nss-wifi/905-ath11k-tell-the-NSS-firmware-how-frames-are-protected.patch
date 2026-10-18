@@ -10,10 +10,8 @@ association that authenticates and never authorises.
 
 Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 ---
-Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
-===================================================================
---- backports-7.2.orig/drivers/net/wireless/ath/ath11k/mac.c
-+++ backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
 @@ -6,6 +6,7 @@
  
  #include <net/mac80211.h>
@@ -69,9 +67,9 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
 +			nss_wifi_vdev_security(arvif->nss_ifnum, key->cipher);
 +
 +		if (nss_peer_id) {
-+			nss_wifi_peer_security(nss_peer_id, group, key->cipher,
-+					       mic);
-+			nss_wifi_peer_authorize(nss_peer_id);
++			nss_wifi_peer_security(ab->nss_soc, nss_peer_id, group,
++					       key->cipher, mic);
++			nss_wifi_peer_authorize(ab->nss_soc, nss_peer_id);
 +		}
 +	}
 +
