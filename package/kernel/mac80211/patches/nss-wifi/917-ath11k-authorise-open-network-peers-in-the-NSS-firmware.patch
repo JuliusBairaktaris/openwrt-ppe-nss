@@ -10,11 +10,9 @@ mac80211 authorises the station.
 Assisted-by: Claude:claude-opus-5-5
 Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 ---
-diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
-index 1aa3679..c4f0346 100644
 --- a/drivers/net/wireless/ath/ath11k/mac.c
 +++ b/drivers/net/wireless/ath/ath11k/mac.c
-@@ -10281,11 +10281,10 @@ static int ath11k_mac_op_sta_state(struct ieee80211_hw *hw,
+@@ -10315,11 +10315,10 @@ static int ath11k_mac_op_sta_state(struc
  
  		spin_unlock_bh(&ar->ab->base_lock);
  
@@ -26,6 +24,6 @@ index 1aa3679..c4f0346 100644
 -		if (ar->ab->nss_offload && peer_id &&
 -		    vif->type == NL80211_IFTYPE_MESH_POINT)
 +		if (ar->ab->nss_offload && peer_id)
- 			nss_wifi_peer_authorize(peer_id);
+ 			nss_wifi_peer_authorize(ar->ab->nss_soc, peer_id);
  
  		if (vif->type == NL80211_IFTYPE_STATION && arvif->is_up) {
