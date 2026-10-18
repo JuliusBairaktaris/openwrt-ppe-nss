@@ -92,6 +92,9 @@ unsigned int nss_pool_ceiling(void);
 #define NSS_INTERFACE_VAP_BASE	200
 
 #define NSS_INTERFACE_WIFILI	203
+/* The instances for radios on their own chip. */
+#define NSS_INTERFACE_WIFILI_EXT0	215
+#define NSS_INTERFACE_WIFILI_EXT1	216
 #define NSS_INTERFACE_MAX	228
 
 /* Interrupt causes, one GIC line each: there are no mask or status registers
@@ -458,6 +461,7 @@ struct nss_core {
 int nss_meminfo_init(struct nss_core *core);
 void *nss_mem_alloc(struct nss_core *core, size_t size, u32 align,
 		    u32 *addr_out);
+void nss_mem_free(struct nss_core *core, void *cpu);
 void nss_mem_free_all(struct nss_core *core);
 int nss_wifi_pool_set(struct nss_core *core, u32 payloads);
 void nss_pbuf_pool_free(struct nss_core *core);
@@ -495,6 +499,7 @@ void nss_wifili_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
 		       u32 len);
 void nss_wifili_bind(struct nss_core *core);
 bool nss_wifili_owns(const struct net_device *dev);
+bool nss_wifili_is_soc(u32 if_num);
 void nss_wifili_me_snoop(u32 if_num, struct sk_buff *skb);
 bool nss_wifili_rx_80211(u32 if_num, struct net_device *dev,
 			 struct sk_buff *skb, struct napi_struct *napi);
