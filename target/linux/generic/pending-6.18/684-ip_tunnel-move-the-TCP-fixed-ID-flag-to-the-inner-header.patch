@@ -1,0 +1,53 @@
+From 44dce02a36429356aa12372bd928fc79d45bb965 Mon Sep 17 00:00:00 2001
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Date: Sun, 18 Oct 2026 14:20:14 +0200
+Subject: [PATCH] ip_tunnel: move the TCP fixed-ID flag to the inner header
+
+SKB_GSO_TCP_FIXEDID describes the outer header of an encapsulated GSO
+packet and SKB_GSO_TCP_FIXEDID_INNER the inner one. TCP GRO sets
+SKB_GSO_TCP_FIXEDID for the header it merged. When such a packet is
+forwarded into a tunnel, iptunnel_handle_offloads() makes that header the
+inner one but leaves the flag, so software segmentation gives every
+segment the outer ID of the first and increments the inner IDs.
+
+Move the flag to SKB_GSO_TCP_FIXEDID_INNER when the packet becomes
+encapsulated.
+
+Fixes: 3271f19bf7b9 ("net: gso: restore ids of outer ip headers correctly")
+Link: https://lore.kernel.org/netdev/cover.1792293419.git.julius@bairaktaris.de/
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/net/ipv4/ip_tunnel_core.c
++++ b/net/ipv4/ip_tunnel_core.c
+@@ -174,18 +174,29 @@ EXPORT_SYMBOL_GPL(iptunnel_metadata_repl
+ int iptunnel_handle_offloads(struct sk_buff *skb,
+ 			     int gso_type_mask)
+ {
++	bool inner = false;
+ 	int err;
+ 
+ 	if (likely(!skb->encapsulation)) {
+ 		skb_reset_inner_headers(skb);
+ 		skb->encapsulation = 1;
++		inner = true;
+ 	}
+ 
+ 	if (skb_is_gso(skb)) {
++		struct skb_shared_info *shinfo;
++
+ 		err = skb_header_unclone(skb, GFP_ATOMIC);
+ 		if (unlikely(err))
+ 			return err;
+-		skb_shinfo(skb)->gso_type |= gso_type_mask;
++
++		shinfo = skb_shinfo(skb);
++		/* The header SKB_GSO_TCP_FIXEDID described is now the inner one */
++		if (inner && (shinfo->gso_type & SKB_GSO_TCP_FIXEDID)) {
++			shinfo->gso_type &= ~SKB_GSO_TCP_FIXEDID;
++			shinfo->gso_type |= SKB_GSO_TCP_FIXEDID_INNER;
++		}
++		shinfo->gso_type |= gso_type_mask;
+ 		return 0;
+ 	}
+ 
