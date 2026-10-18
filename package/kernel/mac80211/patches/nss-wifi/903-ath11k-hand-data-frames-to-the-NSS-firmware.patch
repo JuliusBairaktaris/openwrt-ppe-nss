@@ -34,10 +34,8 @@ PPDU end user stats TLV is enabled; the last PPDU carrying data sets it.
 
 Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 ---
-Index: backports-7.2/drivers/net/wireless/ath/ath11k/core.h
-===================================================================
---- backports-7.2.orig/drivers/net/wireless/ath/ath11k/core.h
-+++ backports-7.2/drivers/net/wireless/ath/ath11k/core.h
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
 @@ -67,6 +67,7 @@ extern bool ath11k_nss_offload;
  extern bool ath11k_nss_prefill;
  extern bool ath11k_nss_hash;
@@ -46,7 +44,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/core.h
  
  #define ATH11K_SCAN_TIMEOUT_HZ (20 * HZ)
  
-@@ -378,6 +379,9 @@ struct ath11k_vif {
+@@ -379,6 +380,9 @@ struct ath11k_vif {
  	u8 hal_addr_search_flags;
  	u8 search_type;
  
@@ -56,7 +54,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/core.h
  	struct ath11k *ar;
  	struct ieee80211_vif *vif;
  
-@@ -562,6 +566,8 @@ struct ath11k_sta {
+@@ -563,6 +567,8 @@ struct ath11k_sta {
  	struct rate_info txrate;
  	u32 peer_nss;
  	struct rate_info last_txrate;
@@ -65,10 +63,8 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/core.h
  	u64 rx_duration;
  	u64 tx_duration;
  	u8 rssi_comb;
-Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
-===================================================================
---- backports-7.2.orig/drivers/net/wireless/ath/ath11k/mac.c
-+++ backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
 @@ -5,6 +5,7 @@
   */
  
@@ -151,7 +147,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
  		return;
  	}
  
-@@ -6881,6 +6926,56 @@ static int ath11k_mac_setup_vdev_create_
+@@ -6881,6 +6926,61 @@ static int ath11k_mac_setup_vdev_create_
  	return 0;
  }
  
@@ -178,8 +174,11 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
 +	return ATH11K_HW_TXRX_NATIVE_WIFI;
 +}
 +
-+static void ath11k_nss_vdev_register(struct ath11k_vif *arvif,
-+				     struct ieee80211_vif *vif)
++/* The firmware owns the radio's rings, so an interface it does not take
++ * cannot carry data at all and is refused.
++ */
++static int ath11k_nss_vdev_register(struct ath11k_vif *arvif,
++				    struct ieee80211_vif *vif)
 +{
 +	struct ath11k *ar = arvif->ar;
 +	struct wireless_dev *wdev;
@@ -187,10 +186,10 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
 +
 +	wdev = ieee80211_vif_to_wdev(vif);
 +	if (!wdev || !wdev->netdev)
-+		return;
++		return 0;
 +
-+	ret = nss_wifi_vdev_register(wdev->netdev, ar->pdev_idx, arvif->vdev_id,
-+				     vif->addr,
++	ret = nss_wifi_vdev_register(ar->ab->nss_soc, wdev->netdev,
++				     ar->pdev_idx, arvif->vdev_id, vif->addr,
 +				     vif->type == NL80211_IFTYPE_AP,
 +				     ath11k_nss_vdev_mode(ar->ab, vif,
 +							  IEEE80211_OFFLOAD_ENCAP_ENABLED),
@@ -199,16 +198,18 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
 +	if (ret < 0) {
 +		ath11k_warn(ar->ab, "failed to give vdev %d to the NSS firmware: %d\n",
 +			    arvif->vdev_id, ret);
-+		return;
++		return ret;
 +	}
 +
 +	arvif->nss_ifnum = ret;
++
++	return 0;
 +}
 +
  static void ath11k_mac_op_update_vif_offload(struct ieee80211_hw *hw,
  					     struct ieee80211_vif *vif)
  {
-@@ -7127,6 +7222,7 @@ static int ath11k_mac_op_add_interface(s
+@@ -7127,6 +7227,7 @@ static int ath11k_mac_op_add_interface(s
  
  	arvif->ar = ar;
  	arvif->vif = vif;
@@ -216,17 +217,20 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
  
  	INIT_LIST_HEAD(&arvif->list);
  	INIT_WORK(&arvif->bcn_tx_work, ath11k_mac_bcn_tx_work);
-@@ -7212,6 +7308,9 @@ static int ath11k_mac_op_add_interface(s
+@@ -7212,6 +7313,12 @@ static int ath11k_mac_op_add_interface(s
  
  	ath11k_mac_op_update_vif_offload(hw, vif);
  
-+	if (ab->nss_offload)
-+		ath11k_nss_vdev_register(arvif, vif);
++	if (ab->nss_offload) {
++		ret = ath11k_nss_vdev_register(arvif, vif);
++		if (ret)
++			goto err_vdev_del;
++	}
 +
  	nss = get_num_chains(ar->cfg_tx_chainmask) ? : 1;
  	ret = ath11k_wmi_vdev_set_param_cmd(ar, arvif->vdev_id,
  					    WMI_VDEV_PARAM_NSS, nss);
-@@ -7394,6 +7493,17 @@ static void ath11k_mac_op_remove_interfa
+@@ -7394,6 +7501,17 @@ static void ath11k_mac_op_remove_interfa
  				    arvif->vdev_id, ret);
  	}
  
@@ -244,7 +248,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
  	ret = ath11k_mac_vdev_delete(ar, arvif);
  	if (ret) {
  		ath11k_warn(ab, "failed to delete vdev %d: %d\n",
-@@ -9469,6 +9579,11 @@ static void ath11k_mac_op_sta_statistics
+@@ -9469,6 +9587,11 @@ static void ath11k_mac_op_sta_statistics
  		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_BITRATE);
  	}
  
@@ -256,10 +260,8 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
  	ath11k_mac_put_chain_rssi(sinfo, arsta, "ppdu", false);
  
  	mutex_lock(&ar->conf_mutex);
-Index: backports-7.2/drivers/net/wireless/ath/ath11k/core.c
-===================================================================
---- backports-7.2.orig/drivers/net/wireless/ath/ath11k/core.c
-+++ backports-7.2/drivers/net/wireless/ath/ath11k/core.c
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
 @@ -42,6 +42,10 @@ bool ath11k_nss_offload;
  module_param_named(nss_offload, ath11k_nss_offload, bool, 0644);
  MODULE_PARM_DESC(nss_offload, "Hand the data-path rings to the NSS firmware");
@@ -271,11 +273,9 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/core.c
  bool ath11k_nss_keep_mask;
  module_param_named(nss_keep_mask, ath11k_nss_keep_mask, bool, 0644);
  MODULE_PARM_DESC(nss_keep_mask, "Leave the ring mask alone while offloading");
-Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp.c
-===================================================================
---- backports-7.2.orig/drivers/net/wireless/ath/ath11k/dp.c
-+++ backports-7.2/drivers/net/wireless/ath/ath11k/dp.c
-@@ -1001,6 +1001,7 @@ static void ath11k_nss_wifi_describe(str
+--- a/drivers/net/wireless/ath/ath11k/dp.c
++++ b/drivers/net/wireless/ath/ath11k/dp.c
+@@ -994,6 +994,7 @@ static void ath11k_nss_wifi_describe(str
  	soc->priv = ab;
  	soc->reset = ath11k_nss_reset;
  	soc->link_desc_return = ath11k_nss_link_desc_return;
@@ -283,10 +283,8 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp.c
  
  	for (i = 0; i < soc->num_tcl; i++) {
  		ath11k_nss_wifi_ring(&soc->tcl[i], ab,
-Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp_rx.c
-===================================================================
---- backports-7.2.orig/drivers/net/wireless/ath/ath11k/dp_rx.c
-+++ backports-7.2/drivers/net/wireless/ath/ath11k/dp_rx.c
+--- a/drivers/net/wireless/ath/ath11k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
 @@ -2506,6 +2506,55 @@ static void ath11k_dp_rx_deliver_msdu(st
  	ieee80211_rx_napi(ar->hw, pubsta, msdu, napi);
  }
@@ -421,10 +419,8 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp_rx.c
  		ath11k_dp_rx_update_peer_stats(arsta, ppdu_info);
  
  		if (ath11k_debugfs_is_pktlog_peer_valid(ar, peer->addr))
-Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp_rx.h
-===================================================================
---- backports-7.2.orig/drivers/net/wireless/ath/ath11k/dp_rx.h
-+++ backports-7.2/drivers/net/wireless/ath/ath11k/dp_rx.h
+--- a/drivers/net/wireless/ath/ath11k/dp_rx.h
++++ b/drivers/net/wireless/ath/ath11k/dp_rx.h
 @@ -100,4 +100,9 @@ int ath11k_dp_rx_pktlog_stop(struct ath1
  
  int ath11k_dp_rx_crypto_mic_len(struct ath11k *ar, enum hal_encrypt_type enctype);
@@ -435,10 +431,8 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp_rx.h
 +			    struct sk_buff *msdu, struct napi_struct *napi);
 +
  #endif /* ATH11K_DP_RX_H */
-Index: backports-7.2/drivers/net/wireless/ath/ath11k/hal_rx.c
-===================================================================
---- backports-7.2.orig/drivers/net/wireless/ath/ath11k/hal_rx.c
-+++ backports-7.2/drivers/net/wireless/ath/ath11k/hal_rx.c
+--- a/drivers/net/wireless/ath/ath11k/hal_rx.c
++++ b/drivers/net/wireless/ath/ath11k/hal_rx.c
 @@ -925,6 +925,10 @@ ath11k_hal_rx_parse_mon_status_tlv(struc
  		ppdu_info->num_mpdu_fcs_err =
  			FIELD_GET(HAL_RX_PPDU_END_USER_STATS_INFO0_MPDU_CNT_FCS_ERR,
