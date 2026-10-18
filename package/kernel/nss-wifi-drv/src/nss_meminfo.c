@@ -59,6 +59,22 @@ void *nss_mem_alloc(struct nss_core *core, size_t size, u32 align,
 	return cpu;
 }
 
+/* One block back before the core halts, its record with it. */
+void nss_mem_free(struct nss_core *core, void *cpu)
+{
+	struct nss_alloc *a;
+
+	list_for_each_entry(a, &core->allocs, node) {
+		if (a->cpu != cpu)
+			continue;
+
+		dma_free_coherent(core->dev, a->size, a->cpu, a->dma);
+		list_del(&a->node);
+		kfree(a);
+		return;
+	}
+}
+
 void nss_mem_free_all(struct nss_core *core)
 {
 	struct nss_alloc *a, *tmp;
