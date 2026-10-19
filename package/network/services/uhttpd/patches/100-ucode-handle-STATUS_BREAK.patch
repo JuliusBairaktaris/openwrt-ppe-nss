@@ -1,0 +1,12 @@
+Index: uhttpd-2026.08.24~373145f7/ucode.c
+===================================================================
+--- uhttpd-2026.08.24~373145f7.orig/ucode.c
++++ uhttpd-2026.08.24~373145f7/ucode.c
+@@ -305,6 +305,7 @@ uh_ucode_state_init(struct ucode_prefix
+ 		exit(1);
+ 
+ 	case ERROR_RUNTIME:
++	default:
+ 		fprintf(stderr, "Error: Runtime error while executing ucode handler\n");
+ 		exit(2);
+ 	}
