@@ -1129,6 +1129,7 @@ static int qca_ppe_connect_tag_protocol(struct dsa_switch *ds,
 		return -EPROTONOSUPPORT;
 
 	data->trap_rcv = qca_ppe_trap_rcv;
+	data->flow_xmit = ppe_flow_xmit;
 
 	return 0;
 }
