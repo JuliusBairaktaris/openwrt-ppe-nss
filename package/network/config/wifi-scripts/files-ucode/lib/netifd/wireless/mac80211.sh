@@ -108,6 +108,10 @@ function setup_phy(phy, config, data) {
 	system(`iw phy ${phy} set distance ${config.distance} >/dev/null 2>&1`);
 	system(`iw phy ${phy} set txpower ${config.txpower}`);
 
+	let direct_tx = `/sys/kernel/debug/ieee80211/${phy}/direct_tx`;
+	if (fs.access(direct_tx, 'w'))
+		fs.writefile(direct_tx, config.aqm === false ? 'Y' : 'N');
+
 	if (config.frag)
 		system(`iw phy ${phy} set frag ${config.frag}`);
 	if (config.rts)
