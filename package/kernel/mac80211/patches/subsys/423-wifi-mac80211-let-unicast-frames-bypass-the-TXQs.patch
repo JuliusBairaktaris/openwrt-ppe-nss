@@ -1,0 +1,49 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] wifi: mac80211: let unicast frames bypass the TXQs
+
+Add a per-phy debugfs switch, direct_tx, that hands frames to a station
+straight to the driver's tx op instead of the station's TXQ. The driver
+and its firmware then queue them, so fq_codel, AQL and airtime fairness
+no longer apply to that traffic. Frames to no station keep their TXQ.
+
+This is for routers that forward at line rate on cores too slow to run
+the per-frame TXQ path. It is off by default.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/net/mac80211/debugfs.c
++++ b/net/mac80211/debugfs.c
+@@ -689,6 +689,7 @@ void debugfs_hw_add(struct ieee80211_loc
+ 	DEBUGFS_ADD_MODE(force_tx_status, 0600);
+ 	DEBUGFS_ADD_MODE(aql_enable, 0600);
+ 	DEBUGFS_ADD(aql_pending);
++	debugfs_create_bool("direct_tx", 0600, phyd, &local->direct_tx);
+ 	DEBUGFS_ADD_MODE(aqm, 0600);
+ 
+ 	DEBUGFS_ADD_MODE(airtime_flags, 0600);
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -1475,6 +1475,7 @@ struct ieee80211_local {
+ 	u32 aql_txq_limit_low[IEEE80211_NUM_ACS];
+ 	u32 aql_txq_limit_high[IEEE80211_NUM_ACS];
+ 	u32 aql_threshold;
++	bool direct_tx;
+ 	atomic_t aql_total_pending_airtime;
+ 	atomic_t aql_bc_pending_airtime;
+ 	atomic_t aql_ac_pending_airtime[IEEE80211_NUM_ACS];
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -1664,6 +1664,12 @@ static bool ieee80211_queue_skb(struct i
+ 		sdata = container_of(sdata->bss,
+ 				     struct ieee80211_sub_if_data, u.ap);
+ 
++	/* The driver queues frames to a station on its own when the TXQs are
++	 * bypassed; frames for no station still need them for power save.
++	 */
++	if (READ_ONCE(local->direct_tx) && sta)
++		return false;
++
+ 	vif = &sdata->vif;
+ 	txqi = ieee80211_get_txq(local, vif, sta, skb);
+ 
