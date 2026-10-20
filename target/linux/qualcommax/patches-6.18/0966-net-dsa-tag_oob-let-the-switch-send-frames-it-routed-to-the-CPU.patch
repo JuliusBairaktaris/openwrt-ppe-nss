@@ -1,0 +1,21 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] net: dsa: tag_oob: let the switch send frames it routed to the CPU
+
+A switch that routes a flow in hardware towards a device it cannot reach
+delivers the finished frame to the CPU port, marked with the flow it
+matched. Add a tagger_data hook, set through connect_tag_protocol, that
+lets the switch driver send such a frame on to the flow's egress device.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+--- a/include/linux/dsa/oob.h
++++ b/include/linux/dsa/oob.h
+@@ -18,6 +18,8 @@ struct dsa_oob_tag_info {
+ struct dsa_oob_tagger_data {
+ 	bool (*trap_rcv)(struct dsa_switch *ds, struct sk_buff *skb,
+ 			 u8 cpu_code);
++	bool (*flow_xmit)(struct dsa_switch *ds, struct sk_buff *skb,
++			  u32 flow);
+ };
+ 
+ int dsa_oob_tag_push(struct sk_buff *skb, struct dsa_oob_tag_info *ti);
