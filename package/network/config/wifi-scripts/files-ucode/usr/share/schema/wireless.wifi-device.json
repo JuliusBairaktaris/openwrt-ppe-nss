@@ -20,6 +20,11 @@
 			"minimum": 0,
 			"maximum": 3
 		},
+		"aqm": {
+			"description": "Queue frames to each station in mac80211 (fq_codel, AQL, airtime fairness). When disabled, frames go straight to the driver, which costs less CPU per frame",
+			"type": "boolean",
+			"default": true
+		},
 		"antenna_gain": {
 			"description": "Reduction in antenna gain from regulatory maximum in dBi",
 			"type": "number",
