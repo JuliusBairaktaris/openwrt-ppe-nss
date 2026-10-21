@@ -1,0 +1,566 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] wifi: mac80211: let a driver take frames redirected over XDP
+
+An Ethernet frame another device redirects to an AP interface over XDP
+needs nothing from mac80211 when the driver does the encapsulation. Add
+ndo_xdp_xmit to the data interfaces, passing such frames to a new
+xdp_xmit driver op, and a zero_touch debugfs switch per AP interface.
+zero_touch asks the driver for Ethernet encapsulation and advertises the
+interface as an XDP redirect target. The frames skip the TXQs, so
+fq_codel, AQL and airtime fairness do not apply to them.
+
+Export what the driver needs to send such a frame as mac80211 would: the
+TID for its DSCP after the QoS map, admission control and reserved TIDs,
+and a way to count it in the station's TX statistics. The DSCP part of
+cfg80211_classify8021d() moves into cfg80211_classify_dscp() so that it
+can be applied to a frame without an skb.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+Index: backports-7.2/include/net/cfg80211.h
+===================================================================
+--- backports-7.2.orig/include/net/cfg80211.h
++++ backports-7.2/include/net/cfg80211.h
+@@ -7768,6 +7768,15 @@ bool ieee80211_get_8023_tunnel_proto(con
+ int ieee80211_strip_8023_mesh_hdr(struct sk_buff *skb);
+ 
+ /**
++ * cfg80211_classify_dscp - determine the 802.1p/1d tag for a DSCP value
++ * @dscp: the DS field of the frame with the ECN bits masked out
++ * @qos_map: Interworking QoS mapping or %NULL if not in use
++ * Return: The 802.1p/1d tag.
++ */
++unsigned int cfg80211_classify_dscp(unsigned int dscp,
++				   struct cfg80211_qos_map *qos_map);
++
++/**
+  * cfg80211_classify8021d - determine the 802.1p/1d tag for a data frame
+  * @skb: the data frame
+  * @qos_map: Interworking QoS mapping or %NULL if not in use
+Index: backports-7.2/include/net/mac80211.h
+===================================================================
+--- backports-7.2.orig/include/net/mac80211.h
++++ backports-7.2/include/net/mac80211.h
+@@ -24,6 +24,8 @@
+ #include <net/ieee80211_radiotap.h>
+ #include <linux/unaligned.h>
+ 
++struct xdp_frame;
++
+ /**
+  * DOC: Introduction
+  *
+@@ -2217,6 +2219,9 @@ enum ieee80211_neg_ttlm_res {
+  * @txq_mgmt: the mgmt frame TX queue, currently only exists for NAN devices
+  * @offload_flags: 802.3 -> 802.11 enapsulation offload flags, see
+  *	&enum ieee80211_offload_flags.
++ * @zero_touch: the user asked for frames other devices redirect to this
++ *	interface to be sent past the TXQs. A driver that takes such frames
++ *	keeps Ethernet encapsulation on for the interface while this is set.
+  */
+ struct ieee80211_vif {
+ 	enum nl80211_iftype type;
+@@ -2238,6 +2243,7 @@ struct ieee80211_vif {
+ 	netdev_features_t netdev_features;
+ 	u32 driver_flags;
+ 	u32 offload_flags;
++	bool zero_touch;
+ 
+ #ifdef CPTCFG_MAC80211_DEBUGFS
+ 	struct dentry *debugfs_dir;
+@@ -2314,6 +2320,30 @@ static inline bool ieee80211_vif_is_mesh
+ struct ieee80211_vif *wdev_to_ieee80211_vif(struct wireless_dev *wdev);
+ 
+ /**
++ * ieee80211_dscp_to_tid - the TID mac80211 would give a frame to a station
++ * @vif: the interface
++ * @sta: the station, under RCU
++ * @dsfield: the DS field of the frame's IP header
++ *
++ * Applies the QoS map, admission control and reserved TIDs as for a frame
++ * sent through mac80211.
++ *
++ * Return: the TID.
++ */
++u8 ieee80211_dscp_to_tid(struct ieee80211_vif *vif,
++			 struct ieee80211_sta *sta, u8 dsfield);
++
++/**
++ * ieee80211_sta_tx_add - count frames a driver sent to a station on its own
++ * @sta: the station
++ * @ac: the access category the frames went out on
++ * @packets: number of frames
++ * @bytes: their length
++ */
++void ieee80211_sta_tx_add(struct ieee80211_sta *sta, u8 ac,
++			  u32 packets, u32 bytes);
++
++/**
+  * ieee80211_vif_to_wdev - return a wdev struct from a vif
+  * @vif: the vif to get the wdev for
+  *
+@@ -4668,6 +4698,10 @@ struct ieee80211_prep_tx_info {
+  *	This callback may sleep.
+  * @update_vif_offload: Update virtual interface offload flags
+  *	This callback may sleep.
++ * @xdp_xmit: Send frames another device redirected to an interface with
++ *	Ethernet encapsulation, as for ndo_xdp_xmit. Only called while
++ *	@vif has zero_touch set. Returns the number of frames taken
++ *	from the start of @frames; the caller keeps the rest.
+  * @sta_set_4addr: Called to notify the driver when a station starts/stops using
+  *	4-address mode
+  * @set_sar_specs: Update the SAR (TX power) settings.
+@@ -5082,6 +5116,8 @@ struct ieee80211_ops {
+ 				struct ieee80211_sta *sta, u8 tids);
+ 	void (*update_vif_offload)(struct ieee80211_hw *hw,
+ 				   struct ieee80211_vif *vif);
++	int (*xdp_xmit)(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++			int n, struct xdp_frame **frames, u32 flags);
+ 	void (*sta_set_4addr)(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 			      struct ieee80211_sta *sta, bool enabled);
+ 	int (*set_sar_specs)(struct ieee80211_hw *hw,
+Index: backports-7.2/net/mac80211/tx.c
+===================================================================
+--- backports-7.2.orig/net/mac80211/tx.c
++++ backports-7.2/net/mac80211/tx.c
+@@ -4889,6 +4889,16 @@ out:
+ 	rcu_read_unlock();
+ }
+ 
++void ieee80211_sta_tx_add(struct ieee80211_sta *pubsta, u8 ac,
++			  u32 packets, u32 bytes)
++{
++	struct sta_info *sta = container_of(pubsta, struct sta_info, sta);
++
++	sta->deflink.tx_stats.packets[ac] += packets;
++	sta->deflink.tx_stats.bytes[ac] += bytes;
++}
++EXPORT_SYMBOL(ieee80211_sta_tx_add);
++
+ netdev_tx_t ieee80211_subif_start_xmit_8023(struct sk_buff *skb,
+ 					    struct net_device *dev)
+ {
+Index: backports-7.2/net/mac80211/wme.c
+===================================================================
+--- backports-7.2.orig/net/mac80211/wme.c
++++ backports-7.2/net/mac80211/wme.c
+@@ -31,20 +31,20 @@ const int ieee802_1d_to_ac[8] = {
+ 	IEEE80211_AC_VO
+ };
+ 
+-static int wme_downgrade_ac(struct sk_buff *skb)
++static int wme_downgrade_ac(u32 *priority)
+ {
+-	switch (skb->priority) {
++	switch (*priority) {
+ 	case 6:
+ 	case 7:
+-		skb->priority = 5; /* VO -> VI */
++		*priority = 5; /* VO -> VI */
+ 		return 0;
+ 	case 4:
+ 	case 5:
+-		skb->priority = 3; /* VI -> BE */
++		*priority = 3; /* VI -> BE */
+ 		return 0;
+ 	case 0:
+ 	case 3:
+-		skb->priority = 2; /* BE -> BK */
++		*priority = 2; /* BE -> BK */
+ 		return 0;
+ 	default:
+ 		return -1;
+@@ -82,19 +82,19 @@ static inline u8 ieee80211_fix_reserved_
+ }
+ 
+ static u16 ieee80211_downgrade_queue(struct ieee80211_sub_if_data *sdata,
+-				     struct sta_info *sta, struct sk_buff *skb)
++				     struct sta_info *sta, u32 *priority)
+ {
+ 	struct ieee80211_if_managed *ifmgd = &sdata->u.mgd;
+ 
+ 	/* in case we are a client verify acm is not set for this ac */
+-	while (sdata->wmm_acm & BIT(skb->priority)) {
+-		int ac = ieee802_1d_to_ac[skb->priority];
++	while (sdata->wmm_acm & BIT(*priority)) {
++		int ac = ieee802_1d_to_ac[*priority];
+ 
+ 		if (ifmgd->tx_tspec[ac].admitted_time &&
+-		    skb->priority == ifmgd->tx_tspec[ac].up)
++		    *priority == ifmgd->tx_tspec[ac].up)
+ 			return ac;
+ 
+-		if (wme_downgrade_ac(skb)) {
++		if (wme_downgrade_ac(priority)) {
+ 			/*
+ 			 * This should not really happen. The AP has marked all
+ 			 * lower ACs to require admission control which is not
+@@ -106,11 +106,11 @@ static u16 ieee80211_downgrade_queue(str
+ 	}
+ 
+ 	/* Check to see if this is a reserved TID */
+-	if (sta && sta->reserved_tid == skb->priority)
+-		skb->priority = ieee80211_fix_reserved_tid(skb->priority);
++	if (sta && sta->reserved_tid == *priority)
++		*priority = ieee80211_fix_reserved_tid(*priority);
+ 
+ 	/* look up which queue to use for frames with this 1d tag */
+-	return ieee802_1d_to_ac[skb->priority];
++	return ieee802_1d_to_ac[*priority];
+ }
+ 
+ /* Indicate which queue to use for this fully formed 802.11 frame */
+@@ -141,7 +141,7 @@ u16 ieee80211_select_queue_80211(struct
+ 	p = ieee80211_get_qos_ctl(hdr);
+ 	skb->priority = *p & IEEE80211_QOS_CTL_TAG1D_MASK;
+ 
+-	return ieee80211_downgrade_queue(sdata, NULL, skb);
++	return ieee80211_downgrade_queue(sdata, NULL, &skb->priority);
+ }
+ 
+ u16 ieee80211_select_queue(struct ieee80211_sub_if_data *sdata,
+@@ -181,9 +181,29 @@ u16 ieee80211_select_queue(struct ieee80
+ 					       &qos_map->qos_map : NULL);
+ 
+  downgrade:
+-	return ieee80211_downgrade_queue(sdata, sta, skb);
++	return ieee80211_downgrade_queue(sdata, sta, &skb->priority);
+ }
+ 
++u8 ieee80211_dscp_to_tid(struct ieee80211_vif *vif,
++			 struct ieee80211_sta *pubsta, u8 dsfield)
++{
++	struct ieee80211_sub_if_data *sdata = vif_to_sdata(vif);
++	struct sta_info *sta = container_of(pubsta, struct sta_info, sta);
++	struct mac80211_qos_map *qos_map;
++	u32 priority;
++
++	if (!pubsta->wme)
++		return 0;
++
++	qos_map = rcu_dereference(sdata->qos_map);
++	priority = cfg80211_classify_dscp(dsfield & 0xfc, qos_map ?
++					  &qos_map->qos_map : NULL);
++	ieee80211_downgrade_queue(sdata, sta, &priority);
++
++	return priority;
++}
++EXPORT_SYMBOL(ieee80211_dscp_to_tid);
++
+ /**
+  * ieee80211_set_qos_hdr - Fill in the QoS header if there is one.
+  *
+Index: backports-7.2/net/wireless/util.c
+===================================================================
+--- backports-7.2.orig/net/wireless/util.c
++++ backports-7.2/net/wireless/util.c
+@@ -961,75 +961,24 @@ void ieee80211_amsdu_to_8023s(struct sk_
+ EXPORT_SYMBOL(ieee80211_amsdu_to_8023s);
+ 
+ /* Given a data frame determine the 802.1p/1d tag to use. */
+-unsigned int cfg80211_classify8021d(struct sk_buff *skb,
+-				    struct cfg80211_qos_map *qos_map)
++unsigned int cfg80211_classify_dscp(unsigned int dscp,
++				   struct cfg80211_qos_map *qos_map)
+ {
+-	unsigned int dscp;
+-	unsigned char vlan_priority;
+ 	unsigned int ret;
+ 
+-	/* skb->priority values from 256->263 are magic values to
+-	 * directly indicate a specific 802.1d priority.  This is used
+-	 * to allow 802.1d priority to be passed directly in from VLAN
+-	 * tags, etc.
+-	 */
+-	if (skb->priority >= 256 && skb->priority <= 263) {
+-		ret = skb->priority - 256;
+-		goto out;
+-	}
+-
+-	if (skb_vlan_tag_present(skb)) {
+-		vlan_priority = (skb_vlan_tag_get(skb) & VLAN_PRIO_MASK)
+-			>> VLAN_PRIO_SHIFT;
+-		if (vlan_priority > 0) {
+-			ret = vlan_priority;
+-			goto out;
+-		}
+-	}
+-
+-	switch (skb->protocol) {
+-	case htons(ETH_P_IP):
+-		dscp = ipv4_get_dsfield(ip_hdr(skb)) & 0xfc;
+-		break;
+-	case htons(ETH_P_IPV6):
+-		dscp = ipv6_get_dsfield(ipv6_hdr(skb)) & 0xfc;
+-		break;
+-	case htons(ETH_P_MPLS_UC):
+-	case htons(ETH_P_MPLS_MC): {
+-		struct mpls_label mpls_tmp, *mpls;
+-
+-		mpls = skb_header_pointer(skb, sizeof(struct ethhdr),
+-					  sizeof(*mpls), &mpls_tmp);
+-		if (!mpls)
+-			return 0;
+-
+-		ret = (ntohl(mpls->entry) & MPLS_LS_TC_MASK)
+-			>> MPLS_LS_TC_SHIFT;
+-		goto out;
+-	}
+-	case htons(ETH_P_80221):
+-		/* 802.21 is always network control traffic */
+-		return 7;
+-	default:
+-		return 0;
+-	}
+-
+ 	if (qos_map) {
+ 		unsigned int i, tmp_dscp = dscp >> 2;
+ 
+ 		for (i = 0; i < qos_map->num_des; i++) {
+-			if (tmp_dscp == qos_map->dscp_exception[i].dscp) {
+-				ret = qos_map->dscp_exception[i].up;
+-				goto out;
+-			}
++			if (tmp_dscp == qos_map->dscp_exception[i].dscp)
++				return array_index_nospec(qos_map->dscp_exception[i].up,
++							  IEEE80211_NUM_TIDS);
+ 		}
+ 
+ 		for (i = 0; i < 8; i++) {
+ 			if (tmp_dscp >= qos_map->up[i].low &&
+-			    tmp_dscp <= qos_map->up[i].high) {
+-				ret = i;
+-				goto out;
+-			}
++			    tmp_dscp <= qos_map->up[i].high)
++				return i;
+ 		}
+ 	}
+ 
+@@ -1092,6 +1041,64 @@ unsigned int cfg80211_classify8021d(stru
+ 		ret = 7;
+ 		break;
+ 	}
++	return ret;
++}
++EXPORT_SYMBOL(cfg80211_classify_dscp);
++
++unsigned int cfg80211_classify8021d(struct sk_buff *skb,
++				    struct cfg80211_qos_map *qos_map)
++{
++	unsigned int dscp;
++	unsigned char vlan_priority;
++	unsigned int ret;
++
++	/* skb->priority values from 256->263 are magic values to
++	 * directly indicate a specific 802.1d priority.  This is used
++	 * to allow 802.1d priority to be passed directly in from VLAN
++	 * tags, etc.
++	 */
++	if (skb->priority >= 256 && skb->priority <= 263) {
++		ret = skb->priority - 256;
++		goto out;
++	}
++
++	if (skb_vlan_tag_present(skb)) {
++		vlan_priority = (skb_vlan_tag_get(skb) & VLAN_PRIO_MASK)
++			>> VLAN_PRIO_SHIFT;
++		if (vlan_priority > 0) {
++			ret = vlan_priority;
++			goto out;
++		}
++	}
++
++	switch (skb->protocol) {
++	case htons(ETH_P_IP):
++		dscp = ipv4_get_dsfield(ip_hdr(skb)) & 0xfc;
++		break;
++	case htons(ETH_P_IPV6):
++		dscp = ipv6_get_dsfield(ipv6_hdr(skb)) & 0xfc;
++		break;
++	case htons(ETH_P_MPLS_UC):
++	case htons(ETH_P_MPLS_MC): {
++		struct mpls_label mpls_tmp, *mpls;
++
++		mpls = skb_header_pointer(skb, sizeof(struct ethhdr),
++					  sizeof(*mpls), &mpls_tmp);
++		if (!mpls)
++			return 0;
++
++		ret = (ntohl(mpls->entry) & MPLS_LS_TC_MASK)
++			>> MPLS_LS_TC_SHIFT;
++		goto out;
++	}
++	case htons(ETH_P_80221):
++		/* 802.21 is always network control traffic */
++		return 7;
++	default:
++		return 0;
++	}
++
++	ret = cfg80211_classify_dscp(dscp, qos_map);
+ out:
+ 	return array_index_nospec(ret, IEEE80211_NUM_TIDS);
+ }
+Index: backports-7.2/net/mac80211/iface.c
+===================================================================
+--- backports-7.2.orig/net/mac80211/iface.c
++++ backports-7.2/net/mac80211/iface.c
+@@ -18,6 +18,7 @@
+ #include <linux/kcov.h>
+ #include <net/mac80211.h>
+ #include <net/ieee80211_radiotap.h>
++#include <net/xdp.h>
+ #include "ieee80211_i.h"
+ #include "sta_info.h"
+ #include "debugfs_netdev.h"
+@@ -946,6 +947,25 @@ static int ieee80211_netdev_setup_tc(str
+ 	return drv_net_setup_tc(local, sdata, dev, type, type_data);
+ }
+ 
++/* Frames redirected from another device skip the TXQs, so they are taken only
++ * on an interface the user opted in. They are Ethernet frames, which the
++ * driver sends only while it does the encapsulation.
++ */
++static int ieee80211_xdp_xmit(struct net_device *dev, int n,
++			      struct xdp_frame **frames, u32 flags)
++{
++	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
++	struct ieee80211_local *local = sdata->local;
++
++	if (!local->ops->xdp_xmit || !READ_ONCE(sdata->vif.zero_touch) ||
++	    sdata->vif.type != NL80211_IFTYPE_AP ||
++	    !(sdata->vif.offload_flags & IEEE80211_OFFLOAD_ENCAP_ENABLED) ||
++	    !ieee80211_sdata_running(sdata))
++		return 0;
++
++	return local->ops->xdp_xmit(&local->hw, &sdata->vif, n, frames, flags);
++}
++
+ static const struct net_device_ops ieee80211_dataif_ops = {
+ 	.ndo_open		= ieee80211_open,
+ 	.ndo_stop		= ieee80211_stop,
+@@ -954,6 +974,7 @@ static const struct net_device_ops ieee8
+ 	.ndo_set_rx_mode	= ieee80211_set_multicast_list,
+ 	.ndo_set_mac_address 	= ieee80211_change_mac,
+ 	.ndo_setup_tc		= ieee80211_netdev_setup_tc,
++	.ndo_xdp_xmit		= ieee80211_xdp_xmit,
+ };
+ 
+ static u16 ieee80211_monitor_select_queue(struct net_device *dev,
+@@ -1070,6 +1091,7 @@ static const struct net_device_ops ieee8
+ 	.ndo_set_mac_address	= ieee80211_change_mac,
+ 	.ndo_fill_forward_path	= ieee80211_netdev_fill_forward_path,
+ 	.ndo_setup_tc		= ieee80211_netdev_setup_tc,
++	.ndo_xdp_xmit		= ieee80211_xdp_xmit,
+ };
+ 
+ static bool ieee80211_iftype_supports_hdr_offload(enum nl80211_iftype iftype)
+@@ -1169,6 +1191,41 @@ static void ieee80211_recalc_sdata_offlo
+ 	}
+ }
+ 
++/* The driver decides on the encapsulation from zero_touch, so it is asked
++ * again even when mac80211's own offload flags stay the same.
++ */
++void ieee80211_set_zero_touch(struct ieee80211_sub_if_data *sdata, bool on)
++{
++	struct ieee80211_local *local = sdata->local;
++	struct ieee80211_sub_if_data *vsdata;
++
++	ASSERT_RTNL();
++	lockdep_assert_wiphy(local->hw.wiphy);
++
++	if (sdata->vif.zero_touch == on)
++		return;
++	WRITE_ONCE(sdata->vif.zero_touch, on);
++
++	if (on && local->ops->xdp_xmit)
++		xdp_features_set_redirect_target(sdata->dev, false);
++	else
++		xdp_features_clear_redirect_target(sdata->dev);
++
++	if (!ieee80211_sdata_running(sdata) ||
++	    !ieee80211_hw_check(&local->hw, SUPPORTS_TX_ENCAP_OFFLOAD))
++		return;
++
++	ieee80211_set_sdata_offload_flags(sdata);
++	drv_update_vif_offload(local, sdata);
++	ieee80211_check_fast_rx_iface(sdata);
++	ieee80211_set_vif_encap_ops(sdata);
++
++	list_for_each_entry(vsdata, &local->interfaces, list)
++		if (vsdata->vif.type == NL80211_IFTYPE_AP_VLAN &&
++		    vsdata->bss == &sdata->u.ap)
++			ieee80211_set_vif_encap_ops(vsdata);
++}
++
+ void ieee80211_recalc_offload(struct ieee80211_local *local)
+ {
+ 	struct ieee80211_sub_if_data *sdata;
+Index: backports-7.2/net/mac80211/debugfs_netdev.c
+===================================================================
+--- backports-7.2.orig/net/mac80211/debugfs_netdev.c
++++ backports-7.2/net/mac80211/debugfs_netdev.c
+@@ -651,6 +651,40 @@ IEEE80211_IF_FILE_R(aqm);
+ 
+ IEEE80211_IF_FILE(multicast_to_unicast, u.ap.multicast_to_unicast, HEX);
+ 
++static ssize_t ieee80211_if_fmt_zero_touch(
++	const struct ieee80211_sub_if_data *sdata, char *buf, int buflen)
++{
++	return scnprintf(buf, buflen, "%d\n", sdata->vif.zero_touch);
++}
++
++/* The XDP features change under the RTNL, which nests outside the wiphy lock
++ * and is held while the file is removed.
++ */
++static ssize_t ieee80211_if_write_zero_touch(struct file *file,
++					     const char __user *userbuf,
++					     size_t count, loff_t *ppos)
++{
++	struct ieee80211_sub_if_data *sdata = file->private_data;
++	bool on;
++	int ret;
++
++	ret = kstrtobool_from_user(userbuf, count, &on);
++	if (ret)
++		return ret;
++
++	if (!rtnl_trylock())
++		return restart_syscall();
++	wiphy_lock(sdata->local->hw.wiphy);
++	ieee80211_set_zero_touch(sdata, on);
++	wiphy_unlock(sdata->local->hw.wiphy);
++	rtnl_unlock();
++
++	return count;
++}
++_IEEE80211_IF_FILE_R_FN(zero_touch)
++_IEEE80211_IF_FILE_OPS(zero_touch, ieee80211_if_read_zero_touch,
++		       ieee80211_if_write_zero_touch);
++
+ /* IBSS attributes */
+ static ssize_t ieee80211_if_fmt_tsf(
+ 	const struct ieee80211_sub_if_data *sdata, char *buf, int buflen)
+@@ -858,6 +892,7 @@ static void add_ap_files(struct ieee8021
+ 	DEBUGFS_ADD(num_buffered_multicast);
+ 	DEBUGFS_ADD_MODE(tkip_mic_test, 0200);
+ 	DEBUGFS_ADD_MODE(multicast_to_unicast, 0600);
++	DEBUGFS_ADD_MODE(zero_touch, 0600);
+ }
+ 
+ static void add_vlan_files(struct ieee80211_sub_if_data *sdata)
+Index: backports-7.2/net/mac80211/ieee80211_i.h
+===================================================================
+--- backports-7.2.orig/net/mac80211/ieee80211_i.h
++++ backports-7.2/net/mac80211/ieee80211_i.h
+@@ -2214,6 +2214,7 @@ bool __ieee80211_recalc_txpower(struct i
+ void ieee80211_recalc_txpower(struct ieee80211_link_data *link,
+ 			      bool update_bss);
+ void ieee80211_recalc_offload(struct ieee80211_local *local);
++void ieee80211_set_zero_touch(struct ieee80211_sub_if_data *sdata, bool on);
+ 
+ /* link handling */
+ void ieee80211_link_setup(struct ieee80211_link_data *link);
