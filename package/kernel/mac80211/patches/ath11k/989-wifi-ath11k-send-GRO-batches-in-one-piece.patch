@@ -1,0 +1,204 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] wifi: ath11k: take TCP batches from mac80211 in one piece
+
+On an interface in Ethernet encapsulation mac80211 now hands over a GSO
+frame whole when the driver's features cover it. Advertise TSO and
+fraglist GSO there, and split such a frame at the TCL ring, so that
+mac80211 queues, schedules and completes a batch of up to 45 frames
+once. The last frame of a batch carries its airtime and reports its
+status; the others are freed on completion without one. A dequeue run
+starts only with ring room for a whole batch.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -116,6 +116,7 @@ static inline enum wme_ac ath11k_tid_to_
+ enum ath11k_skb_flags {
+ 	ATH11K_SKB_HW_80211_ENCAP = BIT(0),
+ 	ATH11K_SKB_CIPHER_SET = BIT(1),
++	ATH11K_SKB_GSO_SEG = BIT(2),
+ };
+ 
+ struct ath11k_skb_cb {
+--- a/drivers/net/wireless/ath/ath11k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_tx.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <net/dsfield.h>
++#include <net/gso.h>
+ #include <net/xdp.h>
+ 
+ #include "core.h"
+@@ -532,6 +533,11 @@ tcl_ring_sel:
+ 		goto fail_remove_idr;
+ 	}
+ 
++	if (unlikely(skb_is_nonlinear(skb)) && __skb_linearize(skb)) {
++		ret = -ENOMEM;
++		goto fail_remove_idr;
++	}
++
+ 	ti.paddr = dma_map_single(ab->dev, skb->data, skb->len, DMA_TO_DEVICE);
+ 	if (unlikely(dma_mapping_error(ab->dev, ti.paddr))) {
+ 		atomic_inc(&ab->soc_stats.tx_err.misc_fail);
+@@ -614,6 +620,41 @@ fail_remove_idr:
+ 	return ret;
+ }
+ 
++/* A GSO frame from mac80211 is a batch the driver splits, and its frames
++ * share the one status mac80211 expects: the last frame reports it with
++ * the airtime of the batch, and the others are freed without one. A batch
++ * that does not fit the ring is cut short.
++ */
++int ath11k_dp_tx_gso(struct ath11k *ar, struct ath11k_vif *arvif,
++		     struct ath11k_sta *arsta, struct sk_buff *skb,
++		     int held_ring)
++{
++	struct sk_buff *segs, *seg, *next;
++	int ret = 0;
++
++	segs = skb_gso_segment(skb, NETIF_F_HW_CSUM);
++	if (IS_ERR_OR_NULL(segs)) {
++		ieee80211_free_txskb(ar->hw, skb);
++		return -EINVAL;
++	}
++	consume_skb(skb);
++
++	skb_list_walk_safe(segs, seg, next) {
++		skb_mark_not_on_list(seg);
++		if (next) {
++			ATH11K_SKB_CB(seg)->flags |= ATH11K_SKB_GSO_SEG;
++			ieee80211_info_set_tx_time_est(IEEE80211_SKB_CB(seg), 0);
++		}
++
++		if (!ret)
++			ret = ath11k_dp_tx(ar, arvif, arsta, seg, held_ring);
++		if (ret)
++			ieee80211_free_txskb(ar->hw, seg);
++	}
++
++	return ret;
++}
++
+ static void ath11k_dp_tx_free_txbuf(struct ath11k_base *ab, u8 mac_id,
+ 				    int msdu_id,
+ 				    struct dp_tx_ring *tx_ring,
+@@ -1165,6 +1206,13 @@ int ath11k_dp_tx_completion_handler(stru
+ 		if (atomic_dec_and_test(&ar->dp.num_tx_pending))
+ 			wake_up(&ar->dp.tx_empty_waitq);
+ 
++		if (ATH11K_SKB_CB(msdu)->flags & ATH11K_SKB_GSO_SEG) {
++			dma_unmap_single(ab->dev, ATH11K_SKB_CB(msdu)->paddr,
++					 msdu->len, DMA_TO_DEVICE);
++			list_add_tail(&msdu->list, &c.free);
++			continue;
++		}
++
+ 		ath11k_dp_tx_complete_msdu(ar, msdu, &ts, &c);
+ 	}
+ 
+--- a/drivers/net/wireless/ath/ath11k/dp_tx.h
++++ b/drivers/net/wireless/ath/ath11k/dp_tx.h
+@@ -22,8 +22,20 @@ struct ath11k_dp_htt_wbm_tx_status {
+ 
+ void ath11k_dp_tx_update_txcompl(struct ath11k *ar, struct hal_tx_status *ts);
+ int ath11k_dp_tx_htt_h2t_ver_req_msg(struct ath11k_base *ab);
++/* TCP reaches the driver in batches of up to 64 KiB, at most 45 full-sized
++ * frames: fraglist GRO batches when forwarded, TSO frames from local
++ * sockets.
++ * ponytail: a batch of smaller frames that outgrows the ring room is cut short
++ */
++#define ATH11K_TX_BATCH_MAX		64
++#define ATH11K_TX_BATCH_FEATURES	(NETIF_F_TSO | NETIF_F_TSO6 | \
++					 NETIF_F_FRAGLIST | NETIF_F_GSO_FRAGLIST)
++
+ int ath11k_dp_tx(struct ath11k *ar, struct ath11k_vif *arvif,
+ 		 struct ath11k_sta *arsta, struct sk_buff *skb, int held_ring);
++int ath11k_dp_tx_gso(struct ath11k *ar, struct ath11k_vif *arvif,
++		     struct ath11k_sta *arsta, struct sk_buff *skb,
++		     int held_ring);
+ int ath11k_dp_tx_bufs_init(struct dp_tx_ring *tx_ring);
+ void ath11k_dp_tx_bufs_free(struct dp_tx_ring *tx_ring);
+ int ath11k_dp_tx_xdp(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -6550,6 +6550,9 @@ static int ath11k_mac_tx(struct ieee8021
+ 	if (control->sta)
+ 		arsta = ath11k_sta_to_arsta(control->sta);
+ 
++	if (skb_is_gso(skb))
++		return ath11k_dp_tx_gso(ar, arvif, arsta, skb, held_ring);
++
+ 	ret = ath11k_dp_tx(ar, arvif, arsta, skb, held_ring);
+ 	if (unlikely(ret)) {
+ 		ath11k_warn(ar->ab, "failed to transmit frame %d\n", ret);
+@@ -6916,6 +6919,12 @@ static void ath11k_mac_op_update_vif_off
+ 		vif->offload_flags &= ~IEEE80211_OFFLOAD_ENCAP_ENABLED;
+ 	}
+ 
++	/* Only an Ethernet frame can be split without mac80211 */
++	if (vif->offload_flags & IEEE80211_OFFLOAD_ENCAP_ENABLED)
++		vif->netdev_features |= ATH11K_TX_BATCH_FEATURES;
++	else
++		vif->netdev_features &= ~ATH11K_TX_BATCH_FEATURES;
++
+ 	param_id = WMI_VDEV_PARAM_RX_DECAP_TYPE;
+ 	if (vif->offload_flags & IEEE80211_OFFLOAD_DECAP_ENABLED)
+ 		param_value = ATH11K_HW_TXRX_ETHERNET;
+@@ -10149,7 +10158,8 @@ static int ath11k_mac_tx_push_txq(struct
+ 	 * read once and the head pointer written once, after the last frame,
+ 	 * rather than per frame. The head pointer is a device register, which
+ 	 * is not written while the firmware restarts or when no frame was
+-	 * added.
++	 * added. A frame may be a GRO batch, so a run starts only with room
++	 * for the largest batch of full-sized frames.
+ 	 */
+ 	if (unlikely(test_bit(ATH11K_FLAG_CRASH_FLUSH, &ar->ab->dev_flags)))
+ 		return -ESHUTDOWN;
+@@ -10161,7 +10171,9 @@ static int ath11k_mac_tx_push_txq(struct
+ 	avail = num_free;
+ 
+ 	ret = 0;
+-	while (num_free) {
++	while (num_free >= ATH11K_TX_BATCH_MAX) {
++		int n;
++
+ 		if (unlikely(test_bit(ATH11K_FLAG_CRASH_FLUSH,
+ 				      &ar->ab->dev_flags)))
+ 			break;
+@@ -10170,11 +10182,12 @@ static int ath11k_mac_tx_push_txq(struct
+ 		if (!skb)
+ 			break;
+ 
++		n = skb_is_gso(skb) ? skb_shinfo(skb)->gso_segs : 1;
+ 		ret = ath11k_mac_tx(hw, &control, skb, ring_id);
+ 		if (unlikely(ret == -ENOSPC || ret == -ENOMEM))
+ 			break;
+ 		ret = 0;
+-		num_free--;
++		num_free -= n;
+ 	}
+ 
+ 	if (num_free != avail &&
+@@ -10186,7 +10199,7 @@ static int ath11k_mac_tx_push_txq(struct
+ 	spin_unlock_bh(&tcl_ring->lock);
+ 	spin_unlock_bh(&tx_ring->wake_tx_lock);
+ 
+-	return num_free ? ret : -ENOSPC;
++	return num_free >= ATH11K_TX_BATCH_MAX ? ret : -ENOSPC;
+ }
+ 
+ static void ath11k_mac_schedule_txq(struct ath11k *ar, u8 ac)
+@@ -10814,7 +10827,8 @@ static int __ath11k_mac_register(struct
+ 	ath11k_reg_init(ar);
+ 
+ 	if (!test_bit(ATH11K_FLAG_RAW_MODE, &ab->dev_flags)) {
+-		ar->hw->netdev_features = NETIF_F_HW_CSUM;
++		ar->hw->netdev_features = NETIF_F_HW_CSUM | NETIF_F_SG |
++					  ATH11K_TX_BATCH_FEATURES;
+ 		ieee80211_hw_set(ar->hw, SW_CRYPTO_CONTROL);
+ 		ieee80211_hw_set(ar->hw, SUPPORT_FAST_XMIT);
+ 	}
