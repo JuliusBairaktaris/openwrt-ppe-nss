@@ -1,0 +1,361 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] wifi: mac80211: let a driver send routed frames past mac80211
+
+A driver that is handed routed frames straight from the switch can send
+them to a station without mac80211, once the user has turned the TXQs off
+with direct_tx. Export what it needs to do that as mac80211 would: whether
+direct_tx is on, the TID for the frame's DSCP after the QoS map, admission
+control and reserved TIDs, and a way to count the frames in the station's
+TX statistics.
+
+The DSCP part of cfg80211_classify8021d() moves into cfg80211_classify_dscp()
+so that it can be applied to a frame that has no skb.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@ -7768,6 +7768,15 @@ bool ieee80211_get_8023_tunnel_proto(con
+ int ieee80211_strip_8023_mesh_hdr(struct sk_buff *skb);
+ 
+ /**
++ * cfg80211_classify_dscp - determine the 802.1p/1d tag for a DSCP value
++ * @dscp: the DS field of the frame with the ECN bits masked out
++ * @qos_map: Interworking QoS mapping or %NULL if not in use
++ * Return: The 802.1p/1d tag.
++ */
++unsigned int cfg80211_classify_dscp(unsigned int dscp,
++				   struct cfg80211_qos_map *qos_map);
++
++/**
+  * cfg80211_classify8021d - determine the 802.1p/1d tag for a data frame
+  * @skb: the data frame
+  * @qos_map: Interworking QoS mapping or %NULL if not in use
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -2314,6 +2314,41 @@ static inline bool ieee80211_vif_is_mesh
+ struct ieee80211_vif *wdev_to_ieee80211_vif(struct wireless_dev *wdev);
+ 
+ /**
++ * ieee80211_vif_direct_tx - whether frames to stations skip the TXQs
++ * @vif: the interface
++ *
++ * A driver that sends frames to stations on its own, past mac80211, may do so
++ * only while this is true: the user gave up the per-station queues.
++ *
++ * Return: %true if the TXQs are bypassed for frames to stations.
++ */
++bool ieee80211_vif_direct_tx(struct ieee80211_vif *vif);
++
++/**
++ * ieee80211_dscp_to_tid - the TID mac80211 would give a frame to a station
++ * @vif: the interface
++ * @sta: the station, under RCU
++ * @dsfield: the DS field of the frame's IP header
++ *
++ * Applies the QoS map, admission control and reserved TIDs as for a frame
++ * sent through mac80211.
++ *
++ * Return: the TID.
++ */
++u8 ieee80211_dscp_to_tid(struct ieee80211_vif *vif,
++			 struct ieee80211_sta *sta, u8 dsfield);
++
++/**
++ * ieee80211_sta_tx_add - count frames a driver sent to a station on its own
++ * @sta: the station
++ * @ac: the access category the frames went out on
++ * @packets: number of frames
++ * @bytes: their length
++ */
++void ieee80211_sta_tx_add(struct ieee80211_sta *sta, u8 ac,
++			  u32 packets, u32 bytes);
++
++/**
+  * ieee80211_vif_to_wdev - return a wdev struct from a vif
+  * @vif: the vif to get the wdev for
+  *
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -4889,6 +4889,22 @@ out:
+ 	rcu_read_unlock();
+ }
+ 
++bool ieee80211_vif_direct_tx(struct ieee80211_vif *vif)
++{
++	return READ_ONCE(vif_to_sdata(vif)->local->direct_tx);
++}
++EXPORT_SYMBOL(ieee80211_vif_direct_tx);
++
++void ieee80211_sta_tx_add(struct ieee80211_sta *pubsta, u8 ac,
++			  u32 packets, u32 bytes)
++{
++	struct sta_info *sta = container_of(pubsta, struct sta_info, sta);
++
++	sta->deflink.tx_stats.packets[ac] += packets;
++	sta->deflink.tx_stats.bytes[ac] += bytes;
++}
++EXPORT_SYMBOL(ieee80211_sta_tx_add);
++
+ netdev_tx_t ieee80211_subif_start_xmit_8023(struct sk_buff *skb,
+ 					    struct net_device *dev)
+ {
+--- a/net/mac80211/wme.c
++++ b/net/mac80211/wme.c
+@@ -31,20 +31,20 @@ const int ieee802_1d_to_ac[8] = {
+ 	IEEE80211_AC_VO
+ };
+ 
+-static int wme_downgrade_ac(struct sk_buff *skb)
++static int wme_downgrade_ac(u32 *priority)
+ {
+-	switch (skb->priority) {
++	switch (*priority) {
+ 	case 6:
+ 	case 7:
+-		skb->priority = 5; /* VO -> VI */
++		*priority = 5; /* VO -> VI */
+ 		return 0;
+ 	case 4:
+ 	case 5:
+-		skb->priority = 3; /* VI -> BE */
++		*priority = 3; /* VI -> BE */
+ 		return 0;
+ 	case 0:
+ 	case 3:
+-		skb->priority = 2; /* BE -> BK */
++		*priority = 2; /* BE -> BK */
+ 		return 0;
+ 	default:
+ 		return -1;
+@@ -82,19 +82,19 @@ static inline u8 ieee80211_fix_reserved_
+ }
+ 
+ static u16 ieee80211_downgrade_queue(struct ieee80211_sub_if_data *sdata,
+-				     struct sta_info *sta, struct sk_buff *skb)
++				     struct sta_info *sta, u32 *priority)
+ {
+ 	struct ieee80211_if_managed *ifmgd = &sdata->u.mgd;
+ 
+ 	/* in case we are a client verify acm is not set for this ac */
+-	while (sdata->wmm_acm & BIT(skb->priority)) {
+-		int ac = ieee802_1d_to_ac[skb->priority];
++	while (sdata->wmm_acm & BIT(*priority)) {
++		int ac = ieee802_1d_to_ac[*priority];
+ 
+ 		if (ifmgd->tx_tspec[ac].admitted_time &&
+-		    skb->priority == ifmgd->tx_tspec[ac].up)
++		    *priority == ifmgd->tx_tspec[ac].up)
+ 			return ac;
+ 
+-		if (wme_downgrade_ac(skb)) {
++		if (wme_downgrade_ac(priority)) {
+ 			/*
+ 			 * This should not really happen. The AP has marked all
+ 			 * lower ACs to require admission control which is not
+@@ -106,11 +106,11 @@ static u16 ieee80211_downgrade_queue(str
+ 	}
+ 
+ 	/* Check to see if this is a reserved TID */
+-	if (sta && sta->reserved_tid == skb->priority)
+-		skb->priority = ieee80211_fix_reserved_tid(skb->priority);
++	if (sta && sta->reserved_tid == *priority)
++		*priority = ieee80211_fix_reserved_tid(*priority);
+ 
+ 	/* look up which queue to use for frames with this 1d tag */
+-	return ieee802_1d_to_ac[skb->priority];
++	return ieee802_1d_to_ac[*priority];
+ }
+ 
+ /* Indicate which queue to use for this fully formed 802.11 frame */
+@@ -141,7 +141,7 @@ u16 ieee80211_select_queue_80211(struct
+ 	p = ieee80211_get_qos_ctl(hdr);
+ 	skb->priority = *p & IEEE80211_QOS_CTL_TAG1D_MASK;
+ 
+-	return ieee80211_downgrade_queue(sdata, NULL, skb);
++	return ieee80211_downgrade_queue(sdata, NULL, &skb->priority);
+ }
+ 
+ u16 ieee80211_select_queue(struct ieee80211_sub_if_data *sdata,
+@@ -181,9 +181,29 @@ u16 ieee80211_select_queue(struct ieee80
+ 					       &qos_map->qos_map : NULL);
+ 
+  downgrade:
+-	return ieee80211_downgrade_queue(sdata, sta, skb);
++	return ieee80211_downgrade_queue(sdata, sta, &skb->priority);
+ }
+ 
++u8 ieee80211_dscp_to_tid(struct ieee80211_vif *vif,
++			 struct ieee80211_sta *pubsta, u8 dsfield)
++{
++	struct ieee80211_sub_if_data *sdata = vif_to_sdata(vif);
++	struct sta_info *sta = container_of(pubsta, struct sta_info, sta);
++	struct mac80211_qos_map *qos_map;
++	u32 priority;
++
++	if (!pubsta->wme)
++		return 0;
++
++	qos_map = rcu_dereference(sdata->qos_map);
++	priority = cfg80211_classify_dscp(dsfield & 0xfc, qos_map ?
++					  &qos_map->qos_map : NULL);
++	ieee80211_downgrade_queue(sdata, sta, &priority);
++
++	return priority;
++}
++EXPORT_SYMBOL(ieee80211_dscp_to_tid);
++
+ /**
+  * ieee80211_set_qos_hdr - Fill in the QoS header if there is one.
+  *
+--- a/net/wireless/util.c
++++ b/net/wireless/util.c
+@@ -961,75 +961,24 @@ void ieee80211_amsdu_to_8023s(struct sk_
+ EXPORT_SYMBOL(ieee80211_amsdu_to_8023s);
+ 
+ /* Given a data frame determine the 802.1p/1d tag to use. */
+-unsigned int cfg80211_classify8021d(struct sk_buff *skb,
+-				    struct cfg80211_qos_map *qos_map)
++unsigned int cfg80211_classify_dscp(unsigned int dscp,
++				   struct cfg80211_qos_map *qos_map)
+ {
+-	unsigned int dscp;
+-	unsigned char vlan_priority;
+ 	unsigned int ret;
+ 
+-	/* skb->priority values from 256->263 are magic values to
+-	 * directly indicate a specific 802.1d priority.  This is used
+-	 * to allow 802.1d priority to be passed directly in from VLAN
+-	 * tags, etc.
+-	 */
+-	if (skb->priority >= 256 && skb->priority <= 263) {
+-		ret = skb->priority - 256;
+-		goto out;
+-	}
+-
+-	if (skb_vlan_tag_present(skb)) {
+-		vlan_priority = (skb_vlan_tag_get(skb) & VLAN_PRIO_MASK)
+-			>> VLAN_PRIO_SHIFT;
+-		if (vlan_priority > 0) {
+-			ret = vlan_priority;
+-			goto out;
+-		}
+-	}
+-
+-	switch (skb->protocol) {
+-	case htons(ETH_P_IP):
+-		dscp = ipv4_get_dsfield(ip_hdr(skb)) & 0xfc;
+-		break;
+-	case htons(ETH_P_IPV6):
+-		dscp = ipv6_get_dsfield(ipv6_hdr(skb)) & 0xfc;
+-		break;
+-	case htons(ETH_P_MPLS_UC):
+-	case htons(ETH_P_MPLS_MC): {
+-		struct mpls_label mpls_tmp, *mpls;
+-
+-		mpls = skb_header_pointer(skb, sizeof(struct ethhdr),
+-					  sizeof(*mpls), &mpls_tmp);
+-		if (!mpls)
+-			return 0;
+-
+-		ret = (ntohl(mpls->entry) & MPLS_LS_TC_MASK)
+-			>> MPLS_LS_TC_SHIFT;
+-		goto out;
+-	}
+-	case htons(ETH_P_80221):
+-		/* 802.21 is always network control traffic */
+-		return 7;
+-	default:
+-		return 0;
+-	}
+-
+ 	if (qos_map) {
+ 		unsigned int i, tmp_dscp = dscp >> 2;
+ 
+ 		for (i = 0; i < qos_map->num_des; i++) {
+-			if (tmp_dscp == qos_map->dscp_exception[i].dscp) {
+-				ret = qos_map->dscp_exception[i].up;
+-				goto out;
+-			}
++			if (tmp_dscp == qos_map->dscp_exception[i].dscp)
++				return array_index_nospec(qos_map->dscp_exception[i].up,
++							  IEEE80211_NUM_TIDS);
+ 		}
+ 
+ 		for (i = 0; i < 8; i++) {
+ 			if (tmp_dscp >= qos_map->up[i].low &&
+-			    tmp_dscp <= qos_map->up[i].high) {
+-				ret = i;
+-				goto out;
+-			}
++			    tmp_dscp <= qos_map->up[i].high)
++				return i;
+ 		}
+ 	}
+ 
+@@ -1092,6 +1041,64 @@ unsigned int cfg80211_classify8021d(stru
+ 		ret = 7;
+ 		break;
+ 	}
++	return ret;
++}
++EXPORT_SYMBOL(cfg80211_classify_dscp);
++
++unsigned int cfg80211_classify8021d(struct sk_buff *skb,
++				    struct cfg80211_qos_map *qos_map)
++{
++	unsigned int dscp;
++	unsigned char vlan_priority;
++	unsigned int ret;
++
++	/* skb->priority values from 256->263 are magic values to
++	 * directly indicate a specific 802.1d priority.  This is used
++	 * to allow 802.1d priority to be passed directly in from VLAN
++	 * tags, etc.
++	 */
++	if (skb->priority >= 256 && skb->priority <= 263) {
++		ret = skb->priority - 256;
++		goto out;
++	}
++
++	if (skb_vlan_tag_present(skb)) {
++		vlan_priority = (skb_vlan_tag_get(skb) & VLAN_PRIO_MASK)
++			>> VLAN_PRIO_SHIFT;
++		if (vlan_priority > 0) {
++			ret = vlan_priority;
++			goto out;
++		}
++	}
++
++	switch (skb->protocol) {
++	case htons(ETH_P_IP):
++		dscp = ipv4_get_dsfield(ip_hdr(skb)) & 0xfc;
++		break;
++	case htons(ETH_P_IPV6):
++		dscp = ipv6_get_dsfield(ipv6_hdr(skb)) & 0xfc;
++		break;
++	case htons(ETH_P_MPLS_UC):
++	case htons(ETH_P_MPLS_MC): {
++		struct mpls_label mpls_tmp, *mpls;
++
++		mpls = skb_header_pointer(skb, sizeof(struct ethhdr),
++					  sizeof(*mpls), &mpls_tmp);
++		if (!mpls)
++			return 0;
++
++		ret = (ntohl(mpls->entry) & MPLS_LS_TC_MASK)
++			>> MPLS_LS_TC_SHIFT;
++		goto out;
++	}
++	case htons(ETH_P_80221):
++		/* 802.21 is always network control traffic */
++		return 7;
++	default:
++		return 0;
++	}
++
++	ret = cfg80211_classify_dscp(dscp, qos_map);
+ out:
+ 	return array_index_nospec(ret, IEEE80211_NUM_TIDS);
+ }

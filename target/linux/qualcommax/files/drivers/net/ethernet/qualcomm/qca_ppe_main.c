@@ -1130,6 +1130,8 @@ static int qca_ppe_connect_tag_protocol(struct dsa_switch *ds,
 
 	data->trap_rcv = qca_ppe_trap_rcv;
 	data->flow_xmit = ppe_flow_xmit;
+	data->flow_xmit_page = ppe_flow_xmit_page;
+	data->flow_xmit_flush = ppe_flow_xmit_flush;
 
 	return 0;
 }
