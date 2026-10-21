@@ -1,0 +1,210 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] wifi: ath11k: look up the RX peer once per run of MSDUs
+
+Each received MSDU took base_lock twice to find its peer, once for the
+cipher and once for the station handed to mac80211. MSDUs reaped in one
+poll mostly come from the same peer, so keep what the poll needs of the
+peer and look it up again only when the peer ID changes. The station
+stays valid for the poll, which runs under RCU.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/drivers/net/wireless/ath/ath11k/dp_rx.c	2026-10-21 19:58:21.932437150 +0200
++++ b/drivers/net/wireless/ath/ath11k/dp_rx.c	2026-10-21 22:20:44.505627482 +0200
+@@ -2437,17 +2437,54 @@ ath11k_dp_rx_h_find_peer(struct ath11k_b
+ 	return peer;
+ }
+ 
++/* What a receive poll needs of the peer an MSDU came from, looked up once
++ * for each run of MSDUs from one peer. The station stays valid for the poll,
++ * which runs under RCU.
++ */
++struct ath11k_dp_rx_peer {
++	int peer_id;
++	bool found;
++	struct ieee80211_sta *sta;
++	enum hal_encrypt_type sec_type;
++	enum hal_encrypt_type sec_type_grp;
++};
++
++static struct ath11k_dp_rx_peer *
++ath11k_dp_rx_peer_get(struct ath11k_base *ab, struct sk_buff *msdu,
++		      struct ath11k_dp_rx_peer *cache)
++{
++	struct ath11k_skb_rxcb *rxcb = ATH11K_SKB_RXCB(msdu);
++	struct ath11k_peer *peer;
++
++	if (cache->found && cache->peer_id == rxcb->peer_id)
++		return cache;
++
++	spin_lock_bh(&ab->base_lock);
++	peer = ath11k_dp_rx_h_find_peer(ab, msdu);
++	cache->found = peer && peer->peer_id == rxcb->peer_id;
++	if (peer) {
++		cache->peer_id = rxcb->peer_id;
++		cache->sta = peer->sta;
++		cache->sec_type = peer->sec_type;
++		cache->sec_type_grp = peer->sec_type_grp;
++	}
++	spin_unlock_bh(&ab->base_lock);
++
++	return peer ? cache : NULL;
++}
++
+ static void ath11k_dp_rx_h_mpdu(struct ath11k *ar,
+ 				struct sk_buff *msdu,
+ 				struct hal_rx_desc *rx_desc,
+-				struct ieee80211_rx_status *rx_status)
++				struct ieee80211_rx_status *rx_status,
++				struct ath11k_dp_rx_peer *cache)
+ {
+ 	bool  fill_crypto_hdr;
+ 	enum hal_encrypt_type enctype;
+ 	bool is_decrypted = false;
+ 	struct ath11k_skb_rxcb *rxcb;
+ 	struct ieee80211_hdr *hdr;
+-	struct ath11k_peer *peer;
++	struct ath11k_dp_rx_peer *peer;
+ 	struct rx_attention *rx_attention;
+ 	u32 err_bitmap;
+ 
+@@ -2461,8 +2498,7 @@ static void ath11k_dp_rx_h_mpdu(struct a
+ 		rxcb->seq_no = ath11k_dp_rx_h_mpdu_start_seq_no(ar->ab, rx_desc);
+ 	}
+ 
+-	spin_lock_bh(&ar->ab->base_lock);
+-	peer = ath11k_dp_rx_h_find_peer(ar->ab, msdu);
++	peer = ath11k_dp_rx_peer_get(ar->ab, msdu, cache);
+ 	if (peer) {
+ 		if (rxcb->is_mcbc)
+ 			enctype = peer->sec_type_grp;
+@@ -2471,7 +2507,6 @@ static void ath11k_dp_rx_h_mpdu(struct a
+ 	} else {
+ 		enctype = ath11k_dp_rx_h_mpdu_start_enctype(ar->ab, rx_desc);
+ 	}
+-	spin_unlock_bh(&ar->ab->base_lock);
+ 
+ 	rx_attention = ath11k_dp_rx_get_attention(ar->ab, rx_desc);
+ 	err_bitmap = ath11k_dp_rx_h_attn_mpdu_err(rx_attention);
+@@ -2634,7 +2669,8 @@ static void ath11k_dp_rx_h_ppdu(struct a
+ 
+ static void ath11k_dp_rx_deliver_msdu(struct ath11k *ar, struct napi_struct *napi,
+ 				      struct sk_buff *msdu,
+-				      struct ieee80211_rx_status *status)
++				      struct ieee80211_rx_status *status,
++				      struct ath11k_dp_rx_peer *cache)
+ {
+ 	static const struct ieee80211_radiotap_he known = {
+ 		.data1 = cpu_to_le16(IEEE80211_RADIOTAP_HE_DATA1_DATA_MCS_KNOWN |
+@@ -2644,7 +2680,7 @@ static void ath11k_dp_rx_deliver_msdu(st
+ 	struct ieee80211_rx_status *rx_status;
+ 	struct ieee80211_radiotap_he *he = NULL;
+ 	struct ieee80211_sta *pubsta = NULL;
+-	struct ath11k_peer *peer;
++	struct ath11k_dp_rx_peer local = {}, *peer;
+ 	struct ath11k_skb_rxcb *rxcb = ATH11K_SKB_RXCB(msdu);
+ 	u8 decap = DP_RX_DECAP_TYPE_RAW;
+ 	bool is_mcbc = rxcb->is_mcbc;
+@@ -2661,17 +2697,15 @@ static void ath11k_dp_rx_deliver_msdu(st
+ 	if (!(status->flag & RX_FLAG_ONLY_MONITOR))
+ 		decap = ath11k_dp_rx_h_msdu_start_decap_type(ar->ab, rxcb->rx_desc);
+ 
+-	spin_lock_bh(&ar->ab->base_lock);
+-	peer = ath11k_dp_rx_h_find_peer(ar->ab, msdu);
+-	if (peer && peer->sta)
++	peer = ath11k_dp_rx_peer_get(ar->ab, msdu, cache ?: &local);
++	if (peer)
+ 		pubsta = peer->sta;
+-	spin_unlock_bh(&ar->ab->base_lock);
+ 
+ 	ath11k_dbg(ar->ab, ATH11K_DBG_DATA,
+ 		   "rx skb %p len %u peer %pM %d %s sn %u %s%s%s%s%s%s%s %srate_idx %u vht_nss %u freq %u band %u flag 0x%x fcs-err %i mic-err %i amsdu-more %i\n",
+ 		   msdu,
+ 		   msdu->len,
+-		   peer ? peer->addr : NULL,
++		   pubsta ? pubsta->addr : NULL,
+ 		   rxcb->tid,
+ 		   is_mcbc ? "mcast" : "ucast",
+ 		   rxcb->seq_no,
+@@ -2737,7 +2771,8 @@ static bool ath11k_dp_rx_check_nwifi_hdr
+ static int ath11k_dp_rx_process_msdu(struct ath11k *ar,
+ 				     struct sk_buff *msdu,
+ 				     struct sk_buff_head *msdu_list,
+-				     struct ieee80211_rx_status *rx_status)
++				     struct ieee80211_rx_status *rx_status,
++				     struct ath11k_dp_rx_peer *cache)
+ {
+ 	struct ath11k_base *ab = ar->ab;
+ 	struct hal_rx_desc *rx_desc, *lrx_desc;
+@@ -2810,7 +2845,7 @@ static int ath11k_dp_rx_process_msdu(str
+ 	}
+ 
+ 	ath11k_dp_rx_h_ppdu(ar, rx_desc, rx_status);
+-	ath11k_dp_rx_h_mpdu(ar, msdu, rx_desc, rx_status);
++	ath11k_dp_rx_h_mpdu(ar, msdu, rx_desc, rx_status, cache);
+ 
+ 	rx_status->flag |= RX_FLAG_SKIP_MONITOR | RX_FLAG_DUP_VALIDATED;
+ 
+@@ -2828,6 +2863,7 @@ static void ath11k_dp_rx_process_receive
+ 	struct sk_buff *msdu;
+ 	struct ath11k *ar;
+ 	struct ieee80211_rx_status rx_status = {};
++	struct ath11k_dp_rx_peer cache = {};
+ 	int ret;
+ 
+ 	if (skb_queue_empty(msdu_list))
+@@ -2845,7 +2881,8 @@ static void ath11k_dp_rx_process_receive
+ 	}
+ 
+ 	while ((msdu = __skb_dequeue(msdu_list))) {
+-		ret = ath11k_dp_rx_process_msdu(ar, msdu, msdu_list, &rx_status);
++		ret = ath11k_dp_rx_process_msdu(ar, msdu, msdu_list, &rx_status,
++						&cache);
+ 		if (unlikely(ret)) {
+ 			ath11k_dbg(ab, ATH11K_DBG_DATA,
+ 				   "Unable to process msdu %d", ret);
+@@ -2853,7 +2890,7 @@ static void ath11k_dp_rx_process_receive
+ 			continue;
+ 		}
+ 
+-		ath11k_dp_rx_deliver_msdu(ar, napi, msdu, &rx_status);
++		ath11k_dp_rx_deliver_msdu(ar, napi, msdu, &rx_status, &cache);
+ 	}
+ }
+ 
+@@ -4155,6 +4192,7 @@ static int ath11k_dp_rx_h_null_q_desc(st
+ 	struct rx_attention *rx_attention;
+ 	u8 l3pad_bytes;
+ 	struct ath11k_skb_rxcb *rxcb = ATH11K_SKB_RXCB(msdu);
++	struct ath11k_dp_rx_peer cache = {};
+ 	u32 hal_rx_desc_sz = ar->ab->hw_params.hal_desc_sz;
+ 
+ 	msdu_len = ath11k_dp_rx_h_msdu_start_msdu_len(ar->ab, desc);
+@@ -4203,7 +4241,7 @@ static int ath11k_dp_rx_h_null_q_desc(st
+ 
+ 	ath11k_dp_rx_h_ppdu(ar, desc, status);
+ 
+-	ath11k_dp_rx_h_mpdu(ar, msdu, desc, status);
++	ath11k_dp_rx_h_mpdu(ar, msdu, desc, status, &cache);
+ 
+ 	rxcb->tid = ath11k_dp_rx_h_mpdu_start_tid(ar->ab, desc);
+ 
+@@ -4335,7 +4373,7 @@ static void ath11k_dp_rx_wbm_err(struct
+ 		return;
+ 	}
+ 
+-	ath11k_dp_rx_deliver_msdu(ar, napi, msdu, &rxs);
++	ath11k_dp_rx_deliver_msdu(ar, napi, msdu, &rxs, NULL);
+ }
+ 
+ int ath11k_dp_rx_process_wbm_err(struct ath11k_base *ab,
+@@ -5342,7 +5380,7 @@ static int ath11k_dp_rx_mon_deliver(stru
+ 		rxs->flag |= RX_FLAG_ONLY_MONITOR;
+ 		ath11k_update_radiotap(ar, ppduinfo, mon_skb, rxs);
+ 
+-		ath11k_dp_rx_deliver_msdu(ar, napi, mon_skb, rxs);
++		ath11k_dp_rx_deliver_msdu(ar, napi, mon_skb, rxs, NULL);
+ 		mon_skb = skb_next;
+ 	} while (mon_skb);
+ 	rxs->flag = 0;
