@@ -1009,6 +1009,141 @@ static struct net_device *ppe_flow_xdev(struct qca_ppe_priv *priv,
  * IP header and the flow hash, so both are set as the receive path would
  * have. The flow index is unique per flow.
  */
+static bool ppe_cpu_batch = true;
+module_param_named(cpu_batch, ppe_cpu_batch, bool, 0644);
+MODULE_PARM_DESC(cpu_batch,
+		 "Pass TCP frames of one flow out through the CPU port in batches");
+
+/* The TCP frames of one flow that a receive poll brings for an egress that
+ * takes fraglist batches go out as one, shaped as fraglist GRO would have
+ * merged them: the first frame whole, the payloads of the others on its
+ * frag_list. The egress queues, schedules and completes the batch once.
+ * Frames join while their IP IDs run on from the batch's, as GSO rewrites
+ * them; the batch goes out when a frame of another flow comes, when it is
+ * full and when the poll ends.
+ */
+#define PPE_BATCH_MAX	32
+
+struct ppe_batch {
+	struct sk_buff *head, *tail;
+	u32 flow;
+	u16 id;
+	u8 ids;		/* 0: one frame so far, 1: IDs increment, 2: IDs fixed */
+	u8 count;
+};
+
+static DEFINE_PER_CPU(struct ppe_batch, ppe_batch);
+
+/* The length of the headers of a TCP frame with payload and without IP
+ * options or extension headers, which is what may join a batch, or 0.
+ */
+static unsigned int ppe_batch_hlen(struct sk_buff *skb, u16 *id)
+{
+	unsigned int nlen, hlen;
+	struct tcphdr *th;
+	u8 proto;
+
+	switch (skb->protocol) {
+	case htons(ETH_P_IP): {
+		struct iphdr *iph = ip_hdr(skb);
+
+		if (iph->ihl != 5 || ip_is_fragment(iph))
+			return 0;
+		proto = iph->protocol;
+		nlen = sizeof(*iph);
+		*id = ntohs(iph->id);
+		break;
+	}
+	case htons(ETH_P_IPV6):
+		proto = ipv6_hdr(skb)->nexthdr;
+		nlen = sizeof(struct ipv6hdr);
+		*id = 0;
+		break;
+	default:
+		return 0;
+	}
+
+	if (proto != IPPROTO_TCP ||
+	    skb_headlen(skb) < ETH_HLEN + nlen + sizeof(*th))
+		return 0;
+
+	th = (void *)skb_network_header(skb) + nlen;
+	hlen = ETH_HLEN + nlen + th->doff * 4;
+	if (skb_headlen(skb) <= hlen)
+		return 0;
+
+	skb_set_transport_header(skb, ETH_HLEN + nlen);
+	return hlen;
+}
+
+static void ppe_batch_flush(struct ppe_batch *bq)
+{
+	struct sk_buff *head = bq->head;
+	struct skb_shared_info *shinfo;
+
+	if (!head)
+		return;
+
+	bq->head = NULL;
+	if (bq->count > 1) {
+		shinfo = skb_shinfo(head);
+		shinfo->gso_size = skb_headlen(head) -
+				   skb_transport_offset(head) - tcp_hdrlen(head);
+		shinfo->gso_segs = bq->count;
+		if (head->protocol == htons(ETH_P_IP))
+			shinfo->gso_type = SKB_GSO_FRAGLIST | SKB_GSO_TCPV4 |
+					   (bq->ids == 2 ? SKB_GSO_TCP_FIXEDID : 0);
+		else
+			shinfo->gso_type = SKB_GSO_FRAGLIST | SKB_GSO_TCPV6;
+	}
+	dev_queue_xmit(head);
+}
+
+static void ppe_batch_add(struct net_device *dev, struct sk_buff *skb,
+			  u32 flow)
+{
+	struct ppe_batch *bq = this_cpu_ptr(&ppe_batch);
+	struct sk_buff *head = bq->head;
+	unsigned int hlen;
+	u16 id;
+	u8 ids;
+
+	hlen = ppe_batch_hlen(skb, &id);
+	if (head && hlen && bq->flow == flow && head->dev == dev &&
+	    bq->count < PPE_BATCH_MAX &&
+	    head->len + skb->len - hlen < GSO_LEGACY_MAX_SIZE) {
+		ids = id == bq->id ? 2 : id == (u16)(bq->id + 1) ? 1 : 0;
+		if (ids && (!bq->ids || ids == bq->ids)) {
+			skb_pull(skb, hlen);
+			if (bq->tail == head)
+				skb_shinfo(head)->frag_list = skb;
+			else
+				bq->tail->next = skb;
+			bq->tail = skb;
+			head->len += skb->len;
+			head->data_len += skb->len;
+			head->truesize += skb->truesize;
+			bq->id = id;
+			bq->ids = ids;
+			bq->count++;
+			return;
+		}
+	}
+
+	ppe_batch_flush(bq);
+	if (!hlen) {
+		dev_queue_xmit(skb);
+		return;
+	}
+
+	bq->head = skb;
+	bq->tail = skb;
+	bq->flow = flow;
+	bq->id = id;
+	bq->ids = 0;
+	bq->count = 1;
+}
+
 static void ppe_flow_dev_xmit(struct net_device *dev, struct sk_buff *skb,
 			      u32 flow)
 {
@@ -1017,7 +1152,10 @@ static void ppe_flow_dev_xmit(struct net_device *dev, struct sk_buff *skb,
 	skb_set_network_header(skb, ETH_HLEN);
 	skb->protocol = eth_hdr(skb)->h_proto;
 	skb_set_hash(skb, hash_32(flow, 32), PKT_HASH_TYPE_L4);
-	dev_queue_xmit(skb);
+	if (READ_ONCE(ppe_cpu_batch) && dev->features & NETIF_F_GSO_FRAGLIST)
+		ppe_batch_add(dev, skb, flow);
+	else
+		dev_queue_xmit(skb);
 }
 
 /* A frame the PPE routed to the CPU port for a flow whose egress is a
@@ -1139,11 +1277,13 @@ void ppe_flow_xmit_flush(struct dsa_switch *ds)
 {
 	struct ppe_xdp_bulk *bq = this_cpu_ptr(&ppe_xdp_bulk);
 
-	if (!bq->dev)
-		return;
+	if (bq->dev) {
+		ppe_xdp_bulk_xmit(ds_to_priv(ds), bq, XDP_XMIT_FLUSH);
+		bq->dev = NULL;
+	}
 
-	ppe_xdp_bulk_xmit(ds_to_priv(ds), bq, XDP_XMIT_FLUSH);
-	bq->dev = NULL;
+	/* after the bulk, whose refused frames may join a batch */
+	ppe_batch_flush(this_cpu_ptr(&ppe_batch));
 }
 
 /* Build the egress L3 interface, nexthop and public-address entries this rule

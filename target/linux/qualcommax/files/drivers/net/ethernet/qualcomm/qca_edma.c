@@ -793,6 +793,7 @@ static u32 edma_clean_rx(struct edma_queue *q, int budget)
 
 		if (flow_ops && edma_rx_flow_skb(netdev, flow_ops, skb, rxph)) {
 			dev_sw_netstats_rx_add(netdev, pkt_len);
+			xdp_flush = true;
 			goto next;
 		}
 
