@@ -6,8 +6,8 @@ code splits such a batch whatever the features passed to it. On the
 802.3 path mac80211 therefore queued, scheduled and completed every
 frame of a batch on its own even when the driver could send the batch
 whole. Leave a GSO frame intact on the 802.3 path when the interface
-features cover it, and allow NETIF_F_FRAGLIST among the driver's
-features so that a fraglist batch can be covered. The frame counters
+features cover it, and allow NETIF_F_FRAGLIST and NETIF_F_GSO_FRAGLIST
+among the driver's features so that a fraglist batch can be covered. The frame counters
 count the frames of a batch.
 
 Assisted-by: Claude:claude-opus-5-5
@@ -19,7 +19,7 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  #define MAC80211_SUPPORTED_FEATURES_TX	(NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM | \
  					 NETIF_F_HW_CSUM | NETIF_F_SG | \
  					 NETIF_F_HIGHDMA | NETIF_F_GSO_SOFTWARE | \
-+					 NETIF_F_FRAGLIST | \
++					 NETIF_F_FRAGLIST | NETIF_F_GSO_FRAGLIST | \
  					 NETIF_F_HW_TC)
  #define MAC80211_SUPPORTED_FEATURES_RX	(NETIF_F_RXCSUM)
  #define MAC80211_SUPPORTED_FEATURES	(MAC80211_SUPPORTED_FEATURES_TX | \
