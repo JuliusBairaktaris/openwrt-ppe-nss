@@ -489,7 +489,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp_tx.c
  	if (!c->sta) {
  		ath11k_dbg(ab, ATH11K_DBG_DATA,
  			   "dp_tx: failed to find the peer with peer_id %d\n",
-@@ -794,11 +1077,12 @@ int ath11k_dp_tx_completion_handler(stru
+@@ -794,13 +1077,16 @@ int ath11k_dp_tx_completion_handler(stru
  	struct hal_tx_status ts = {};
  	struct dp_tx_ring *tx_ring = &dp->tx_ring[ring_id];
  	struct ath11k_dp_tx_compl c = { .free = LIST_HEAD_INIT(c.free) };
@@ -502,8 +502,12 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp_tx.c
 +	u32 msdu_id, dma;
  	u8 mac_id, i;
  
++	xdp_frame_bulk_init(&bq);
++
  	spin_lock_bh(&status_ring->lock);
-@@ -858,10 +1142,23 @@ int ath11k_dp_tx_completion_handler(stru
+ 
+ 	ath11k_hal_srng_access_begin(ab, status_ring);
+@@ -858,10 +1144,23 @@ int ath11k_dp_tx_completion_handler(stru
  			spin_unlock(&tx_ring->tx_idr_lock);
  			continue;
  		}
@@ -527,7 +531,7 @@ Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp_tx.c
  		__set_bit(mac_id * IEEE80211_NUM_ACS + skb_get_queue_mapping(msdu),
  			  &push);
  
-@@ -871,6 +1168,8 @@ int ath11k_dp_tx_completion_handler(stru
+@@ -871,6 +1170,8 @@ int ath11k_dp_tx_completion_handler(stru
  		ath11k_dp_tx_complete_msdu(ar, msdu, &ts, &c);
  	}
  
