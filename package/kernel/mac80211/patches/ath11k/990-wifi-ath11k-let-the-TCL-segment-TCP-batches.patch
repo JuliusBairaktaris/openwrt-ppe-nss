@@ -1,0 +1,671 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] wifi: ath11k: let the TCL segment TCP batches
+
+A TCP batch from mac80211 was split with skb_gso_segment(), which
+allocates, maps and frees a buffer for every frame of it. The TCL can
+segment a batch itself: a data command may point at an MSDU extension
+descriptor that lists the batch's headers and one segment's payload, and
+the TCL writes that segment's IP length, IP ID, TCP sequence number and
+flags into the headers and fills in the checksums. Queue every segment
+of a TSO batch that way, with one mapping of the headers and of each
+payload piece, and complete the batch when its last segment completes.
+Batches the TCL cannot take whole still go through skb_gso_segment().
+The tso module parameter turns it off.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp.c
+===================================================================
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/dp.c
++++ backports-7.2/drivers/net/wireless/ath/ath11k/dp.c
+@@ -1027,8 +1027,15 @@ static void ath11k_dp_tx_pending_cleanup
+ 			continue;
+ 		}
+ 
++		if (ath11k_dp_tx_buf_is_tso(msdu)) {
++			msdu = ath11k_dp_tx_tso_put(ab, tx_ring, msdu,
++						    tx_ring->page_dma[id]);
++			if (!msdu)
++				continue;
++		}
++
+ 		dma_unmap_single(ab->dev, ATH11K_SKB_CB(msdu)->paddr,
+-				 msdu->len, DMA_TO_DEVICE);
++				 skb_headlen(msdu), DMA_TO_DEVICE);
+ 		dev_kfree_skb_any(msdu);
+ 	}
+ }
+@@ -1048,8 +1055,8 @@ void ath11k_dp_free(struct ath11k_base *
+ 	for (i = 0; i < ab->hw_params.hal_params->num_tx_rings; i++) {
+ 		spin_lock_bh(&dp->tx_ring[i].tx_idr_lock);
+ 		ath11k_dp_tx_pending_cleanup(ab, &dp->tx_ring[i]);
+-		ath11k_dp_tx_bufs_free(&dp->tx_ring[i]);
+ 		spin_unlock_bh(&dp->tx_ring[i].tx_idr_lock);
++		ath11k_dp_tx_bufs_free(ab, &dp->tx_ring[i]);
+ 		kfree(dp->tx_ring[i].tx_status);
+ 		dp->tx_ring[i].tx_status = NULL;
+ 	}
+@@ -1097,7 +1104,7 @@ int ath11k_dp_alloc(struct ath11k_base *
+ 	size = sizeof(struct hal_wbm_release_ring) * DP_TX_COMP_RING_SIZE;
+ 
+ 	for (i = 0; i < ab->hw_params.hal_params->num_tx_rings; i++) {
+-		ret = ath11k_dp_tx_bufs_init(&dp->tx_ring[i]);
++		ret = ath11k_dp_tx_bufs_init(ab, &dp->tx_ring[i]);
+ 		if (ret)
+ 			goto fail_cmn_srng_cleanup;
+ 		spin_lock_init(&dp->tx_ring[i].tx_idr_lock);
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp.h
+===================================================================
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/dp.h
++++ backports-7.2/drivers/net/wireless/ath/ath11k/dp.h
+@@ -85,6 +85,13 @@ struct dp_rxdma_ring {
+ 
+ #define ATH11K_TX_COMPL_NEXT(x)	(((x) + 1) % DP_TX_COMP_RING_SIZE)
+ 
++/* The payload pieces of one TSO segment, past the shared headers */
++struct ath11k_dp_tx_ext_map {
++	u32 dma[HAL_TX_MSDU_EXT_NUM_BUFS - 1];
++	u16 len[HAL_TX_MSDU_EXT_NUM_BUFS - 1];
++	u8 num;
++};
++
+ struct dp_tx_ring {
+ 	u8 tcl_data_ring_id;
+ 	struct dp_srng tcl_data_ring;
+@@ -95,7 +102,15 @@ struct dp_tx_ring {
+ 	u32 *page_dma;
+ 	u32 *free_ids;
+ 	u32 num_free;
+-	/* Protects bufs and free_ids */
++	/* MSDU extension descriptors for TSO segments, the payload mappings
++	 * of each, and the slots not in use
++	 */
++	struct hal_tx_msdu_ext *ext;
++	dma_addr_t ext_paddr;
++	struct ath11k_dp_tx_ext_map *ext_map;
++	u16 *ext_free;
++	u32 ext_num_free;
++	/* Protects bufs, free_ids and ext_free */
+ 	spinlock_t tx_idr_lock;
+ 	/* Serializes wake_tx_queue operations for this ring */
+ 	spinlock_t wake_tx_lock;
+@@ -219,6 +234,7 @@ struct ath11k_pdev_dp {
+ #define DP_TCL_DATA_RING_SIZE_WCN6750	2048
+ #define DP_TX_COMP_RING_SIZE		32768
+ #define DP_TX_IDR_SIZE			DP_TX_COMP_RING_SIZE
++#define DP_TX_EXT_DESC_NUM		2048
+ #define DP_TCL_CMD_RING_SIZE		32
+ #define DP_TCL_STATUS_RING_SIZE		32
+ #define DP_REO_DST_RING_MAX		4
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp_tx.c
+===================================================================
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/dp_tx.c
++++ backports-7.2/drivers/net/wireless/ath/ath11k/dp_tx.c
+@@ -6,6 +6,7 @@
+ 
+ #include <net/dsfield.h>
+ #include <net/gso.h>
++#include <net/tcp.h>
+ #include <net/xdp.h>
+ 
+ #include "core.h"
+@@ -16,6 +17,10 @@
+ #include "peer.h"
+ #include "mac.h"
+ 
++static bool ath11k_tso = true;
++module_param_named(tso, ath11k_tso, bool, 0644);
++MODULE_PARM_DESC(tso, "Let the TCL segment TCP batches");
++
+ static enum hal_tcl_encap_type
+ ath11k_dp_tx_get_encap_type(struct ath11k_vif *arvif, struct sk_buff *skb)
+ {
+@@ -87,7 +92,7 @@ enum hal_encrypt_type ath11k_dp_tx_get_e
+  * ones: the completion's cookie names the buffer directly. Callers of the id
+  * helpers hold tx_idr_lock.
+  */
+-int ath11k_dp_tx_bufs_init(struct dp_tx_ring *tx_ring)
++int ath11k_dp_tx_bufs_init(struct ath11k_base *ab, struct dp_tx_ring *tx_ring)
+ {
+ 	u32 id;
+ 
+@@ -97,8 +102,16 @@ int ath11k_dp_tx_bufs_init(struct dp_tx_
+ 				     sizeof(*tx_ring->page_dma), GFP_KERNEL);
+ 	tx_ring->free_ids = kvcalloc(DP_TX_IDR_SIZE - 1,
+ 				     sizeof(*tx_ring->free_ids), GFP_KERNEL);
+-	if (!tx_ring->bufs || !tx_ring->page_dma || !tx_ring->free_ids) {
+-		ath11k_dp_tx_bufs_free(tx_ring);
++	tx_ring->ext = dma_alloc_coherent(ab->dev, DP_TX_EXT_DESC_NUM *
++					  sizeof(*tx_ring->ext),
++					  &tx_ring->ext_paddr, GFP_KERNEL);
++	tx_ring->ext_map = kvcalloc(DP_TX_EXT_DESC_NUM,
++				    sizeof(*tx_ring->ext_map), GFP_KERNEL);
++	tx_ring->ext_free = kvcalloc(DP_TX_EXT_DESC_NUM,
++				     sizeof(*tx_ring->ext_free), GFP_KERNEL);
++	if (!tx_ring->bufs || !tx_ring->page_dma || !tx_ring->free_ids ||
++	    !tx_ring->ext || !tx_ring->ext_map || !tx_ring->ext_free) {
++		ath11k_dp_tx_bufs_free(ab, tx_ring);
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -106,18 +119,32 @@ int ath11k_dp_tx_bufs_init(struct dp_tx_
+ 	for (id = DP_TX_IDR_SIZE - 1; id--;)
+ 		tx_ring->free_ids[tx_ring->num_free++] = id;
+ 
++	tx_ring->ext_num_free = 0;
++	for (id = DP_TX_EXT_DESC_NUM; id--;)
++		tx_ring->ext_free[tx_ring->ext_num_free++] = id;
++
+ 	return 0;
+ }
+ 
+-void ath11k_dp_tx_bufs_free(struct dp_tx_ring *tx_ring)
++void ath11k_dp_tx_bufs_free(struct ath11k_base *ab, struct dp_tx_ring *tx_ring)
+ {
+ 	kvfree(tx_ring->bufs);
+ 	kvfree(tx_ring->page_dma);
+ 	kvfree(tx_ring->free_ids);
++	if (tx_ring->ext)
++		dma_free_coherent(ab->dev,
++				  DP_TX_EXT_DESC_NUM * sizeof(*tx_ring->ext),
++				  tx_ring->ext, tx_ring->ext_paddr);
++	kvfree(tx_ring->ext_map);
++	kvfree(tx_ring->ext_free);
+ 	tx_ring->bufs = NULL;
+ 	tx_ring->page_dma = NULL;
+ 	tx_ring->free_ids = NULL;
++	tx_ring->ext = NULL;
++	tx_ring->ext_map = NULL;
++	tx_ring->ext_free = NULL;
+ 	tx_ring->num_free = 0;
++	tx_ring->ext_num_free = 0;
+ }
+ 
+ static int ath11k_dp_tx_buf_get_id(struct dp_tx_ring *tx_ring,
+@@ -178,6 +205,40 @@ static struct xdp_frame *ath11k_dp_tx_bu
+ 	return (void *)((unsigned long)buf & ~ATH11K_DP_TX_BUF_XDP);
+ }
+ 
++/* A TSO segment sits in the buffer table as its batch, tagged in bit 1, with
++ * the extension descriptor slot it uses in page_dma.
++ */
++#define ATH11K_DP_TX_BUF_TSO	BIT(1)
++
++bool ath11k_dp_tx_buf_is_tso(struct sk_buff *buf)
++{
++	return (unsigned long)buf & ATH11K_DP_TX_BUF_TSO;
++}
++
++struct sk_buff *ath11k_dp_tx_buf_tso(struct sk_buff *buf)
++{
++	return (void *)((unsigned long)buf & ~ATH11K_DP_TX_BUF_TSO);
++}
++
++/* Releases a completed TSO segment under tx_idr_lock. Returns its batch once
++ * the last segment of it is done, NULL before that.
++ */
++struct sk_buff *ath11k_dp_tx_tso_put(struct ath11k_base *ab,
++				     struct dp_tx_ring *tx_ring,
++				     struct sk_buff *buf, u32 slot)
++{
++	struct ath11k_dp_tx_ext_map *map = &tx_ring->ext_map[slot];
++	struct sk_buff *skb = ath11k_dp_tx_buf_tso(buf);
++	int i;
++
++	for (i = 0; i < map->num; i++)
++		dma_unmap_page(ab->dev, map->dma[i], map->len[i],
++			       DMA_TO_DEVICE);
++	tx_ring->ext_free[tx_ring->ext_num_free++] = slot;
++
++	return skb_unref(skb) ? skb : NULL;
++}
++
+ void ath11k_dp_tx_xdp_release(struct ath11k_base *ab, struct sk_buff *buf,
+ 			      u32 dma, struct xdp_frame_bulk *bq)
+ {
+@@ -620,6 +681,257 @@ fail_remove_idr:
+ 	return ret;
+ }
+ 
++/* Maps the payload of one segment, @len bytes from *@piece at *@off, where
++ * piece 0 is the linear part past the headers and piece n is fragment n - 1.
++ */
++static int ath11k_dp_tx_tso_map(struct device *dev, struct sk_buff *skb,
++				struct ath11k_dp_tx_ext_map *map,
++				struct hal_tx_msdu_ext *ext,
++				unsigned int *piece, unsigned int *off,
++				unsigned int len)
++{
++	struct skb_shared_info *shinfo = skb_shinfo(skb);
++	unsigned int avail, take;
++	dma_addr_t dma;
++
++	map->num = 0;
++	while (len) {
++		if (!*piece)
++			avail = skb_headlen(skb) - *off;
++		else
++			avail = skb_frag_size(&shinfo->frags[*piece - 1]) - *off;
++		if (!avail) {
++			if (*piece == shinfo->nr_frags)
++				return -EINVAL;
++			(*piece)++;
++			*off = 0;
++			continue;
++		}
++		if (map->num == HAL_TX_MSDU_EXT_NUM_BUFS - 1)
++			return -E2BIG;
++
++		take = min(avail, len);
++		if (!*piece)
++			dma = dma_map_single(dev, skb->data + *off, take,
++					     DMA_TO_DEVICE);
++		else
++			dma = skb_frag_dma_map(dev, &shinfo->frags[*piece - 1],
++					       *off, take, DMA_TO_DEVICE);
++		if (dma_mapping_error(dev, dma))
++			return -ENOMEM;
++
++		map->dma[map->num] = dma;
++		map->len[map->num] = take;
++		map->num++;
++		ext->buf[map->num].addr_lo = lower_32_bits(dma);
++		ext->buf[map->num].info =
++			FIELD_PREP(HAL_TX_MSDU_EXT_BUF_INFO_LEN, take);
++		*off += take;
++		len -= take;
++	}
++
++	return 0;
++}
++
++static void ath11k_dp_tx_tso_unmap(struct device *dev,
++				   struct ath11k_dp_tx_ext_map *map)
++{
++	while (map->num--)
++		dma_unmap_page(dev, map->dma[map->num], map->len[map->num],
++			       DMA_TO_DEVICE);
++	map->num = 0;
++}
++
++/* A TCP batch the TCL segments: each segment is one TCL entry pointing at
++ * an MSDU extension descriptor, which lists the headers shared by the batch
++ * and the segment's payload, and gives the segment's IP length, IP ID, TCP
++ * sequence number and flags for the TCL to write into the headers. Every
++ * segment holds a reference on the batch, and the completion of the last
++ * one reports the batch to mac80211.
++ *
++ * Returns -EAGAIN, with the batch untouched, for a batch the TCL cannot
++ * take whole; ids, extension descriptors and ring entries for all segments
++ * are taken before the first is queued.
++ */
++static int ath11k_dp_tx_tso(struct ath11k *ar, struct ath11k_vif *arvif,
++			    struct sk_buff *skb, int held_ring)
++{
++	struct skb_shared_info *shinfo = skb_shinfo(skb);
++	struct ath11k_skb_cb *skb_cb = ATH11K_SKB_CB(skb);
++	unsigned int n = shinfo->gso_segs, mss = shinfo->gso_size;
++	unsigned int hdr_len, l2_len, ip_off, left, piece = 0, off;
++	struct ath11k_base *ab = ar->ab;
++	struct hal_tx_info ti = {};
++	struct dp_tx_ring *tx_ring;
++	struct hal_srng *tcl_ring;
++	u16 ids[ATH11K_TX_BATCH_MAX], slots[ATH11K_TX_BATCH_MAX];
++	u32 seq, flags, ip_id = 0;
++	dma_addr_t hdr_dma;
++	struct tcphdr *th;
++	int i, j, ret = -EAGAIN;
++
++	if (!(shinfo->gso_type & (SKB_GSO_TCPV4 | SKB_GSO_TCPV6)) ||
++	    shinfo->gso_type & SKB_GSO_FRAGLIST || skb_has_frag_list(skb) ||
++	    skb->ip_summed != CHECKSUM_PARTIAL || n > ATH11K_TX_BATCH_MAX ||
++	    refcount_read(&skb->users) != 1 ||
++	    ieee80211_vif_is_mesh(arvif->vif))
++		return -EAGAIN;
++
++	hdr_len = skb_tcp_all_headers(skb);
++	l2_len = skb_network_offset(skb);
++	/* the IP length counts the IPv4 header, but not the IPv6 one */
++	ip_off = shinfo->gso_type & SKB_GSO_TCPV6 ? skb_transport_offset(skb) :
++						     l2_len;
++	if (hdr_len > skb_headlen(skb) || l2_len > hdr_len)
++		return -EAGAIN;
++
++	if (held_ring >= 0)
++		ti.ring_id = held_ring;
++	else
++		ti.ring_id = ab->hw_params.hw_ops->get_ring_selector(skb_get_queue_mapping(skb)) %
++			     ab->hw_params.hal_params->num_tx_rings;
++	tx_ring = &ab->dp.tx_ring[ti.ring_id];
++	tcl_ring = &ab->hal.srng_list[tx_ring->tcl_data_ring.ring_id];
++
++	spin_lock_bh(&tx_ring->tx_idr_lock);
++	if (tx_ring->num_free < n || tx_ring->ext_num_free < n) {
++		spin_unlock_bh(&tx_ring->tx_idr_lock);
++		return -EAGAIN;
++	}
++	for (i = 0; i < n; i++) {
++		slots[i] = tx_ring->ext_free[--tx_ring->ext_num_free];
++		ids[i] = ath11k_dp_tx_buf_get_id(tx_ring,
++						 (void *)((unsigned long)skb |
++							  ATH11K_DP_TX_BUF_TSO));
++		tx_ring->page_dma[ids[i]] = slots[i];
++	}
++	spin_unlock_bh(&tx_ring->tx_idr_lock);
++
++	hdr_dma = dma_map_single(ab->dev, skb->data, skb_headlen(skb),
++				 DMA_TO_DEVICE);
++	if (dma_mapping_error(ab->dev, hdr_dma)) {
++		i = 0;
++		goto fail_put;
++	}
++
++	th = tcp_hdr(skb);
++	seq = ntohl(th->seq);
++	flags = (ntohl(tcp_flag_word(th)) >> 16) & 0x1ff;
++	if (shinfo->gso_type & SKB_GSO_TCPV4)
++		ip_id = ntohs(ip_hdr(skb)->id);
++
++	off = hdr_len;
++	left = skb->len - hdr_len;
++	for (i = 0; i < n; i++) {
++		struct hal_tx_msdu_ext *ext = &tx_ring->ext[slots[i]];
++		struct ath11k_dp_tx_ext_map *map = &tx_ring->ext_map[slots[i]];
++		unsigned int len = min(left, mss);
++		u32 seg_flags = flags;
++
++		if (i)
++			seg_flags &= ~TCPHDR_CWR;
++		if (i < n - 1)
++			seg_flags &= ~(TCPHDR_FIN | TCPHDR_PSH);
++
++		memset(ext, 0, sizeof(*ext));
++		if (ath11k_dp_tx_tso_map(ab->dev, skb, map, ext, &piece, &off,
++					 len)) {
++			ath11k_dp_tx_tso_unmap(ab->dev, map);
++			goto fail_unmap;
++		}
++
++		ext->info0 = FIELD_PREP(HAL_TX_MSDU_EXT_INFO0_TSO_ENABLE, 1) |
++			     FIELD_PREP(HAL_TX_MSDU_EXT_INFO0_TCP_FLAG,
++					seg_flags) |
++			     FIELD_PREP(HAL_TX_MSDU_EXT_INFO0_TCP_FLAG_MASK,
++					0x1ff);
++		ext->info1 = FIELD_PREP(HAL_TX_MSDU_EXT_INFO1_L2_LEN, l2_len) |
++			     FIELD_PREP(HAL_TX_MSDU_EXT_INFO1_IP_LEN,
++					hdr_len - ip_off + len);
++		ext->tcp_seq = seq;
++		ext->info3 = FIELD_PREP(HAL_TX_MSDU_EXT_INFO3_IP_ID, ip_id);
++		ext->buf[0].addr_lo = lower_32_bits(hdr_dma);
++		ext->buf[0].info = FIELD_PREP(HAL_TX_MSDU_EXT_BUF_INFO_LEN,
++					      hdr_len);
++
++		seq += len;
++		left -= len;
++		if (!(shinfo->gso_type & SKB_GSO_TCP_FIXEDID))
++			ip_id = (ip_id + 1) & 0xffff;
++	}
++
++	if (held_ring < 0) {
++		spin_lock_bh(&tcl_ring->lock);
++		ath11k_hal_srng_access_begin(ab, tcl_ring);
++	}
++	if (ath11k_hal_srng_src_num_free(ab, tcl_ring, held_ring < 0) < n) {
++		if (held_ring < 0) {
++			ath11k_hal_srng_access_end(ab, tcl_ring);
++			spin_unlock_bh(&tcl_ring->lock);
++		}
++		ab->soc_stats.tx_err.desc_na[ti.ring_id]++;
++		goto fail_unmap;
++	}
++
++	skb_cb->paddr = hdr_dma;
++	skb_cb->vif = arvif->vif;
++	skb_cb->ar = ar;
++	refcount_add(n - 1, &skb->users);
++
++	ti.encap_type = HAL_TCL_ENCAP_TYPE_ETHERNET;
++	ti.meta_data_flags = arvif->tcl_metadata;
++	ti.addr_search_flags = arvif->hal_addr_search_flags;
++	ti.search_type = arvif->search_type;
++	ti.type = HAL_TCL_DESC_TYPE_EXT_DESC;
++	ti.lmac_id = ar->lmac_id;
++	ti.bss_ast_hash = arvif->ast_hash;
++	ti.bss_ast_idx = arvif->ast_idx;
++	ti.rbm_id = ab->hw_params.hal_params->tcl2wbm_rbm_map[ti.ring_id].rbm_id;
++	ti.tid = ath11k_dp_tx_get_tid(skb);
++	ti.flags0 = FIELD_PREP(HAL_TCL_DATA_CMD_INFO1_IP4_CKSUM_EN, 1) |
++		    FIELD_PREP(HAL_TCL_DATA_CMD_INFO1_TCP4_CKSUM_EN, 1) |
++		    FIELD_PREP(HAL_TCL_DATA_CMD_INFO1_TCP6_CKSUM_EN, 1);
++	ti.flags1 = FIELD_PREP(HAL_TCL_DATA_CMD_INFO2_TID_OVERWRITE, 1);
++	/* the TCL reads this much of the extension descriptor */
++	ti.data_len = sizeof(*tx_ring->ext);
++
++	for (i = 0; i < n; i++) {
++		ti.desc_id = FIELD_PREP(DP_TX_DESC_ID_MAC_ID, ar->pdev_idx) |
++			     FIELD_PREP(DP_TX_DESC_ID_MSDU_ID, ids[i]) |
++			     FIELD_PREP(DP_TX_DESC_ID_POOL_ID,
++					skb_get_queue_mapping(skb));
++		ti.paddr = tx_ring->ext_paddr + slots[i] * sizeof(*tx_ring->ext);
++		ath11k_hal_tx_cmd_desc_setup(ab,
++					     ath11k_hal_srng_src_get_next_entry(ab, tcl_ring) +
++					     sizeof(struct hal_tlv_hdr), &ti);
++	}
++
++	if (held_ring < 0) {
++		ath11k_hal_srng_access_end(ab, tcl_ring);
++		ath11k_dp_shadow_start_timer(ab, tcl_ring,
++					     &ab->dp.tx_ring_timer[ti.ring_id]);
++		spin_unlock_bh(&tcl_ring->lock);
++	}
++
++	atomic_add(n, &ar->dp.num_tx_pending);
++
++	return 0;
++
++fail_unmap:
++	for (j = 0; j < i; j++)
++		ath11k_dp_tx_tso_unmap(ab->dev, &tx_ring->ext_map[slots[j]]);
++	dma_unmap_single(ab->dev, hdr_dma, skb_headlen(skb), DMA_TO_DEVICE);
++fail_put:
++	spin_lock_bh(&tx_ring->tx_idr_lock);
++	for (j = n; j--;) {
++		ath11k_dp_tx_buf_put_id(tx_ring, ids[j]);
++		tx_ring->ext_free[tx_ring->ext_num_free++] = slots[j];
++	}
++	spin_unlock_bh(&tx_ring->tx_idr_lock);
++
++	return ret;
++}
++
+ /* A GSO frame from mac80211 is a batch the driver splits, and its frames
+  * share the one status mac80211 expects: the last frame reports it with
+  * the airtime of the batch, and the others are freed without one. A batch
+@@ -630,8 +942,12 @@ int ath11k_dp_tx_gso(struct ath11k *ar,
+ 		     int held_ring)
+ {
+ 	struct sk_buff *segs, *seg, *next;
+-	int ret = 0;
++	int ret;
+ 
++	if (READ_ONCE(ath11k_tso) && !ath11k_dp_tx_tso(ar, arvif, skb, held_ring))
++		return 0;
++
++	ret = 0;
+ 	segs = skb_gso_segment(skb, NETIF_F_HW_CSUM);
+ 	if (IS_ERR_OR_NULL(segs)) {
+ 		ieee80211_free_txskb(ar->hw, skb);
+@@ -669,6 +985,16 @@ static void ath11k_dp_tx_free_txbuf(stru
+ 	msdu = ath11k_dp_tx_buf_put_id(tx_ring, msdu_id);
+ 	if (msdu)
+ 		dma = tx_ring->page_dma[msdu_id];
++	if (msdu && ath11k_dp_tx_buf_is_tso(msdu)) {
++		msdu = ath11k_dp_tx_tso_put(ab, tx_ring, msdu, dma);
++		if (!msdu) {
++			spin_unlock(&tx_ring->tx_idr_lock);
++			ar = ab->pdevs[mac_id].ar;
++			if (atomic_dec_and_test(&ar->dp.num_tx_pending))
++				wake_up(&ar->dp.tx_empty_waitq);
++			return;
++		}
++	}
+ 	spin_unlock(&tx_ring->tx_idr_lock);
+ 
+ 	if (unlikely(!msdu)) {
+@@ -688,7 +1014,8 @@ static void ath11k_dp_tx_free_txbuf(stru
+ 
+ 	skb_cb = ATH11K_SKB_CB(msdu);
+ 
+-	dma_unmap_single(ab->dev, skb_cb->paddr, msdu->len, DMA_TO_DEVICE);
++	dma_unmap_single(ab->dev, skb_cb->paddr, skb_headlen(msdu),
++			 DMA_TO_DEVICE);
+ 
+ 	__set_bit(mac_id * IEEE80211_NUM_ACS + skb_get_queue_mapping(msdu),
+ 		  push);
+@@ -716,6 +1043,16 @@ ath11k_dp_tx_htt_tx_complete_buf(struct
+ 	msdu = ath11k_dp_tx_buf_put_id(tx_ring, ts->msdu_id);
+ 	if (msdu)
+ 		dma = tx_ring->page_dma[ts->msdu_id];
++	if (msdu && ath11k_dp_tx_buf_is_tso(msdu)) {
++		msdu = ath11k_dp_tx_tso_put(ab, tx_ring, msdu, dma);
++		if (!msdu) {
++			spin_unlock(&tx_ring->tx_idr_lock);
++			ar = ab->pdevs[mac_id].ar;
++			if (atomic_dec_and_test(&ar->dp.num_tx_pending))
++				wake_up(&ar->dp.tx_empty_waitq);
++			return;
++		}
++	}
+ 	spin_unlock(&tx_ring->tx_idr_lock);
+ 
+ 	if (unlikely(!msdu)) {
+@@ -742,7 +1079,8 @@ ath11k_dp_tx_htt_tx_complete_buf(struct
+ 	if (atomic_dec_and_test(&ar->dp.num_tx_pending))
+ 		wake_up(&ar->dp.tx_empty_waitq);
+ 
+-	dma_unmap_single(ab->dev, skb_cb->paddr, msdu->len, DMA_TO_DEVICE);
++	dma_unmap_single(ab->dev, skb_cb->paddr, skb_headlen(msdu),
++			 DMA_TO_DEVICE);
+ 
+ 	if (!skb_cb->vif) {
+ 		ieee80211_free_txskb(ar->hw, msdu);
+@@ -996,7 +1334,8 @@ static void ath11k_dp_tx_complete_msdu(s
+ 
+ 	skb_cb = ATH11K_SKB_CB(msdu);
+ 
+-	dma_unmap_single(ab->dev, skb_cb->paddr, msdu->len, DMA_TO_DEVICE);
++	dma_unmap_single(ab->dev, skb_cb->paddr, skb_headlen(msdu),
++			 DMA_TO_DEVICE);
+ 
+ 	if (unlikely(!rcu_access_pointer(ab->pdevs_active[ar->pdev_idx]))) {
+ 		ieee80211_free_txskb(ar->hw, msdu);
+@@ -1186,11 +1525,19 @@ int ath11k_dp_tx_completion_handler(stru
+ 			continue;
+ 		}
+ 		dma = tx_ring->page_dma[msdu_id];
++		if (ath11k_dp_tx_buf_is_tso(msdu))
++			msdu = ath11k_dp_tx_tso_put(ab, tx_ring, msdu, dma);
+ 
+ 		spin_unlock(&tx_ring->tx_idr_lock);
+ 
+ 		ar = ab->pdevs[mac_id].ar;
+ 
++		if (!msdu) {
++			if (atomic_dec_and_test(&ar->dp.num_tx_pending))
++				wake_up(&ar->dp.tx_empty_waitq);
++			continue;
++		}
++
+ 		if (ath11k_dp_tx_buf_is_xdp(msdu)) {
+ 			if (atomic_dec_and_test(&ar->dp.num_tx_pending))
+ 				wake_up(&ar->dp.tx_empty_waitq);
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp_tx.h
+===================================================================
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/dp_tx.h
++++ backports-7.2/drivers/net/wireless/ath/ath11k/dp_tx.h
+@@ -36,8 +36,13 @@ int ath11k_dp_tx(struct ath11k *ar, stru
+ int ath11k_dp_tx_gso(struct ath11k *ar, struct ath11k_vif *arvif,
+ 		     struct ath11k_sta *arsta, struct sk_buff *skb,
+ 		     int held_ring);
+-int ath11k_dp_tx_bufs_init(struct dp_tx_ring *tx_ring);
+-void ath11k_dp_tx_bufs_free(struct dp_tx_ring *tx_ring);
++int ath11k_dp_tx_bufs_init(struct ath11k_base *ab, struct dp_tx_ring *tx_ring);
++void ath11k_dp_tx_bufs_free(struct ath11k_base *ab, struct dp_tx_ring *tx_ring);
++bool ath11k_dp_tx_buf_is_tso(struct sk_buff *buf);
++struct sk_buff *ath11k_dp_tx_buf_tso(struct sk_buff *buf);
++struct sk_buff *ath11k_dp_tx_tso_put(struct ath11k_base *ab,
++				     struct dp_tx_ring *tx_ring,
++				     struct sk_buff *buf, u32 slot);
+ int ath11k_dp_tx_xdp(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 		     int n, struct xdp_frame **frames, u32 flags);
+ bool ath11k_dp_tx_buf_is_xdp(struct sk_buff *buf);
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/hal_desc.h
+===================================================================
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/hal_desc.h
++++ backports-7.2/drivers/net/wireless/ath/ath11k/hal_desc.h
+@@ -1023,6 +1023,51 @@ enum hal_wbm_htt_tx_comp_status {
+ 	HAL_WBM_REL_HTT_TX_COMP_STATUS_MEC_NOTIFY,
+ };
+ 
++#define HAL_TX_MSDU_EXT_INFO0_TSO_ENABLE	BIT(0)
++#define HAL_TX_MSDU_EXT_INFO0_TCP_FLAG		GENMASK(15, 7)
++#define HAL_TX_MSDU_EXT_INFO0_TCP_FLAG_MASK	GENMASK(24, 16)
++#define HAL_TX_MSDU_EXT_INFO1_L2_LEN		GENMASK(15, 0)
++#define HAL_TX_MSDU_EXT_INFO1_IP_LEN		GENMASK(31, 16)
++#define HAL_TX_MSDU_EXT_INFO3_IP_ID		GENMASK(15, 0)
++#define HAL_TX_MSDU_EXT_BUF_INFO_ADDR_HI	GENMASK(7, 0)
++#define HAL_TX_MSDU_EXT_BUF_INFO_LEN		GENMASK(31, 16)
++#define HAL_TX_MSDU_EXT_NUM_BUFS		6
++
++struct hal_tx_msdu_ext_buf {
++	u32 addr_lo;
++	u32 info;
++} __packed;
++
++struct hal_tx_msdu_ext {
++	u32 info0;
++	u32 info1;
++	u32 tcp_seq;
++	u32 info3;
++	u32 info4;
++	u32 info5;
++	struct hal_tx_msdu_ext_buf buf[HAL_TX_MSDU_EXT_NUM_BUFS];
++} __packed;
++
++/* hal_tx_msdu_ext
++ *
++ *		A TCL data command of type HAL_TCL_DESC_TYPE_EXT_DESC points at
++ *		this descriptor instead of at the frame.
++ *
++ * tso_enable
++ *		The TCL writes tcp_flag under tcp_flag_mask, the IP length,
++ *		the IP ID and the TCP sequence number into the headers in
++ *		the first buffer, and fills in the checksums the TCL data
++ *		command enables.
++ *
++ * l2_length, ip_length
++ *		The length of the L2 header, and the IP length of the packet
++ *		this descriptor makes: the IPv4 total length, or the IPv6
++ *		payload length.
++ *
++ * buf
++ *		Up to six buffers that make up the frame, in order.
++ */
++
+ struct hal_tcl_data_cmd {
+ 	struct ath11k_buffer_addr buf_addr_info;
+ 	u32 info0;
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
+===================================================================
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/mac.c
++++ backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
+@@ -7375,7 +7375,7 @@ static void ath11k_mac_vif_unref(struct
+ 		    ath11k_dp_tx_buf_is_xdp(tx_ring->bufs[id]))
+ 			continue;
+ 
+-		skb_cb = ATH11K_SKB_CB(tx_ring->bufs[id]);
++		skb_cb = ATH11K_SKB_CB(ath11k_dp_tx_buf_tso(tx_ring->bufs[id]));
+ 		if (skb_cb->vif == vif)
+ 			skb_cb->vif = NULL;
+ 	}
