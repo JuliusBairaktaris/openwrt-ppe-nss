@@ -1,0 +1,53 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] wifi: ath11k: sync only what the device wrote into an RX buffer
+
+A reaped refill buffer was synced for the CPU over all of its 2.7 KB,
+whatever the frame's length. The REO destination descriptor gives the
+MSDU length, so sync the descriptor TLVs, the L3 padding and the MSDU,
+and all of the buffer only for an MSDU that goes on in the next one.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+diff -Naurp a/drivers/net/wireless/ath/ath11k/dp_rx.c b/drivers/net/wireless/ath/ath11k/dp_rx.c
+--- a/drivers/net/wireless/ath/ath11k/dp_rx.c	2026-10-21 19:54:10.381650099 +0200
++++ b/drivers/net/wireless/ath/ath11k/dp_rx.c	2026-10-21 19:55:18.309072863 +0200
+@@ -420,6 +420,29 @@ static void ath11k_dp_rx_unmap_buf(struc
+ 		dma_unmap_single(ab->dev, rxcb->paddr, len, dir);
+ }
+ 
++/* A refill buffer is synced for the CPU over what the device wrote into it:
++ * the descriptor, the L3 padding and the MSDU, or all of the buffer for an
++ * MSDU that goes on in the next one.
++ */
++static void ath11k_dp_rx_sync_msdu(struct ath11k_base *ab, struct sk_buff *skb,
++				   u32 info0)
++{
++	struct ath11k_skb_rxcb *rxcb = ATH11K_SKB_RXCB(skb);
++	unsigned int len;
++
++	if (!ath11k_dp_rx_buf_is_pp(skb) ||
++	    info0 & RX_MSDU_DESC_INFO0_MSDU_CONTINUATION) {
++		ath11k_dp_rx_unmap_buf(ab, skb, DMA_FROM_DEVICE);
++		return;
++	}
++
++	len = ab->hw_params.hal_desc_sz + L1_CACHE_BYTES +
++	      FIELD_GET(RX_MSDU_DESC_INFO0_MSDU_LENGTH, info0);
++	dma_sync_single_for_cpu(ab->dev, rxcb->paddr,
++				min(len, skb->len + skb_tailroom(skb)),
++				DMA_BIDIRECTIONAL);
++}
++
+ static dma_addr_t ath11k_dp_rx_pp_dma_addr(struct sk_buff *skb)
+ {
+ 	struct page *page = virt_to_head_page(skb->data);
+@@ -2890,7 +2913,7 @@ try_again:
+ 		spin_unlock_bh(&rx_ring->bufs_lock);
+ 
+ 		rxcb = ATH11K_SKB_RXCB(msdu);
+-		ath11k_dp_rx_unmap_buf(ab, msdu, DMA_FROM_DEVICE);
++		ath11k_dp_rx_sync_msdu(ab, msdu, desc->rx_msdu_info.info0);
+ 
+ 		num_buffs_reaped[mac_id]++;
+ 
