@@ -1,0 +1,13 @@
+#!/bin/sh
+# Applies the wifi-iface option zero_touch when the interface is created
+
+[ "$ACTION" = add ] || exit 0
+
+phy="$(cat /sys/class/net/$INTERFACE/phy80211/name 2>/dev/null)" || exit 0
+knob="/sys/kernel/debug/ieee80211/$phy/netdev:$INTERFACE/zero_touch"
+[ -w "$knob" ] || exit 0
+
+on="$(ubus call network.wireless status | \
+	jsonfilter -e "@.*.interfaces[@.ifname='$INTERFACE'].config.zero_touch")"
+[ "$on" = true ] && echo 1 > "$knob"
+exit 0

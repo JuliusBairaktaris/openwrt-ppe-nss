@@ -1262,6 +1262,11 @@
 		"wps_pushbutton": {
 			"description": "Support WPS pushbutton. Ignored in the 6 GHz band, which has no WPS",
 			"type": "boolean"
+		},
+		"zero_touch": {
+			"description": "Let the switch hand frames it routed to an AP interface straight to the Wi-Fi driver, past mac80211's queues (fq_codel, AQL, airtime fairness) and without an skb, where the driver supports it",
+			"type": "boolean",
+			"default": false
 		}
 	}
 }

@@ -13,6 +13,7 @@
 #include <linux/platform_device.h>
 #include <net/dsa.h>
 #include <net/page_pool/helpers.h>
+#include <net/xdp.h>
 
 #define EDMA_HW_RESET_ID "edma_rst"
 
@@ -338,6 +339,7 @@ struct edma_queue {
 	struct edma_priv *priv;
 	struct napi_struct napi;
 	struct page_pool *page_pool;
+	struct xdp_rxq_info xdp_rxq;
 
 	/* The frame a run of completions belongs to, named by the first of
 	 * them and released on the last.
