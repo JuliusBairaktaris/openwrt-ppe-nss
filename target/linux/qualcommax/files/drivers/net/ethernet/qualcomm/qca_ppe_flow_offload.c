@@ -1024,6 +1024,59 @@ bool ppe_flow_xmit(struct dsa_switch *ds, struct sk_buff *skb, u32 flow)
 	return true;
 }
 
+/* The egress that last took a page on this CPU, flushed when the next page
+ * goes elsewhere and when the receive poll ends.
+ */
+static DEFINE_PER_CPU(struct net_device *, ppe_page_dev);
+
+/* The same frame before it has an skb, for an egress that takes pages. Only an
+ * egress with nothing between the stack and its driver qualifies: no qdisc,
+ * no tc or netfilter egress hook, no packet socket.
+ */
+bool ppe_flow_xmit_page(struct dsa_switch *ds, struct net_device *indev,
+			struct page *page, unsigned int off, unsigned int len,
+			u32 flow)
+{
+	struct qca_ppe_priv *priv = ds_to_priv(ds);
+	struct net_device *dev, *prev;
+	int ifindex;
+
+	if (flow >= priv->data->num_flow_entries)
+		return false;
+	ifindex = READ_ONCE(priv->flow_xdev[flow]);
+	if (!ifindex)
+		return false;
+
+	dev = dev_get_by_index_rcu(dev_net(indev), ifindex);
+	if (!dev || !netif_running(dev) || !READ_ONCE(dev->page_xmit) ||
+	    rcu_dereference(dev->qdisc)->enqueue ||
+#ifdef CONFIG_NET_XGRESS
+	    rcu_access_pointer(dev->tcx_egress) ||
+#endif
+#ifdef CONFIG_NETFILTER_EGRESS
+	    rcu_access_pointer(dev->nf_hooks_egress) ||
+#endif
+	    !list_empty(&dev->ptype_all) ||
+	    !list_empty(&dev_net(dev)->ptype_all))
+		return false;
+
+	if (!dev->page_xmit(dev, page, off, len))
+		return false;
+
+	prev = this_cpu_xchg(ppe_page_dev, dev);
+	if (prev && prev != dev)
+		prev->page_xmit_flush(prev);
+	return true;
+}
+
+void ppe_flow_xmit_flush(struct dsa_switch *ds)
+{
+	struct net_device *dev = this_cpu_xchg(ppe_page_dev, NULL);
+
+	if (dev)
+		dev->page_xmit_flush(dev);
+}
+
 /* Build the egress L3 interface, nexthop and public-address entries this rule
  * needs, and program any that were not already in use by another flow.
  */

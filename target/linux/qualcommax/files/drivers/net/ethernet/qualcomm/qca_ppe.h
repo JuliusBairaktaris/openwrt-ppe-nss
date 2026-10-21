@@ -1773,6 +1773,10 @@ int ppe_setup_ft_block(struct qca_ppe_priv *priv,
 		       struct flow_block_offload *f);
 int ppe_flow_offload_init(struct qca_ppe_priv *priv);
 bool ppe_flow_xmit(struct dsa_switch *ds, struct sk_buff *skb, u32 flow);
+bool ppe_flow_xmit_page(struct dsa_switch *ds, struct net_device *indev,
+			struct page *page, unsigned int off, unsigned int len,
+			u32 flow);
+void ppe_flow_xmit_flush(struct dsa_switch *ds);
 void ppe_flow_purge_vsi(struct qca_ppe_priv *priv, u32 vsi);
 void ppe_flow_offload_exit(struct qca_ppe_priv *priv);
 

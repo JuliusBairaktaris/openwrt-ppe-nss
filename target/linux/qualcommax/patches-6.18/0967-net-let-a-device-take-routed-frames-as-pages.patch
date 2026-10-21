@@ -1,0 +1,44 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] net: let a device take routed frames as pages
+
+A frame the switch routed to the CPU port for a device outside the switch
+is finished and needs no skb if that device can send a page. Add a
+net_device hook for drivers that can, and a tagger_data hook through which
+the switch driver hands such frames to it before an skb is built.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+--- a/include/linux/dsa/oob.h
++++ b/include/linux/dsa/oob.h
+@@ -20,6 +20,10 @@ struct dsa_oob_tagger_data {
+ 			 u8 cpu_code);
+ 	bool (*flow_xmit)(struct dsa_switch *ds, struct sk_buff *skb,
+ 			  u32 flow);
++	bool (*flow_xmit_page)(struct dsa_switch *ds, struct net_device *dev,
++			       struct page *page, unsigned int off,
++			       unsigned int len, u32 flow);
++	void (*flow_xmit_flush)(struct dsa_switch *ds);
+ };
+ 
+ int dsa_oob_tag_push(struct sk_buff *skb, struct dsa_oob_tag_info *ti);
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -2582,6 +2582,18 @@ struct net_device {
+ 
+ 	struct hwtstamp_provider __rcu	*hwprov;
+ 
++	/* Takes a finished Ethernet frame another device's driver routed to
++	 * it, as a page that nothing on the CPU has written to. Called from
++	 * NAPI under RCU; returns false to leave the page with the caller.
++	 * The frames may wait for page_xmit_flush, which the caller runs
++	 * before it leaves the NAPI poll.
++	 */
++	bool			(*page_xmit)(struct net_device *dev,
++					     struct page *page,
++					     unsigned int off,
++					     unsigned int len);
++	void			(*page_xmit_flush)(struct net_device *dev);
++
+ 	u8			priv[] ____cacheline_aligned
+ 				       __counted_by(priv_len);
+ } ____cacheline_aligned;

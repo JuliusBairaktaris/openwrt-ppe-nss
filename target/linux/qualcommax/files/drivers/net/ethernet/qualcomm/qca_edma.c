@@ -607,33 +607,64 @@ static void edma_rx_vlan(struct net_device *netdev, struct sk_buff *skb,
 }
 
 /* The switch routed the frame to the CPU port on a flow it holds, with no
- * exception: its driver may own the egress and send it on unchanged.
+ * exception: its driver may own the egress and send it on unchanged. It first
+ * gets the bare page, which an egress that can take one sends without an skb.
  */
-static bool edma_rx_flow(struct net_device *netdev, struct sk_buff *skb,
-			 const struct edma_rx_preheader *rxph)
+static struct dsa_port *edma_rx_flow(struct net_device *netdev,
+				     const struct edma_rx_preheader *rxph)
 {
 	u32 pre2 = le32_to_cpu(rxph->rx_pre2);
-	struct dsa_oob_tagger_data *data;
-	struct dsa_port *cpu_dp;
 
 	if (((pre2 >> EDMA_RXPH_HASH_FLAG_SHIFT) & EDMA_RXPH_HASH_FLAG_MASK) !=
 	    EDMA_RXPH_HASH_FLOW ||
 	    le16_to_cpu(rxph->dst_info) != EDMA_PREHDR_DSTINFO_PORTID_IND << 8 ||
 	    FIELD_GET(EDMA_RXPH_CPU_CODE, le32_to_cpu(rxph->rx_pre4)))
-		return false;
+		return NULL;
 
-	cpu_dp = netdev->dsa_ptr;
-	if (!cpu_dp)
-		return false;
-	data = cpu_dp->ds->tagger_data;
+	return netdev->dsa_ptr;
+}
+
+static bool edma_rx_flow_page(struct net_device *netdev,
+			      struct dsa_port *cpu_dp, struct page *page,
+			      unsigned int len,
+			      const struct edma_rx_preheader *rxph)
+{
+	struct dsa_oob_tagger_data *data = cpu_dp->ds->tagger_data;
+
+	return data && data->flow_xmit_page &&
+	       data->flow_xmit_page(cpu_dp->ds, netdev, page,
+				    NET_SKB_PAD + EDMA_RX_PREHDR_SIZE, len,
+				    le32_to_cpu(rxph->rx_pre2) &
+				    EDMA_RXPH_HASH_MASK);
+}
+
+static void edma_rx_flow_flush(struct dsa_switch *ds)
+{
+	struct dsa_oob_tagger_data *data = ds->tagger_data;
+
+	data->flow_xmit_flush(ds);
+}
+
+static bool edma_rx_flow_skb(struct net_device *netdev,
+			     struct dsa_port *cpu_dp, struct sk_buff *skb,
+			     const struct edma_rx_preheader *rxph)
+{
+	struct dsa_oob_tagger_data *data = cpu_dp->ds->tagger_data;
+
 	if (!data || !data->flow_xmit)
 		return false;
 
 	skb->dev = netdev;
-	return data->flow_xmit(cpu_dp->ds, skb, pre2 & EDMA_RXPH_HASH_MASK);
+	return data->flow_xmit(cpu_dp->ds, skb,
+			       le32_to_cpu(rxph->rx_pre2) & EDMA_RXPH_HASH_MASK);
 }
 
-/* Reads a descriptor and hands its frame's lines to the CPU. The preheader
+/* The headers a routed frame is forwarded on fit in this much; the rest of the
+ * frame is handed to the CPU only when it gets an skb.
+ */
+#define EDMA_RX_PEEK_LEN	128
+
+/* Reads a descriptor and hands its frame's headers to the CPU. The preheader
  * and the headers behind it are prefetched, which the caller does one frame
  * ahead so that they arrive while the frame before is processed.
  */
@@ -647,7 +678,8 @@ static void edma_rx_peek(struct edma_queue *q, u16 idx, u32 *addr, u32 *status)
 	rxph = phys_to_virt(*addr);
 	page_pool_dma_sync_for_cpu(q->page_pool, virt_to_head_page(rxph), 0,
 				   EDMA_RX_PREHDR_SIZE +
-				   (*status & EDMA_RXDESC_PACKET_LEN_MASK));
+				   min_t(u32, *status & EDMA_RXDESC_PACKET_LEN_MASK,
+					 EDMA_RX_PEEK_LEN));
 	prefetch(rxph);
 	prefetch(rxph + L1_CACHE_BYTES);
 }
@@ -665,6 +697,8 @@ static u32 edma_clean_rx(struct edma_queue *q, int budget)
 	bool ahead = false;
 	struct sk_buff *skb;
 	u16 prod, cons;
+	struct dsa_switch *page_ds = NULL;
+	struct dsa_port *cpu_dp;
 	struct page *page;
 	u32 done = 0;
 	u32 src_port;
@@ -728,6 +762,20 @@ static u32 edma_clean_rx(struct edma_queue *q, int budget)
 
 		src_port = rxph->src_info & EDMA_SRC_PORT_MASK;
 
+		cpu_dp = edma_rx_flow(netdev, rxph);
+		if (cpu_dp && edma_rx_flow_page(netdev, cpu_dp, page, pkt_len,
+						rxph)) {
+			dev_sw_netstats_rx_add(netdev, pkt_len);
+			page_ds = cpu_dp->ds;
+			goto next;
+		}
+
+		if (pkt_len > EDMA_RX_PEEK_LEN)
+			page_pool_dma_sync_for_cpu(q->page_pool, page,
+						   EDMA_RX_PREHDR_SIZE +
+						   EDMA_RX_PEEK_LEN,
+						   pkt_len - EDMA_RX_PEEK_LEN);
+
 		skb = napi_build_skb(page_address(page), page_size(page));
 		if (unlikely(!skb)) {
 			page_pool_put_full_page(q->page_pool, page, true);
@@ -740,7 +788,7 @@ static u32 edma_clean_rx(struct edma_queue *q, int budget)
 		skb_reserve(skb, NET_SKB_PAD + EDMA_RX_PREHDR_SIZE);
 		skb_put(skb, pkt_len);
 
-		if (edma_rx_flow(netdev, skb, rxph)) {
+		if (cpu_dp && edma_rx_flow_skb(netdev, cpu_dp, skb, rxph)) {
 			dev_sw_netstats_rx_add(netdev, pkt_len);
 			goto next;
 		}
@@ -773,6 +821,9 @@ next:
 
 		done++;
 	}
+
+	if (page_ds)
+		edma_rx_flow_flush(page_ds);
 
 	edma_rx_fill(q);
 
