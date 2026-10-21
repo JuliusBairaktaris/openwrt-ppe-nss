@@ -21,7 +21,9 @@
 #include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/reset.h>
+#include <net/ip6_checksum.h>
 #include <net/netdev_queues.h>
+#include <net/tcp.h>
 
 #include "qca_cpu_port.h"
 #include "qca_edma.h"
@@ -932,6 +934,39 @@ static void edma_tx_vlan(struct sk_buff *skb, struct edma_tx_preheader *txph)
  * size in the preheader. The engine writes the headers of each segment it
  * cuts, so the checksums it is already asked for cover what it produced.
  */
+/* A forwarded TCP flow arrives as a fraglist GRO batch: the first frame
+ * with its headers, the payloads of the others on its frag_list. Payloads
+ * of the segment size fall where segmentation would cut them, so the batch
+ * goes out as one TSO frame cut from the first frame's headers.
+ */
+static bool edma_tx_fraglist_tso_ok(struct sk_buff *skb)
+{
+	const struct skb_shared_info *si = skb_shinfo(skb);
+
+	return (si->gso_type & (SKB_GSO_TCPV4 | SKB_GSO_TCPV6)) &&
+	       !(si->gso_type & SKB_GSO_DODGY) && !skb_header_cloned(skb) &&
+	       skb_pagelen(skb) - skb_transport_offset(skb) - tcp_hdrlen(skb) ==
+	       si->gso_size;
+}
+
+static void edma_tx_fraglist_tso(struct sk_buff *skb)
+{
+	struct skb_shared_info *si = skb_shinfo(skb);
+	unsigned int len = skb->len - skb_transport_offset(skb);
+	struct tcphdr *th = tcp_hdr(skb);
+
+	si->gso_type &= ~SKB_GSO_FRAGLIST;
+	skb->ip_summed = CHECKSUM_PARTIAL;
+	skb->csum_start = skb_transport_header(skb) - skb->head;
+	skb->csum_offset = offsetof(struct tcphdr, check);
+	if (si->gso_type & SKB_GSO_TCPV4)
+		th->check = ~tcp_v4_check(len, ip_hdr(skb)->saddr,
+					  ip_hdr(skb)->daddr, 0);
+	else
+		th->check = ~tcp_v6_check(len, &ipv6_hdr(skb)->saddr,
+					  &ipv6_hdr(skb)->daddr, 0);
+}
+
 static u32 edma_tx_tso(struct sk_buff *skb, struct edma_tx_preheader *txph)
 {
 	if (!skb_is_gso(skb))
@@ -1046,6 +1081,8 @@ static netdev_tx_t edma_ring_xmit(struct edma_queue *q, struct net_device *netde
 	memset((void *)txph, 0, EDMA_TX_PREHDR_SIZE);
 
 	txph->dst_info = dst_info;
+	if (skb_is_gso(skb) && (shinfo->gso_type & SKB_GSO_FRAGLIST))
+		edma_tx_fraglist_tso(skb);
 	edma_tx_csum(skb, txph, proto);
 	edma_tx_vlan(skb, txph);
 	tso = edma_tx_tso(skb, txph);
@@ -2002,7 +2039,9 @@ static netdev_features_t edma_ndo_features_check(struct sk_buff *skb,
 						 struct net_device *netdev,
 						 netdev_features_t features)
 {
-	if (skb_is_gso(skb) && edma_tx_needs_linearize(skb))
+	if (skb_is_gso(skb) && (edma_tx_needs_linearize(skb) ||
+				((skb_shinfo(skb)->gso_type & SKB_GSO_FRAGLIST) &&
+				 !edma_tx_fraglist_tso_ok(skb))))
 		features &= ~NETIF_F_GSO_MASK;
 
 	/* The switch inserts a C-tag behind an S-tag already in the frame and
@@ -2500,7 +2539,7 @@ static int edma_probe(struct platform_device *pdev)
 	netdev->hw_features = NETIF_F_RXCSUM | NETIF_F_IP_CSUM |
 			      NETIF_F_IPV6_CSUM | NETIF_F_SG | NETIF_F_TSO |
 			      NETIF_F_TSO6 | NETIF_F_RXHASH | NETIF_F_FRAGLIST |
-			      NETIF_F_HW_VLAN_CTAG_RX | NETIF_F_HW_VLAN_CTAG_TX |
+			      NETIF_F_GSO_FRAGLIST | NETIF_F_HW_VLAN_CTAG_RX | NETIF_F_HW_VLAN_CTAG_TX |
 			      NETIF_F_HW_VLAN_STAG_TX;
 	netdev->features = netdev->hw_features;
 	/* A DSA user port takes its features from the conduit's vlan_features. */
