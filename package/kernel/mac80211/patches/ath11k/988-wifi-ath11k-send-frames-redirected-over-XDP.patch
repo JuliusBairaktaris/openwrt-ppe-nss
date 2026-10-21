@@ -1,0 +1,641 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] wifi: ath11k: send frames redirected over XDP
+
+On an AP interface with zero_touch set, mac80211 passes ath11k the
+Ethernet frames another device redirected over XDP. Queue a run of them
+on one TCL ring under one lock, look the station up once per
+destination, take the TID from the DSCP, and write the head pointer on
+XDP_XMIT_FLUSH. The completion counts each frame for its station and
+returns the frames in bulk. Frames to unauthorized, TKIP or 4-address
+stations, multicast and non-IP frames are refused: the op takes the
+frames before the first refused one and leaves the rest to the caller.
+The interface gets Ethernet encapsulation while zero_touch is set,
+whatever the frame_mode.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/core.h
+===================================================================
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/core.h
++++ backports-7.2/drivers/net/wireless/ath/ath11k/core.h
+@@ -575,6 +575,8 @@ struct ath11k_sta {
+ #endif
+ 
+ 	bool use_4addr_set;
++	/* Authorized, with a cipher the hardware encrypts on its own */
++	bool page_tx;
+ 	u16 tcl_metadata;
+ 
+ 	/* Protected with ar->data_lock */
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp.c
+===================================================================
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/dp.c
++++ backports-7.2/drivers/net/wireless/ath/ath11k/dp.c
+@@ -1021,6 +1021,12 @@ static void ath11k_dp_tx_pending_cleanup
+ 		if (!msdu)
+ 			continue;
+ 
++		if (ath11k_dp_tx_buf_is_xdp(msdu)) {
++			ath11k_dp_tx_xdp_release(ab, msdu,
++						 tx_ring->page_dma[id], NULL);
++			continue;
++		}
++
+ 		dma_unmap_single(ab->dev, ATH11K_SKB_CB(msdu)->paddr,
+ 				 msdu->len, DMA_TO_DEVICE);
+ 		dev_kfree_skb_any(msdu);
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp.h
+===================================================================
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/dp.h
++++ backports-7.2/drivers/net/wireless/ath/ath11k/dp.h
+@@ -91,6 +91,8 @@ struct dp_tx_ring {
+ 	struct dp_srng tcl_comp_ring;
+ 	/* Buffers by the id their descriptor carries, and the ids not in use */
+ 	struct sk_buff **bufs;
++	/* For a redirected frame: the DMA address of its data */
++	u32 *page_dma;
+ 	u32 *free_ids;
+ 	u32 num_free;
+ 	/* Protects bufs and free_ids */
+@@ -276,6 +278,10 @@ struct ath11k_dp {
+ 	struct dp_link_desc_bank link_desc_banks[DP_LINK_DESC_BANKS_MAX];
+ 	struct dp_srng wbm_idle_ring;
+ 	struct dp_srng wbm_desc_rel_ring;
++	/* TCL rings holding redirected frames whose head pointer is not
++	 * written yet
++	 */
++	unsigned long xdp_tx_pending;
+ 	struct dp_srng tcl_cmd_ring;
+ 	struct dp_srng tcl_status_ring;
+ 	struct dp_srng reo_reinject_ring;
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp_tx.c
+===================================================================
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/dp_tx.c
++++ backports-7.2/drivers/net/wireless/ath/ath11k/dp_tx.c
+@@ -4,6 +4,9 @@
+  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+  */
+ 
++#include <net/dsfield.h>
++#include <net/xdp.h>
++
+ #include "core.h"
+ #include "dp_tx.h"
+ #include "debug.h"
+@@ -89,9 +92,11 @@ int ath11k_dp_tx_bufs_init(struct dp_tx_
+ 
+ 	tx_ring->bufs = kvcalloc(DP_TX_IDR_SIZE - 1, sizeof(*tx_ring->bufs),
+ 				 GFP_KERNEL);
++	tx_ring->page_dma = kvcalloc(DP_TX_IDR_SIZE - 1,
++				     sizeof(*tx_ring->page_dma), GFP_KERNEL);
+ 	tx_ring->free_ids = kvcalloc(DP_TX_IDR_SIZE - 1,
+ 				     sizeof(*tx_ring->free_ids), GFP_KERNEL);
+-	if (!tx_ring->bufs || !tx_ring->free_ids) {
++	if (!tx_ring->bufs || !tx_ring->page_dma || !tx_ring->free_ids) {
+ 		ath11k_dp_tx_bufs_free(tx_ring);
+ 		return -ENOMEM;
+ 	}
+@@ -106,8 +111,10 @@ int ath11k_dp_tx_bufs_init(struct dp_tx_
+ void ath11k_dp_tx_bufs_free(struct dp_tx_ring *tx_ring)
+ {
+ 	kvfree(tx_ring->bufs);
++	kvfree(tx_ring->page_dma);
+ 	kvfree(tx_ring->free_ids);
+ 	tx_ring->bufs = NULL;
++	tx_ring->page_dma = NULL;
+ 	tx_ring->free_ids = NULL;
+ 	tx_ring->num_free = 0;
+ }
+@@ -144,6 +151,251 @@ static struct sk_buff *ath11k_dp_tx_buf_
+ 	return skb;
+ }
+ 
++static u8 ath11k_dp_tx_tid_to_ac(u8 tid)
++{
++	static const u8 ac[] = {
++		IEEE80211_AC_BE, IEEE80211_AC_BK, IEEE80211_AC_BK,
++		IEEE80211_AC_BE, IEEE80211_AC_VI, IEEE80211_AC_VI,
++		IEEE80211_AC_VO, IEEE80211_AC_VO,
++	};
++
++	return ac[tid & 7];
++}
++
++/* A frame redirected from another device sits in the buffer table tagged in
++ * its low bit, which the alignment of struct xdp_frame leaves clear.
++ */
++#define ATH11K_DP_TX_BUF_XDP	BIT(0)
++
++bool ath11k_dp_tx_buf_is_xdp(struct sk_buff *buf)
++{
++	return (unsigned long)buf & ATH11K_DP_TX_BUF_XDP;
++}
++
++static struct xdp_frame *ath11k_dp_tx_buf_xdp(struct sk_buff *buf)
++{
++	return (void *)((unsigned long)buf & ~ATH11K_DP_TX_BUF_XDP);
++}
++
++void ath11k_dp_tx_xdp_release(struct ath11k_base *ab, struct sk_buff *buf,
++			      u32 dma, struct xdp_frame_bulk *bq)
++{
++	struct xdp_frame *xdpf = ath11k_dp_tx_buf_xdp(buf);
++
++	dma_unmap_single(ab->dev, dma, xdpf->len, DMA_TO_DEVICE);
++	if (bq)
++		xdp_return_frame_bulk(xdpf, bq);
++	else
++		xdp_return_frame(xdpf);
++}
++
++static void ath11k_dp_tx_xdp_ring_end(struct ath11k_base *ab, int ring)
++{
++	struct hal_srng *tcl_ring;
++
++	tcl_ring = &ab->hal.srng_list[ab->dp.tx_ring[ring].tcl_data_ring.ring_id];
++	ath11k_hal_srng_access_end(ab, tcl_ring);
++	ath11k_dp_shadow_start_timer(ab, tcl_ring, &ab->dp.tx_ring_timer[ring]);
++}
++
++static void ath11k_dp_tx_xdp_flush(struct ath11k_base *ab)
++{
++	struct hal_srng *tcl_ring;
++	unsigned long ring;
++
++	for_each_set_bit(ring, &ab->dp.xdp_tx_pending,
++			 ab->hw_params.hal_params->num_tx_rings) {
++		tcl_ring = &ab->hal.srng_list[ab->dp.tx_ring[ring].tcl_data_ring.ring_id];
++		spin_lock_bh(&tcl_ring->lock);
++		if (test_and_clear_bit(ring, &ab->dp.xdp_tx_pending))
++			ath11k_dp_tx_xdp_ring_end(ab, ring);
++		spin_unlock_bh(&tcl_ring->lock);
++	}
++}
++
++/* The station a run of frames goes to, looked up once per destination. */
++struct ath11k_dp_tx_xdp_dst {
++	u8 addr[ETH_ALEN];
++	struct ieee80211_sta *sta;
++};
++
++static struct ieee80211_sta *
++ath11k_dp_tx_xdp_sta(struct ieee80211_vif *vif, const u8 *addr,
++		     struct ath11k_dp_tx_xdp_dst *dst)
++{
++	struct ath11k_sta *arsta;
++
++	if (dst->sta && ether_addr_equal(addr, dst->addr))
++		return dst->sta;
++
++	dst->sta = ieee80211_find_sta(vif, addr);
++	if (!dst->sta)
++		return NULL;
++
++	arsta = ath11k_sta_to_arsta(dst->sta);
++	if (!READ_ONCE(arsta->page_tx) || arsta->use_4addr_set) {
++		dst->sta = NULL;
++		return NULL;
++	}
++	ether_addr_copy(dst->addr, addr);
++
++	return dst->sta;
++}
++
++/* Frames another device redirected to an AP interface in Ethernet
++ * encapsulation, with mac80211's TXQs off. The hardware adds the 802.11
++ * header and finds the station from the destination address.
++ *
++ * Frames the radio would treat differently from mac80211 stay with the
++ * caller: multicast, non-IP and fragmented frames, and frames to stations
++ * that are not authorized or use TKIP or 4-address mode. The TCL rings are
++ * taken once for a run of frames on the same ring, and their head pointers
++ * are written on XDP_XMIT_FLUSH.
++ */
++int ath11k_dp_tx_xdp(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++		     int n, struct xdp_frame **frames, u32 flags)
++{
++	struct ath11k_vif *arvif = ath11k_vif_to_arvif(vif);
++	struct net_device *dev = ieee80211_vif_to_wdev(vif)->netdev;
++	struct ath11k_dp_tx_xdp_dst dst = {};
++	struct ath11k *ar = arvif->ar;
++	struct ath11k_base *ab = ar->ab;
++	struct dp_tx_ring *tx_ring = NULL;
++	struct hal_srng *tcl_ring = NULL;
++	unsigned int bytes = 0;
++	int ring = -1, i, id;
++
++	if (unlikely(!(vif->offload_flags & IEEE80211_OFFLOAD_ENCAP_ENABLED) ||
++		     test_bit(ATH11K_FLAG_CRASH_FLUSH, &ab->dev_flags)))
++		return 0;
++
++	for (i = 0; i < n; i++) {
++		struct xdp_frame *xdpf = frames[i];
++		const struct ethhdr *eth = xdpf->data;
++		struct hal_tx_info ti = {};
++		struct ieee80211_sta *sta;
++		void *hal_tcl_desc;
++		dma_addr_t dma;
++		u8 dsfield, ac;
++
++		if (unlikely(xdpf->len < ETH_HLEN + sizeof(struct ipv6hdr) ||
++			     xdp_frame_has_frags(xdpf) ||
++			     is_multicast_ether_addr(eth->h_dest)))
++			break;
++
++		switch (eth->h_proto) {
++		case htons(ETH_P_IP):
++			dsfield = ipv4_get_dsfield((const void *)(eth + 1));
++			break;
++		case htons(ETH_P_IPV6):
++			dsfield = ipv6_get_dsfield((const void *)(eth + 1));
++			break;
++		default:
++			goto out;
++		}
++
++		sta = ath11k_dp_tx_xdp_sta(vif, eth->h_dest, &dst);
++		if (unlikely(!sta))
++			break;
++
++		ti.tid = ieee80211_dscp_to_tid(vif, sta, dsfield);
++		ac = ath11k_dp_tx_tid_to_ac(ti.tid);
++		ti.ring_id = ab->hw_params.hw_ops->get_ring_selector(ac) %
++			     ab->hw_params.hal_params->num_tx_rings;
++
++		if (ti.ring_id != ring) {
++			if (tcl_ring) {
++				spin_unlock(&tx_ring->tx_idr_lock);
++				if (flags & XDP_XMIT_FLUSH)
++					ath11k_dp_tx_xdp_ring_end(ab, ring);
++				else
++					set_bit(ring, &ab->dp.xdp_tx_pending);
++				spin_unlock_bh(&tcl_ring->lock);
++			}
++			ring = ti.ring_id;
++			tx_ring = &ab->dp.tx_ring[ring];
++			tcl_ring = &ab->hal.srng_list[tx_ring->tcl_data_ring.ring_id];
++			spin_lock_bh(&tcl_ring->lock);
++			spin_lock(&tx_ring->tx_idr_lock);
++			clear_bit(ring, &ab->dp.xdp_tx_pending);
++			ath11k_hal_srng_access_begin(ab, tcl_ring);
++		}
++
++		/* The producer may have written the headers, so the frame is
++		 * cleaned to memory as any redirected frame is.
++		 */
++		dma = dma_map_single(ab->dev, xdpf->data, xdpf->len,
++				     DMA_TO_DEVICE);
++		if (unlikely(dma_mapping_error(ab->dev, dma)))
++			break;
++		if (unlikely(upper_32_bits(dma)))
++			goto unmap;
++
++		id = ath11k_dp_tx_buf_get_id(tx_ring,
++					     (void *)((unsigned long)xdpf |
++						      ATH11K_DP_TX_BUF_XDP));
++		if (unlikely(id < 0))
++			goto unmap;
++
++		hal_tcl_desc = ath11k_hal_srng_src_get_next_entry(ab, tcl_ring);
++		if (unlikely(!hal_tcl_desc)) {
++			ath11k_hal_srng_access_begin(ab, tcl_ring);
++			hal_tcl_desc = ath11k_hal_srng_src_get_next_entry(ab,
++									  tcl_ring);
++		}
++		if (unlikely(!hal_tcl_desc)) {
++			ab->soc_stats.tx_err.desc_na[ring]++;
++			ath11k_dp_tx_buf_put_id(tx_ring, id);
++			goto unmap;
++		}
++		tx_ring->page_dma[id] = dma;
++
++		ti.desc_id = FIELD_PREP(DP_TX_DESC_ID_MAC_ID, ar->pdev_idx) |
++			     FIELD_PREP(DP_TX_DESC_ID_MSDU_ID, id) |
++			     FIELD_PREP(DP_TX_DESC_ID_POOL_ID, ac);
++		ti.rbm_id = ab->hw_params.hal_params->tcl2wbm_rbm_map[ring].rbm_id;
++		ti.encap_type = HAL_TCL_ENCAP_TYPE_ETHERNET;
++		ti.meta_data_flags = arvif->tcl_metadata;
++		ti.addr_search_flags = arvif->hal_addr_search_flags;
++		ti.search_type = arvif->search_type;
++		ti.type = HAL_TCL_DESC_TYPE_BUFFER;
++		ti.lmac_id = ar->lmac_id;
++		ti.bss_ast_hash = arvif->ast_hash;
++		ti.bss_ast_idx = arvif->ast_idx;
++		ti.flags1 = FIELD_PREP(HAL_TCL_DATA_CMD_INFO2_TID_OVERWRITE, 1);
++		ti.paddr = dma;
++		ti.data_len = xdpf->len;
++		ath11k_hal_tx_cmd_desc_setup(ab, hal_tcl_desc +
++					     sizeof(struct hal_tlv_hdr), &ti);
++		bytes += xdpf->len;
++		continue;
++
++unmap:
++		dma_unmap_single(ab->dev, dma, xdpf->len, DMA_TO_DEVICE);
++		break;
++	}
++out:
++	if (tcl_ring) {
++		spin_unlock(&tx_ring->tx_idr_lock);
++		if (flags & XDP_XMIT_FLUSH)
++			ath11k_dp_tx_xdp_ring_end(ab, ring);
++		else
++			set_bit(ring, &ab->dp.xdp_tx_pending);
++		spin_unlock_bh(&tcl_ring->lock);
++	}
++
++	/* A flush covers rings an earlier call left open. */
++	if (flags & XDP_XMIT_FLUSH && READ_ONCE(ab->dp.xdp_tx_pending))
++		ath11k_dp_tx_xdp_flush(ab);
++
++	if (i) {
++		atomic_add(i, &ar->dp.num_tx_pending);
++		dev_sw_netstats_tx_add(dev, i, bytes);
++	}
++
++	return i;
++}
++
+ /* A caller that passes @held_ring holds that TCL ring's lock with an access
+  * open, and ends the access itself once it has queued its last frame; the frame
+  * goes on that ring or not at all.
+@@ -370,9 +622,12 @@ static void ath11k_dp_tx_free_txbuf(stru
+ 	struct ath11k *ar;
+ 	struct sk_buff *msdu;
+ 	struct ath11k_skb_cb *skb_cb;
++	u32 dma;
+ 
+ 	spin_lock(&tx_ring->tx_idr_lock);
+ 	msdu = ath11k_dp_tx_buf_put_id(tx_ring, msdu_id);
++	if (msdu)
++		dma = tx_ring->page_dma[msdu_id];
+ 	spin_unlock(&tx_ring->tx_idr_lock);
+ 
+ 	if (unlikely(!msdu)) {
+@@ -381,11 +636,19 @@ static void ath11k_dp_tx_free_txbuf(stru
+ 		return;
+ 	}
+ 
++	ar = ab->pdevs[mac_id].ar;
++
++	if (ath11k_dp_tx_buf_is_xdp(msdu)) {
++		ath11k_dp_tx_xdp_release(ab, msdu, dma, NULL);
++		if (atomic_dec_and_test(&ar->dp.num_tx_pending))
++			wake_up(&ar->dp.tx_empty_waitq);
++		return;
++	}
++
+ 	skb_cb = ATH11K_SKB_CB(msdu);
+ 
+ 	dma_unmap_single(ab->dev, skb_cb->paddr, msdu->len, DMA_TO_DEVICE);
+ 
+-	ar = ab->pdevs[mac_id].ar;
+ 	__set_bit(mac_id * IEEE80211_NUM_ACS + skb_get_queue_mapping(msdu),
+ 		  push);
+ 	ieee80211_free_txskb(ar->hw, msdu);
+@@ -396,7 +659,7 @@ static void ath11k_dp_tx_free_txbuf(stru
+ 
+ static void
+ ath11k_dp_tx_htt_tx_complete_buf(struct ath11k_base *ab,
+-				 struct dp_tx_ring *tx_ring,
++				 struct dp_tx_ring *tx_ring, u8 mac_id,
+ 				 struct ath11k_dp_htt_wbm_tx_status *ts,
+ 				 unsigned long *push)
+ {
+@@ -406,9 +669,12 @@ ath11k_dp_tx_htt_tx_complete_buf(struct
+ 	struct ath11k_skb_cb *skb_cb;
+ 	struct ath11k *ar;
+ 	struct ath11k_peer *peer;
++	u32 dma;
+ 
+ 	spin_lock(&tx_ring->tx_idr_lock);
+ 	msdu = ath11k_dp_tx_buf_put_id(tx_ring, ts->msdu_id);
++	if (msdu)
++		dma = tx_ring->page_dma[ts->msdu_id];
+ 	spin_unlock(&tx_ring->tx_idr_lock);
+ 
+ 	if (unlikely(!msdu)) {
+@@ -417,6 +683,14 @@ ath11k_dp_tx_htt_tx_complete_buf(struct
+ 		return;
+ 	}
+ 
++	if (ath11k_dp_tx_buf_is_xdp(msdu)) {
++		ar = ab->pdevs[mac_id].ar;
++		ath11k_dp_tx_xdp_release(ab, msdu, dma, NULL);
++		if (atomic_dec_and_test(&ar->dp.num_tx_pending))
++			wake_up(&ar->dp.tx_empty_waitq);
++		return;
++	}
++
+ 	skb_cb = ATH11K_SKB_CB(msdu);
+ 	info = IEEE80211_SKB_CB(msdu);
+ 
+@@ -500,7 +774,8 @@ ath11k_dp_tx_process_htt_tx_complete(str
+ 		else
+ 			ts.peer_id = HTT_INVALID_PEER_ID;
+ 
+-		ath11k_dp_tx_htt_tx_complete_buf(ab, tx_ring, &ts, push);
++		ath11k_dp_tx_htt_tx_complete_buf(ab, tx_ring, mac_id, &ts,
++						 push);
+ 
+ 		break;
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_REINJ:
+@@ -644,6 +919,24 @@ struct ath11k_dp_tx_compl {
+ 	u16 peer_id;
+ };
+ 
++static void ath11k_dp_tx_compl_sta(struct ath11k_base *ab,
++				   struct hal_tx_status *ts,
++				   struct ath11k_dp_tx_compl *c)
++{
++	struct ath11k_peer *peer;
++
++	if (c->sta && c->peer_id == ts->peer_id)
++		return;
++
++	spin_lock_bh(&ab->base_lock);
++	peer = ath11k_peer_find_by_id(ab, ts->peer_id);
++	c->sta = peer ? peer->sta : NULL;
++	c->peer_id = ts->peer_id;
++	if (c->sta)
++		c->rate = ath11k_sta_to_arsta(c->sta)->last_txrate;
++	spin_unlock_bh(&ab->base_lock);
++}
++
+ static void ath11k_dp_tx_complete_msdu(struct ath11k *ar,
+ 				       struct sk_buff *msdu,
+ 				       struct hal_tx_status *ts,
+@@ -654,7 +947,6 @@ static void ath11k_dp_tx_complete_msdu(s
+ 	struct ath11k_base *ab = ar->ab;
+ 	struct ieee80211_tx_info *info;
+ 	struct ath11k_skb_cb *skb_cb;
+-	struct ath11k_peer *peer;
+ 
+ 	if (WARN_ON_ONCE(ts->buf_rel_source != HAL_WBM_REL_SRC_MODULE_TQM)) {
+ 		/* Must not happen */
+@@ -721,16 +1013,7 @@ static void ath11k_dp_tx_complete_msdu(s
+ 		ath11k_dp_tx_cache_peer_stats(ar, msdu, ts);
+ 	}
+ 
+-	if (!c->sta || c->peer_id != ts->peer_id) {
+-		spin_lock_bh(&ab->base_lock);
+-		peer = ath11k_peer_find_by_id(ab, ts->peer_id);
+-		c->sta = peer ? peer->sta : NULL;
+-		c->peer_id = ts->peer_id;
+-		if (c->sta)
+-			c->rate = ath11k_sta_to_arsta(c->sta)->last_txrate;
+-		spin_unlock_bh(&ab->base_lock);
+-	}
+-
++	ath11k_dp_tx_compl_sta(ab, ts, c);
+ 	if (!c->sta) {
+ 		ath11k_dbg(ab, ATH11K_DBG_DATA,
+ 			   "dp_tx: failed to find the peer with peer_id %d\n",
+@@ -794,13 +1077,16 @@ int ath11k_dp_tx_completion_handler(stru
+ 	struct hal_tx_status ts = {};
+ 	struct dp_tx_ring *tx_ring = &dp->tx_ring[ring_id];
+ 	struct ath11k_dp_tx_compl c = { .free = LIST_HEAD_INIT(c.free) };
++	struct xdp_frame_bulk bq;
+ 	struct sk_buff *tmp;
+ 	unsigned long push = 0;
+ 	int done = 0;
+ 	u32 *desc;
+-	u32 msdu_id;
++	u32 msdu_id, dma;
+ 	u8 mac_id, i;
+ 
++	xdp_frame_bulk_init(&bq);
++
+ 	spin_lock_bh(&status_ring->lock);
+ 
+ 	ath11k_hal_srng_access_begin(ab, status_ring);
+@@ -858,10 +1144,23 @@ int ath11k_dp_tx_completion_handler(stru
+ 			spin_unlock(&tx_ring->tx_idr_lock);
+ 			continue;
+ 		}
++		dma = tx_ring->page_dma[msdu_id];
+ 
+ 		spin_unlock(&tx_ring->tx_idr_lock);
+ 
+ 		ar = ab->pdevs[mac_id].ar;
++
++		if (ath11k_dp_tx_buf_is_xdp(msdu)) {
++			if (atomic_dec_and_test(&ar->dp.num_tx_pending))
++				wake_up(&ar->dp.tx_empty_waitq);
++			ath11k_dp_tx_compl_sta(ab, &ts, &c);
++			if (c.sta)
++				ieee80211_sta_tx_add(c.sta,
++						     ath11k_dp_tx_tid_to_ac(ts.tid),
++						     1, ath11k_dp_tx_buf_xdp(msdu)->len);
++			ath11k_dp_tx_xdp_release(ab, msdu, dma, &bq);
++			continue;
++		}
+ 		__set_bit(mac_id * IEEE80211_NUM_ACS + skb_get_queue_mapping(msdu),
+ 			  &push);
+ 
+@@ -871,6 +1170,8 @@ int ath11k_dp_tx_completion_handler(stru
+ 		ath11k_dp_tx_complete_msdu(ar, msdu, &ts, &c);
+ 	}
+ 
++	xdp_flush_frame_bulk(&bq);
++
+ 	list_for_each_entry_safe(msdu, tmp, &c.free, list) {
+ 		skb_list_del_init(msdu);
+ 		napi_consume_skb(msdu, budget);
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp_tx.h
+===================================================================
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/dp_tx.h
++++ backports-7.2/drivers/net/wireless/ath/ath11k/dp_tx.h
+@@ -10,6 +10,9 @@
+ #include "core.h"
+ #include "hal_tx.h"
+ 
++struct xdp_frame;
++struct xdp_frame_bulk;
++
+ struct ath11k_dp_htt_wbm_tx_status {
+ 	u32 msdu_id;
+ 	bool acked;
+@@ -23,6 +26,11 @@ int ath11k_dp_tx(struct ath11k *ar, stru
+ 		 struct ath11k_sta *arsta, struct sk_buff *skb, int held_ring);
+ int ath11k_dp_tx_bufs_init(struct dp_tx_ring *tx_ring);
+ void ath11k_dp_tx_bufs_free(struct dp_tx_ring *tx_ring);
++int ath11k_dp_tx_xdp(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++		     int n, struct xdp_frame **frames, u32 flags);
++bool ath11k_dp_tx_buf_is_xdp(struct sk_buff *buf);
++void ath11k_dp_tx_xdp_release(struct ath11k_base *ab, struct sk_buff *buf,
++			      u32 dma, struct xdp_frame_bulk *bq);
+ int ath11k_dp_tx_completion_handler(struct ath11k_base *ab, int ring_id,
+ 				    int budget);
+ int ath11k_dp_tx_send_reo_cmd(struct ath11k_base *ab, struct dp_rx_tid *rx_tid,
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
+===================================================================
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/mac.c
++++ backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
+@@ -6890,8 +6890,12 @@ static void ath11k_mac_op_update_vif_off
+ 	u32 param_id, param_value;
+ 	int ret;
+ 
++	/* An AP interface the user opted into zero_touch takes Ethernet
++	 * frames whatever the module's frame mode.
++	 */
+ 	param_id = WMI_VDEV_PARAM_TX_ENCAP_TYPE;
+-	if (ath11k_frame_mode != ATH11K_HW_TXRX_ETHERNET ||
++	if ((ath11k_frame_mode != ATH11K_HW_TXRX_ETHERNET &&
++	     !(vif->type == NL80211_IFTYPE_AP && vif->zero_touch)) ||
+ 	    (vif->type != NL80211_IFTYPE_STATION &&
+ 	     vif->type != NL80211_IFTYPE_AP))
+ 		vif->offload_flags &= ~(IEEE80211_OFFLOAD_ENCAP_ENABLED |
+@@ -7358,7 +7362,8 @@ static void ath11k_mac_vif_unref(struct
+ 	u32 id;
+ 
+ 	for (id = 0; id < DP_TX_IDR_SIZE - 1; id++) {
+-		if (!tx_ring->bufs[id])
++		if (!tx_ring->bufs[id] ||
++		    ath11k_dp_tx_buf_is_xdp(tx_ring->bufs[id]))
+ 			continue;
+ 
+ 		skb_cb = ATH11K_SKB_CB(tx_ring->bufs[id]);
+@@ -10049,8 +10054,13 @@ static int ath11k_mac_op_sta_state(struc
+ 		spin_lock_bh(&ar->ab->base_lock);
+ 
+ 		peer = ath11k_peer_find(ar->ab, arvif->vdev_id, sta->addr);
+-		if (peer)
++		if (peer) {
+ 			peer->is_authorized = true;
++			WRITE_ONCE(arsta->page_tx,
++				   vif->type == NL80211_IFTYPE_AP &&
++				   peer->sec_type != HAL_ENCRYPT_TYPE_TKIP_MIC &&
++				   peer->sec_type != HAL_ENCRYPT_TYPE_TKIP_NO_MIC);
++		}
+ 
+ 		spin_unlock_bh(&ar->ab->base_lock);
+ 
+@@ -10090,6 +10100,7 @@ static int ath11k_mac_op_sta_state(struc
+ 		   new_state == IEEE80211_STA_ASSOC) {
+ 		spin_lock_bh(&ar->ab->base_lock);
+ 
++		WRITE_ONCE(arsta->page_tx, false);
+ 		peer = ath11k_peer_find(ar->ab, arvif->vdev_id, sta->addr);
+ 		if (peer)
+ 			peer->is_authorized = false;
+@@ -10241,6 +10252,7 @@ static const struct ieee80211_ops ath11k
+ 	.add_interface                  = ath11k_mac_op_add_interface,
+ 	.remove_interface		= ath11k_mac_op_remove_interface,
+ 	.update_vif_offload		= ath11k_mac_op_update_vif_offload,
++	.xdp_xmit			= ath11k_dp_tx_xdp,
+ 	.config                         = ath11k_mac_op_config,
+ 	.bss_info_changed               = ath11k_mac_op_bss_info_changed,
+ 	.configure_filter		= ath11k_mac_op_configure_filter,
+@@ -10676,7 +10688,11 @@ static int __ath11k_mac_register(struct
+ 	ieee80211_hw_set(ar->hw, SUPPORTS_TX_FRAG);
+ 	ieee80211_hw_set(ar->hw, REPORTS_LOW_ACK);
+ 
+-	if (ath11k_frame_mode == ATH11K_HW_TXRX_ETHERNET) {
++	/* Native Wi-Fi mode still offers Ethernet encapsulation, which
++	 * ath11k_mac_op_update_vif_offload() then grants only to interfaces
++	 * with zero_touch.
++	 */
++	if (ath11k_frame_mode != ATH11K_HW_TXRX_RAW) {
+ 		ieee80211_hw_set(ar->hw, SUPPORTS_TX_ENCAP_OFFLOAD);
+ 		ieee80211_hw_set(ar->hw, SUPPORTS_RX_DECAP_OFFLOAD);
+ 	}
