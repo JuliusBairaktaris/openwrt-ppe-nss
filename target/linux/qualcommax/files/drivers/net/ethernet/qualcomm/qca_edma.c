@@ -23,6 +23,7 @@
 #include <linux/reset.h>
 #include <net/netdev_queues.h>
 
+#include "qca_cpu_port.h"
 #include "qca_edma.h"
 
 static void edma_irq_disable_all(struct edma_priv *priv)
@@ -606,57 +607,55 @@ static void edma_rx_vlan(struct net_device *netdev, struct sk_buff *skb,
 		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), tci);
 }
 
+static const struct qca_cpu_port_ops *edma_cpu_port_ops(struct net_device *netdev)
+{
+	return netdev->dsa_ptr ? netdev->dsa_ptr->ds->tagger_data : NULL;
+}
+
 /* The switch routed the frame to the CPU port on a flow it holds, with no
  * exception: its driver may own the egress and send it on unchanged. It first
- * gets the bare page, which an egress that can take one sends without an skb.
+ * gets the frame as an XDP buffer, which an egress that takes XDP frames sends
+ * without an skb.
  */
-static struct dsa_port *edma_rx_flow(struct net_device *netdev,
-				     const struct edma_rx_preheader *rxph)
+static bool edma_rx_flow(const struct edma_rx_preheader *rxph)
 {
 	u32 pre2 = le32_to_cpu(rxph->rx_pre2);
 
-	if (((pre2 >> EDMA_RXPH_HASH_FLAG_SHIFT) & EDMA_RXPH_HASH_FLAG_MASK) !=
-	    EDMA_RXPH_HASH_FLOW ||
-	    le16_to_cpu(rxph->dst_info) != EDMA_PREHDR_DSTINFO_PORTID_IND << 8 ||
-	    FIELD_GET(EDMA_RXPH_CPU_CODE, le32_to_cpu(rxph->rx_pre4)))
-		return NULL;
-
-	return netdev->dsa_ptr;
+	return ((pre2 >> EDMA_RXPH_HASH_FLAG_SHIFT) & EDMA_RXPH_HASH_FLAG_MASK) ==
+	       EDMA_RXPH_HASH_FLOW &&
+	       le16_to_cpu(rxph->dst_info) == EDMA_PREHDR_DSTINFO_PORTID_IND << 8 &&
+	       !FIELD_GET(EDMA_RXPH_CPU_CODE, le32_to_cpu(rxph->rx_pre4));
 }
 
-static bool edma_rx_flow_page(struct net_device *netdev,
-			      struct dsa_port *cpu_dp, struct page *page,
-			      unsigned int len,
-			      const struct edma_rx_preheader *rxph)
+static bool edma_rx_flow_xdp(struct edma_queue *q,
+			     const struct qca_cpu_port_ops *ops,
+			     struct page *page, unsigned int len,
+			     const struct edma_rx_preheader *rxph)
 {
-	struct dsa_oob_tagger_data *data = cpu_dp->ds->tagger_data;
+	struct xdp_buff xdp;
 
-	return data && data->flow_xmit_page &&
-	       data->flow_xmit_page(cpu_dp->ds, netdev, page,
-				    NET_SKB_PAD + EDMA_RX_PREHDR_SIZE, len,
-				    le32_to_cpu(rxph->rx_pre2) &
-				    EDMA_RXPH_HASH_MASK);
-}
+	if (!ops->flow_xmit_xdp)
+		return false;
 
-static void edma_rx_flow_flush(struct dsa_switch *ds)
-{
-	struct dsa_oob_tagger_data *data = ds->tagger_data;
-
-	data->flow_xmit_flush(ds);
+	xdp_init_buff(&xdp, page_size(page), &q->xdp_rxq);
+	xdp_prepare_buff(&xdp, page_address(page),
+			 NET_SKB_PAD + EDMA_RX_PREHDR_SIZE, len, false);
+	return ops->flow_xmit_xdp(q->priv->netdev->dsa_ptr->ds, &xdp,
+				  le32_to_cpu(rxph->rx_pre2) &
+				  EDMA_RXPH_HASH_MASK);
 }
 
 static bool edma_rx_flow_skb(struct net_device *netdev,
-			     struct dsa_port *cpu_dp, struct sk_buff *skb,
+			     const struct qca_cpu_port_ops *ops,
+			     struct sk_buff *skb,
 			     const struct edma_rx_preheader *rxph)
 {
-	struct dsa_oob_tagger_data *data = cpu_dp->ds->tagger_data;
-
-	if (!data || !data->flow_xmit)
+	if (!ops->flow_xmit)
 		return false;
 
 	skb->dev = netdev;
-	return data->flow_xmit(cpu_dp->ds, skb,
-			       le32_to_cpu(rxph->rx_pre2) & EDMA_RXPH_HASH_MASK);
+	return ops->flow_xmit(netdev->dsa_ptr->ds, skb,
+			      le32_to_cpu(rxph->rx_pre2) & EDMA_RXPH_HASH_MASK);
 }
 
 /* The headers a routed frame is forwarded on fit in this much; the rest of the
@@ -697,8 +696,10 @@ static u32 edma_clean_rx(struct edma_queue *q, int budget)
 	bool ahead = false;
 	struct sk_buff *skb;
 	u16 prod, cons;
-	struct dsa_switch *page_ds = NULL;
-	struct dsa_port *cpu_dp;
+	const struct qca_cpu_port_ops *ops = edma_cpu_port_ops(netdev);
+	const struct qca_cpu_port_ops *flow_ops;
+	bool xdp_flush = false;
+	u8 cpu_code;
 	struct page *page;
 	u32 done = 0;
 	u32 src_port;
@@ -762,11 +763,11 @@ static u32 edma_clean_rx(struct edma_queue *q, int budget)
 
 		src_port = rxph->src_info & EDMA_SRC_PORT_MASK;
 
-		cpu_dp = edma_rx_flow(netdev, rxph);
-		if (cpu_dp && edma_rx_flow_page(netdev, cpu_dp, page, pkt_len,
-						rxph)) {
+		flow_ops = ops && edma_rx_flow(rxph) ? ops : NULL;
+		if (flow_ops && edma_rx_flow_xdp(q, flow_ops, page, pkt_len,
+						 rxph)) {
 			dev_sw_netstats_rx_add(netdev, pkt_len);
-			page_ds = cpu_dp->ds;
+			xdp_flush = true;
 			goto next;
 		}
 
@@ -788,7 +789,7 @@ static u32 edma_clean_rx(struct edma_queue *q, int budget)
 		skb_reserve(skb, NET_SKB_PAD + EDMA_RX_PREHDR_SIZE);
 		skb_put(skb, pkt_len);
 
-		if (cpu_dp && edma_rx_flow_skb(netdev, cpu_dp, skb, rxph)) {
+		if (flow_ops && edma_rx_flow_skb(netdev, flow_ops, skb, rxph)) {
 			dev_sw_netstats_rx_add(netdev, pkt_len);
 			goto next;
 		}
@@ -801,6 +802,20 @@ static u32 edma_clean_rx(struct edma_queue *q, int budget)
 			     skb->data - frame);
 		edma_rx_hash(netdev, skb, rxph);
 
+		dev_sw_netstats_rx_add(priv->netdev, pkt_len);
+
+		/* A frame the switch trapped is reported and maybe consumed
+		 * by its driver.
+		 */
+		cpu_code = FIELD_GET(EDMA_RXPH_CPU_CODE,
+				     le32_to_cpu(rxph->rx_pre4));
+		if (cpu_code && ops && ops->trap_rcv &&
+		    ops->trap_rcv(netdev->dsa_ptr->ds, skb, src_port,
+				  cpu_code)) {
+			kfree_skb(skb);
+			goto next;
+		}
+
 		tag_info = skb_ext_add(skb, SKB_EXT_DSA_OOB);
 		if (unlikely(!tag_info)) {
 			dev_kfree_skb_any(skb);
@@ -809,10 +824,7 @@ static u32 edma_clean_rx(struct edma_queue *q, int budget)
 			goto next;
 		}
 		tag_info->port = src_port;
-		tag_info->cpu_code = FIELD_GET(EDMA_RXPH_CPU_CODE,
-					       le32_to_cpu(rxph->rx_pre4));
 
-		dev_sw_netstats_rx_add(priv->netdev, pkt_len);
 		napi_gro_receive(&q->napi, skb);
 
 next:
@@ -822,8 +834,8 @@ next:
 		done++;
 	}
 
-	if (page_ds)
-		edma_rx_flow_flush(page_ds);
+	if (xdp_flush)
+		ops->flow_xmit_flush(netdev->dsa_ptr->ds);
 
 	edma_rx_fill(q);
 
@@ -2215,8 +2227,12 @@ static void edma_page_pools_swap(struct edma_priv *priv,
 {
 	unsigned int i;
 
-	for (i = 0; i < EDMA_MAX_QUEUES; i++)
+	for (i = 0; i < EDMA_MAX_QUEUES; i++) {
 		swap(priv->q[i].page_pool, pools[i]);
+		if (priv->q[i].page_pool)
+			xdp_rxq_info_attach_page_pool(&priv->q[i].xdp_rxq,
+						      priv->q[i].page_pool);
+	}
 }
 
 static void edma_set_xps(struct edma_priv *priv)
@@ -2438,6 +2454,10 @@ static int edma_probe(struct platform_device *pdev)
 		q->rxfill = priv->soc->rxfill_ring - i;
 		q->rxdesc = priv->soc->rxdesc_ring - i;
 		spin_lock_init(&q->tx_lock);
+		/* Holds nothing to free: the page pools stay the driver's. */
+		ret = xdp_rxq_info_reg(&q->xdp_rxq, netdev, i, 0);
+		if (ret)
+			return ret;
 	}
 
 	ret = edma_get_mac_address(netdev, dev->of_node);

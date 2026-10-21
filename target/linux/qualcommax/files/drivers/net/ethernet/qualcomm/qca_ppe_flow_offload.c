@@ -29,6 +29,8 @@
 #include <net/netfilter/nf_flow_table.h>
 #include <net/pkt_cls.h>
 #include <net/tcp.h>
+#include <net/xdp.h>
+#include <net/page_pool/helpers.h>
 
 #include "qca_ppe.h"
 
@@ -989,6 +991,35 @@ static bool ppe_cpu_xmit_ok(const struct ppe_flow_data *data)
 	       !data->vlan_valid && !data->pppoe_valid;
 }
 
+static struct net_device *ppe_flow_xdev(struct qca_ppe_priv *priv,
+					struct net *net, u32 flow)
+{
+	int ifindex;
+
+	if (flow >= priv->data->num_flow_entries)
+		return NULL;
+	ifindex = READ_ONCE(priv->flow_xdev[flow]);
+	if (!ifindex)
+		return NULL;
+
+	return dev_get_by_index_rcu(net, ifindex) ?: ERR_PTR(-ENODEV);
+}
+
+/* What the egress classifies on - tc, the Wi-Fi access category - reads the
+ * IP header and the flow hash, so both are set as the receive path would
+ * have. The flow index is unique per flow.
+ */
+static void ppe_flow_dev_xmit(struct net_device *dev, struct sk_buff *skb,
+			      u32 flow)
+{
+	skb->dev = dev;
+	skb_reset_mac_header(skb);
+	skb_set_network_header(skb, ETH_HLEN);
+	skb->protocol = eth_hdr(skb)->h_proto;
+	skb_set_hash(skb, hash_32(flow, 32), PKT_HASH_TYPE_L4);
+	dev_queue_xmit(skb);
+}
+
 /* A frame the PPE routed to the CPU port for a flow whose egress is a
  * device outside the switch. It arrives finished, so it goes straight out.
  */
@@ -996,59 +1027,86 @@ bool ppe_flow_xmit(struct dsa_switch *ds, struct sk_buff *skb, u32 flow)
 {
 	struct qca_ppe_priv *priv = ds_to_priv(ds);
 	struct net_device *dev;
-	int ifindex;
 
-	if (flow >= priv->data->num_flow_entries)
-		return false;
-	ifindex = READ_ONCE(priv->flow_xdev[flow]);
-	if (!ifindex)
+	dev = ppe_flow_xdev(priv, dev_net(skb->dev), flow);
+	if (!dev)
 		return false;
 
-	dev = dev_get_by_index_rcu(dev_net(skb->dev), ifindex);
-	if (unlikely(!dev || !netif_running(dev))) {
+	if (unlikely(IS_ERR(dev) || !netif_running(dev))) {
 		atomic_inc(&priv->flow_xmit_drop);
 		kfree_skb(skb);
 		return true;
 	}
 
-	/* What the egress classifies on - tc, the Wi-Fi access category -
-	 * reads the IP header and the flow hash, so both are set as the
-	 * receive path would have. The flow index is unique per flow.
-	 */
-	skb->dev = dev;
-	skb_reset_mac_header(skb);
-	skb_set_network_header(skb, ETH_HLEN);
-	skb->protocol = eth_hdr(skb)->h_proto;
-	skb_set_hash(skb, hash_32(flow, 32), PKT_HASH_TYPE_L4);
-	dev_queue_xmit(skb);
+	ppe_flow_dev_xmit(dev, skb, flow);
 	return true;
 }
 
-/* The egress that last took a page on this CPU, flushed when the next page
- * goes elsewhere and when the receive poll ends.
- */
-static DEFINE_PER_CPU(struct net_device *, ppe_page_dev);
+#define PPE_XDP_BULK	16
 
-/* The same frame before it has an skb, for an egress that takes pages. Only an
- * egress with nothing between the stack and its driver qualifies: no qdisc,
- * no tc or netfilter egress hook, no packet socket.
+/* The frames queued on this CPU for one egress, sent when a frame for another
+ * egress or a seventeenth frame comes and when the receive poll ends.
  */
-bool ppe_flow_xmit_page(struct dsa_switch *ds, struct net_device *indev,
-			struct page *page, unsigned int off, unsigned int len,
-			u32 flow)
+struct ppe_xdp_bulk {
+	struct net_device *dev;
+	unsigned int count;
+	struct xdp_frame *frames[PPE_XDP_BULK];
+	u32 flows[PPE_XDP_BULK];
+};
+
+static DEFINE_PER_CPU(struct ppe_xdp_bulk, ppe_xdp_bulk);
+
+/* A frame the egress did not take goes out with an skb. Only its headers were
+ * synced for the CPU, and the egress may read more of it.
+ */
+static void ppe_xdp_skb_xmit(struct qca_ppe_priv *priv, struct net_device *dev,
+			     struct xdp_frame *xdpf, u32 flow)
 {
+	struct page *page = virt_to_head_page(xdpf->data);
+	struct page_pool *pp = page->pp;
+	struct sk_buff *skb;
+
+	dma_sync_single_for_cpu(pp->p.dev, page_pool_get_dma_addr(page) +
+				(xdpf->data - page_address(page)),
+				xdpf->len, pp->p.dma_dir);
+
+	skb = xdp_build_skb_from_frame(xdpf, dev);
+	if (unlikely(!skb)) {
+		atomic_inc(&priv->flow_xmit_drop);
+		xdp_return_frame_rx_napi(xdpf);
+		return;
+	}
+
+	skb_push(skb, ETH_HLEN);
+	ppe_flow_dev_xmit(dev, skb, flow);
+}
+
+static void ppe_xdp_bulk_xmit(struct qca_ppe_priv *priv,
+			      struct ppe_xdp_bulk *bq, u32 flags)
+{
+	struct net_device *dev = bq->dev;
+	int sent, i;
+
+	sent = dev->netdev_ops->ndo_xdp_xmit(dev, bq->count, bq->frames, flags);
+	for (i = max(sent, 0); i < bq->count; i++)
+		ppe_xdp_skb_xmit(priv, dev, bq->frames[i], bq->flows[i]);
+	bq->count = 0;
+}
+
+/* The same frame before it has an skb, for an egress that takes XDP frames.
+ * Only an egress with nothing between the stack and its driver qualifies: no
+ * qdisc, no tc or netfilter egress hook, no packet socket.
+ */
+bool ppe_flow_xmit_xdp(struct dsa_switch *ds, struct xdp_buff *xdp, u32 flow)
+{
+	struct ppe_xdp_bulk *bq = this_cpu_ptr(&ppe_xdp_bulk);
 	struct qca_ppe_priv *priv = ds_to_priv(ds);
-	struct net_device *dev, *prev;
-	int ifindex;
+	struct xdp_frame *xdpf;
+	struct net_device *dev;
 
-	if (flow >= priv->data->num_flow_entries)
-		return false;
-	ifindex = READ_ONCE(priv->flow_xdev[flow]);
-	if (!ifindex)
-		return false;
-
-	dev = dev_get_by_index_rcu(dev_net(indev), ifindex);
-	if (!dev || !netif_running(dev) || !READ_ONCE(dev->page_xmit) ||
+	dev = ppe_flow_xdev(priv, dev_net(xdp->rxq->dev), flow);
+	if (IS_ERR_OR_NULL(dev) || !netif_running(dev) ||
+	    !(READ_ONCE(dev->xdp_features) & NETDEV_XDP_ACT_NDO_XMIT) ||
 	    rcu_dereference(dev->qdisc)->enqueue ||
 #ifdef CONFIG_NET_XGRESS
 	    rcu_access_pointer(dev->tcx_egress) ||
@@ -1060,21 +1118,32 @@ bool ppe_flow_xmit_page(struct dsa_switch *ds, struct net_device *indev,
 	    !list_empty(&dev_net(dev)->ptype_all))
 		return false;
 
-	if (!dev->page_xmit(dev, page, off, len))
+	xdpf = xdp_convert_buff_to_frame(xdp);
+	if (unlikely(!xdpf))
 		return false;
 
-	prev = this_cpu_xchg(ppe_page_dev, dev);
-	if (prev && prev != dev)
-		prev->page_xmit_flush(prev);
+	if (bq->dev != dev) {
+		if (bq->dev)
+			ppe_xdp_bulk_xmit(priv, bq, XDP_XMIT_FLUSH);
+		bq->dev = dev;
+	} else if (bq->count == PPE_XDP_BULK) {
+		ppe_xdp_bulk_xmit(priv, bq, 0);
+	}
+
+	bq->frames[bq->count] = xdpf;
+	bq->flows[bq->count++] = flow;
 	return true;
 }
 
 void ppe_flow_xmit_flush(struct dsa_switch *ds)
 {
-	struct net_device *dev = this_cpu_xchg(ppe_page_dev, NULL);
+	struct ppe_xdp_bulk *bq = this_cpu_ptr(&ppe_xdp_bulk);
 
-	if (dev)
-		dev->page_xmit_flush(dev);
+	if (!bq->dev)
+		return;
+
+	ppe_xdp_bulk_xmit(ds_to_priv(ds), bq, XDP_XMIT_FLUSH);
+	bq->dev = NULL;
 }
 
 /* Build the egress L3 interface, nexthop and public-address entries this rule

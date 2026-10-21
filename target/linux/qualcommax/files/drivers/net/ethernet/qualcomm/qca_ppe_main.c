@@ -15,6 +15,7 @@
 #include <linux/if_bridge.h>
 #include <linux/if_vlan.h>
 
+#include "qca_cpu_port.h"
 #include "qca_ppe.h"
 
 /* A port carrying nothing but minimum-sized frames at 10G wraps a packet
@@ -1020,18 +1021,22 @@ static int qca_ppe_devlink_trap_action_set(struct dsa_switch *ds,
 }
 
 static bool qca_ppe_trap_rcv(struct dsa_switch *ds, struct sk_buff *skb,
-			     u8 cpu_code)
+			     int port, u8 cpu_code)
 {
 	struct qca_ppe_priv *priv = ds_to_priv(ds);
 	unsigned long to_cpu = READ_ONCE(priv->trap_to_cpu);
+	struct dsa_port *dp = dsa_to_port(ds, port);
 	int i;
+
+	if (!dp || !dsa_port_is_user(dp))
+		return false;
 
 	for_each_set_bit(i, &to_cpu, PPE_TRAP_CODES) {
 		if (ppe_trap_cpu_code[i] != cpu_code)
 			continue;
 		skb_push(skb, ETH_HLEN);
 		devlink_trap_report(ds->devlink, skb, priv->trap_ctx[i],
-				    &dsa_port_from_netdev(skb->dev)->devlink_port,
+				    &dp->devlink_port,
 				    NULL);
 		return true;
 	}
@@ -1042,7 +1047,7 @@ static bool qca_ppe_trap_rcv(struct dsa_switch *ds, struct sk_buff *skb,
 		skb_push(skb, ETH_HLEN);
 		devlink_trap_report(ds->devlink, skb,
 				    priv->trap_ctx[ppe_trap_index(ppe_trap_rx[i].trap)],
-				    &dsa_port_from_netdev(skb->dev)->devlink_port,
+				    &dp->devlink_port,
 				    NULL);
 		skb_pull(skb, ETH_HLEN);
 		break;
@@ -1120,18 +1125,21 @@ static int qca_ppe_devlink_trap_policer_counter_get(struct dsa_switch *ds,
 	return 0;
 }
 
+static const struct qca_cpu_port_ops qca_ppe_cpu_port_ops = {
+	.trap_rcv		= qca_ppe_trap_rcv,
+	.flow_xmit		= ppe_flow_xmit,
+	.flow_xmit_xdp		= ppe_flow_xmit_xdp,
+	.flow_xmit_flush	= ppe_flow_xmit_flush,
+};
+
 static int qca_ppe_connect_tag_protocol(struct dsa_switch *ds,
 					enum dsa_tag_protocol proto)
 {
-	struct dsa_oob_tagger_data *data = ds->tagger_data;
-
 	if (proto != DSA_TAG_PROTO_OOB)
 		return -EPROTONOSUPPORT;
 
-	data->trap_rcv = qca_ppe_trap_rcv;
-	data->flow_xmit = ppe_flow_xmit;
-	data->flow_xmit_page = ppe_flow_xmit_page;
-	data->flow_xmit_flush = ppe_flow_xmit_flush;
+	/* The conduit hands frames to the switch driver before the tagger. */
+	ds->tagger_data = (void *)&qca_ppe_cpu_port_ops;
 
 	return 0;
 }
