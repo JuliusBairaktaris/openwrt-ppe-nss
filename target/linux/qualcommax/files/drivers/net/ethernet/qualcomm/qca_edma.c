@@ -1033,7 +1033,7 @@ static netdev_tx_t edma_ring_xmit(struct edma_queue *q, struct net_device *netde
 	bool stop;
 	__be16 proto;
 
-	spin_lock_bh(&q->tx_lock);
+	spin_lock(&q->tx_lock);
 
 	/* The stop below is decided on the cached index too, so it is read
 	 * again before it could stop the queue on room the engine has freed.
@@ -1154,7 +1154,7 @@ static netdev_tx_t edma_ring_xmit(struct edma_queue *q, struct net_device *netde
 		netif_txq_try_stop(txq, edma_txdesc_free(q),
 				   EDMA_TX_RING_THRESH);
 
-	spin_unlock_bh(&q->tx_lock);
+	spin_unlock(&q->tx_lock);
 	return NETDEV_TX_OK;
 
 unmap:
@@ -1174,7 +1174,7 @@ drop:
 	dev_kfree_skb_any(skb);
 	if (q->tx_kick)
 		edma_tx_kick(q);
-	spin_unlock_bh(&q->tx_lock);
+	spin_unlock(&q->tx_lock);
 	return NETDEV_TX_OK;
 
 busy:
@@ -1193,7 +1193,7 @@ busy:
 	netif_txq_try_stop(txq, taken ? 0 : edma_txdesc_free(q),
 			   EDMA_TX_RING_THRESH);
 
-	spin_unlock_bh(&q->tx_lock);
+	spin_unlock(&q->tx_lock);
 	return NETDEV_TX_BUSY;
 }
 
@@ -2062,10 +2062,10 @@ static netdev_features_t edma_ndo_features_check(struct sk_buff *skb,
  */
 static void edma_tx_flush(struct edma_queue *q)
 {
-	spin_lock_bh(&q->tx_lock);
+	spin_lock(&q->tx_lock);
 	if (q->tx_kick)
 		edma_tx_kick(q);
-	spin_unlock_bh(&q->tx_lock);
+	spin_unlock(&q->tx_lock);
 }
 
 static netdev_tx_t edma_ndo_xmit(struct sk_buff *skb, struct net_device *netdev)
