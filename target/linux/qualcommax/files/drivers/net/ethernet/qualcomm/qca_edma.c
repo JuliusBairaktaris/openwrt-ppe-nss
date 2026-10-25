@@ -48,14 +48,17 @@ static void edma_irq_disable_all(struct edma_priv *priv)
 	}
 }
 
+/* The masks and the interrupt status are touched on every interrupt and
+ * every NAPI round, so they go straight to the register like the ring
+ * indices rather than through the regmap.
+ */
 static void edma_tx_irq_mask(struct edma_queue *q)
 {
 	struct edma_priv *priv = q->priv;
 	const struct edma_soc_data *soc = priv->soc;
 
-	regmap_write(priv->regmap,
-		     EDMA_REG_TX_INT_MASK(soc->tx_int_base, q->txcmpl),
-		     0);
+	writel(0, priv->base +
+	       EDMA_REG_TX_INT_MASK(soc->tx_int_base, q->txcmpl));
 }
 
 static void edma_tx_irq_unmask(struct edma_queue *q)
@@ -63,31 +66,26 @@ static void edma_tx_irq_unmask(struct edma_queue *q)
 	struct edma_priv *priv = q->priv;
 	const struct edma_soc_data *soc = priv->soc;
 
-	regmap_write(priv->regmap,
-		     EDMA_REG_TX_INT_MASK(soc->tx_int_base, q->txcmpl),
-		     EDMA_TX_INT_MASK);
+	writel(EDMA_TX_INT_MASK, priv->base +
+	       EDMA_REG_TX_INT_MASK(soc->tx_int_base, q->txcmpl));
 }
 
 static void edma_rx_irq_mask(struct edma_queue *q)
 {
 	struct edma_priv *priv = q->priv;
 
-	regmap_write(priv->regmap,
-		     EDMA_REG_RXFILL_INT_MASK(q->rxfill), 0);
-	regmap_write(priv->regmap,
-		     EDMA_REG_RXDESC_INT_MASK(q->rxdesc), 0);
+	writel(0, priv->base + EDMA_REG_RXFILL_INT_MASK(q->rxfill));
+	writel(0, priv->base + EDMA_REG_RXDESC_INT_MASK(q->rxdesc));
 }
 
 static void edma_rx_irq_unmask(struct edma_queue *q)
 {
 	struct edma_priv *priv = q->priv;
 
-	regmap_write(priv->regmap,
-		     EDMA_REG_RXFILL_INT_MASK(q->rxfill),
-		     EDMA_RXFILL_INT_MASK);
-	regmap_write(priv->regmap,
-		     EDMA_REG_RXDESC_INT_MASK(q->rxdesc),
-		     EDMA_RXDESC_INT_MASK_PKT_INT);
+	writel(EDMA_RXFILL_INT_MASK,
+	       priv->base + EDMA_REG_RXFILL_INT_MASK(q->rxfill));
+	writel(EDMA_RXDESC_INT_MASK_PKT_INT,
+	       priv->base + EDMA_REG_RXDESC_INT_MASK(q->rxdesc));
 }
 
 static irqreturn_t edma_tx_irq_handle(int irq, void *ctx)
@@ -97,9 +95,8 @@ static irqreturn_t edma_tx_irq_handle(int irq, void *ctx)
 	const struct edma_soc_data *soc = priv->soc;
 	u32 val;
 
-	regmap_read(priv->regmap,
-		    EDMA_REG_TX_INT_STAT(soc->tx_int_base,
-					 q->txcmpl), &val);
+	val = readl(priv->base +
+		    EDMA_REG_TX_INT_STAT(soc->tx_int_base, q->txcmpl));
 	if (!val)
 		return IRQ_NONE;
 
@@ -116,17 +113,10 @@ static irqreturn_t edma_rx_irq_handle(int irq, void *ctx)
 {
 	struct edma_queue *q = ctx;
 	struct edma_priv *priv = q->priv;
-	u32 val, status = 0;
+	u32 status;
 
-	regmap_read(priv->regmap,
-		    EDMA_REG_RXDESC_INT_STAT(q->rxdesc),
-		    &val);
-	status |= val;
-	regmap_read(priv->regmap,
-		    EDMA_REG_RXFILL_INT_STAT(q->rxfill),
-		    &val);
-	status |= val;
-
+	status = readl(priv->base + EDMA_REG_RXDESC_INT_STAT(q->rxdesc)) |
+		 readl(priv->base + EDMA_REG_RXFILL_INT_STAT(q->rxfill));
 	if (!status)
 		return IRQ_NONE;
 
