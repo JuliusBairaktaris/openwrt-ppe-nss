@@ -2114,6 +2114,26 @@ EXPORT_SYMBOL_GPL(qca_edma_port_xmit);
 static const struct net_device_ops edma_netdev_ops;
 
 /**
+ * qca_edma_port_flush - ring the doorbell of frames held back for more
+ * @conduit: the EDMA conduit
+ * @queue: the transmit queue qca_edma_port_xmit() was called on
+ *
+ * A frame sent while netdev_xmit_more() said more would follow is only
+ * handed to the engine with the next one; a caller whose batch ends with
+ * a frame for another device hands it over here.
+ */
+void qca_edma_port_flush(struct net_device *conduit, unsigned int queue)
+{
+	struct edma_priv *priv;
+
+	if (conduit->netdev_ops != &edma_netdev_ops)
+		return;
+	priv = netdev_priv(conduit);
+	edma_tx_flush(&priv->q[queue % priv->num_queues]);
+}
+EXPORT_SYMBOL_GPL(qca_edma_port_flush);
+
+/**
  * qca_edma_switch_register - bind the switch behind an EDMA conduit
  * @conduit: the conduit
  * @ds: the switch

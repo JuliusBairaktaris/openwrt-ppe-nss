@@ -1271,9 +1271,18 @@ static void ppe_flow_slot_clear(struct qca_ppe_priv *priv, u32 index)
  * the qdisc lets it go, with no other device or qdisc on its way; one for a
  * device outside the switch, such as Wi-Fi, to that device.
  */
+/* A/B: a byte budget for the shaper device's queues, which lets the qdisc
+ * hand over batches, so that the conduit rings its doorbell once per batch.
+ */
+static uint ppe_shaper_bulk;
+module_param_named(shaper_bulk, ppe_shaper_bulk, uint, 0644);
+MODULE_PARM_DESC(shaper_bulk,
+		 "Bytes the shaper device's qdisc may dequeue at once (0 off), applied when the device is created");
+
 struct ppe_shaper {
 	struct qca_ppe_priv *priv;
 	struct net_device *conduit;
+	bool bulk;
 };
 
 static const struct net_device_ops ppe_shaper_ops;
@@ -1414,6 +1423,10 @@ static netdev_tx_t ppe_shaper_xmit(struct sk_buff *skb, struct net_device *dev)
 			return ppe_shaper_conduit_xmit(skb, dev, port);
 	}
 
+	/* A batch's frames for the conduit may still wait for its doorbell. */
+	if (sh->bulk)
+		qca_edma_port_flush(sh->conduit, skb_get_queue_mapping(skb));
+
 	/* As an ifb hands a frame on: tc and netfilter are skipped on the
 	 * way out, so that the redirect that brought it is not taken again.
 	 */
@@ -1492,6 +1505,24 @@ static struct net_device *ppe_shaper_create(struct qca_ppe_priv *priv,
 		free_netdev(dev);
 		return ERR_PTR(ret);
 	}
+
+	/* The device does no byte queue accounting of its own, so a limit
+	 * set once is the qdisc's bulk budget for good.
+	 */
+#ifdef CONFIG_BQL
+	if (ppe_shaper_bulk) {
+		unsigned int i;
+
+		for (i = 0; i < dev->num_tx_queues; i++) {
+			struct dql *dql = &netdev_get_tx_queue(dev, i)->dql;
+
+			dql->min_limit = ppe_shaper_bulk;
+			dql->limit = ppe_shaper_bulk;
+			WRITE_ONCE(dql->adj_limit, ppe_shaper_bulk);
+		}
+		sh->bulk = true;
+	}
+#endif
 
 	return dev;
 }

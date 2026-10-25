@@ -22,5 +22,6 @@ int qca_edma_switch_register(struct net_device *conduit, struct dsa_switch *ds,
 void qca_edma_switch_unregister(struct net_device *conduit);
 netdev_tx_t qca_edma_port_xmit(struct sk_buff *skb, struct net_device *conduit,
 			       unsigned int port);
+void qca_edma_port_flush(struct net_device *conduit, unsigned int queue);
 
 #endif
