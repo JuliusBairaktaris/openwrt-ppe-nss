@@ -1445,8 +1445,49 @@ struct qca_ppe_priv {
 	struct ppe_res *nexthop;
 	struct ppe_res *my_mac;
 	u16 *host_ref;
+	/* Per flow index: the device a frame the PPE routed to the CPU port
+	 * leaves on, and whether a software shaper stands in front of it.
+	 */
 	int *flow_xdev;
 	atomic_t flow_xmit_drop;
+	/* frames meant for the download shaper that found no device to pass */
+	atomic_t flow_shaper_miss;
+	/* Per flow index: the conntrack an upload frame is handed over with,
+	 * bit 0 set for the reply direction. Written with flow_xdev.
+	 */
+	unsigned long *flow_ct;
+	/* Per flow index: bit 7 and the DSCP its frames are handed over with,
+	 * taken from the conntrack mark when ct_dscp is on. Written with
+	 * flow_xdev.
+	 */
+	u8 *flow_dscp;
+	/* Per flow index: the VLAN a download frame handed to the shaper
+	 * leaves its LAN port tagged with, zero for none.
+	 */
+	u16 *flow_vid;
+	bool ct_dscp;
+	/* The software shapers offloaded flows are handed to: the ifb carrying
+	 * the download qdisc and the uplink device carrying the upload one, by
+	 * ifindex and by the name they were set by. Zero is none. Written under
+	 * flow_lock, read locklessly on the receive path.
+	 */
+	int dl_shaper;
+	int ul_shaper;
+	char dl_shaper_name[IFNAMSIZ];
+	char ul_shaper_name[IFNAMSIZ];
+	/* The WAN's L3 device, named apart from the shapers so that its path
+	 * is known when only the download is shaped; zero for none, when the
+	 * upload shaper's device stands in for it.
+	 */
+	int uplink_dev;
+	char uplink_name[IFNAMSIZ];
+	/* Where the uplink device meets the switch: the port, and the VLAN and
+	 * PPPoE session on it, zero for none. ul_port is -1 while the path is
+	 * not known. Written under flow_lock.
+	 */
+	int ul_port;
+	u16 ul_vid;
+	u16 ul_sid;
 	u16 l3_if_ref[PPE_VSI_MAX];
 	struct ppe_uplink uplink[PPE_PPPOE_SESSIONS];
 	struct ppe_pppoe_session pppoe[PPE_PPPOE_SESSIONS];
@@ -1736,6 +1777,16 @@ int ppe_setup_ft_block(struct qca_ppe_priv *priv,
 		       struct flow_block_offload *f);
 int ppe_flow_offload_init(struct qca_ppe_priv *priv);
 bool ppe_flow_xmit(struct dsa_switch *ds, struct sk_buff *skb, u32 flow);
+void ppe_flow_shaper_get(struct qca_ppe_priv *priv, bool upload, char *name);
+void ppe_flow_ct_dscp_set(struct qca_ppe_priv *priv, bool on);
+void ppe_flow_uplink_get(struct qca_ppe_priv *priv, char *name);
+int ppe_flow_uplink_set(struct qca_ppe_priv *priv, const char *name);
+int ppe_flow_shaper_set(struct qca_ppe_priv *priv, bool upload,
+			const char *name);
+
+#define PPE_XDEV_IFINDEX	GENMASK(28, 0)
+#define PPE_XDEV_DL		BIT(29)
+#define PPE_XDEV_UL		BIT(30)
 void ppe_flow_purge_vsi(struct qca_ppe_priv *priv, u32 vsi);
 void ppe_flow_offload_exit(struct qca_ppe_priv *priv);
 
