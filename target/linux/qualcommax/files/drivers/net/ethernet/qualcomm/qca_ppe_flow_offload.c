@@ -74,6 +74,10 @@ struct ppe_flow_entry {
 	int my_mac;
 	int l3_if;
 	int eg_l3_if;
+	/* The other path's egress interface of a flow hybrid can switch. */
+	int eg_l3_if_alt;
+	/* A download to Wi-Fi: hybrid switches it by the DL bit of its xdev. */
+	bool hyb_wifi;
 	int pub_ip;
 	int uplink;
 	int in_uplink;
@@ -1074,20 +1078,26 @@ static void ppe_flow_purge_ingress(struct qca_ppe_priv *priv,
 	}
 }
 
+static void ppe_flow_eg_l3_if_put(struct qca_ppe_priv *priv, int idx)
+{
+	if (ppe_res_put(priv->eg_l3_if, idx)) {
+		ppe_tbl_clear(priv, PPE_EG_L3_IF_TBL(idx), PPE_EG_L3_IF_WORDS);
+		ppe_tbl_clear(priv, PPE_IN_L3_IF_TBL(idx), PPE_L3_IF_WORDS);
+	}
+}
+
 static void ppe_flow_free_egress(struct qca_ppe_priv *priv,
 				 struct ppe_flow_entry *entry)
 {
-	if (ppe_res_put(priv->nexthop, entry->nexthop))
+	if (ppe_res_put(priv->nexthop, entry->nexthop)) {
 		ppe_tbl_clear(priv, PPE_IN_NEXTHOP_TBL(entry->nexthop),
 			      PPE_NEXTHOP_WORDS);
+		priv->nh_hyb[entry->nexthop].dir = 0;
+	}
 	if (ppe_res_put(priv->pub_ip, entry->pub_ip))
 		regmap_write(priv->regmap, PPE_PUB_IP_TBL(entry->pub_ip), 0);
-	if (ppe_res_put(priv->eg_l3_if, entry->eg_l3_if)) {
-		ppe_tbl_clear(priv, PPE_EG_L3_IF_TBL(entry->eg_l3_if),
-			      PPE_EG_L3_IF_WORDS);
-		ppe_tbl_clear(priv, PPE_IN_L3_IF_TBL(entry->eg_l3_if),
-			      PPE_L3_IF_WORDS);
-	}
+	ppe_flow_eg_l3_if_put(priv, entry->eg_l3_if);
+	ppe_flow_eg_l3_if_put(priv, entry->eg_l3_if_alt);
 
 	if (entry->session >= 0)
 		ppe_pppoe_session_put(priv, entry->session);
@@ -1124,6 +1134,32 @@ static bool ppe_flow_on_uplink(struct qca_ppe_priv *priv, int port, u16 vid,
 
 	return port == priv->ul_port && vid == priv->ul_vid &&
 	       (!upload || sid == priv->ul_sid);
+}
+
+/* Hybrid upload keeps a flow in the switch while the uplink port's hardware
+ * shaper is the bottleneck in waiting and its queue stays short. Without that
+ * shaper nothing on the router would see the upload queue build, so the flow
+ * goes to the qdisc as it does without hybrid.
+ */
+static bool ppe_flow_ul_direct(struct qca_ppe_priv *priv)
+{
+	int port = READ_ONCE(priv->ul_port);
+
+	return READ_ONCE(priv->hybrid) && !READ_ONCE(priv->ul_cake) &&
+	       port >= 0 && priv->shaper[port].rate_bps;
+}
+
+/* Hybrid download keeps a flow on its hardware path while the uplink port's
+ * count-only meter at the download rate stays green. Without that meter
+ * nothing would see the download reach the rate, so the flow goes to the
+ * qdisc as it does without hybrid.
+ */
+static bool ppe_flow_dl_direct(struct qca_ppe_priv *priv)
+{
+	int port = READ_ONCE(priv->ul_port);
+
+	return READ_ONCE(priv->hybrid) && !READ_ONCE(priv->dl_cake) &&
+	       port >= 0 && READ_ONCE(priv->meter_count_bps[port]);
 }
 
 /* The PPE has no queue that can run CAKE or an L4S AQM: it drops on a
@@ -1317,6 +1353,8 @@ bool ppe_flow_xmit(struct dsa_switch *ds, struct sk_buff *skb, u32 flow)
 		if (likely(shaper && netif_running(shaper))) {
 			u16 vid = READ_ONCE(priv->flow_vid[flow]);
 
+			atomic64_add(skb->len, &priv->dl_handoff_bytes);
+
 			skb->skb_iif = dev->ifindex;
 			skb_set_redirected(skb, false);
 			skb->dev = shaper;
@@ -1327,6 +1365,7 @@ bool ppe_flow_xmit(struct dsa_switch *ds, struct sk_buff *skb, u32 flow)
 			atomic_inc(&priv->flow_shaper_miss);
 		}
 	} else if (xdev & PPE_XDEV_UL) {
+		atomic64_add(skb->len, &priv->ul_handoff_bytes);
 		ppe_flow_ct_attach(priv, skb, flow);
 		if (uplink != dev) {
 			skb->skb_iif = uplink->ifindex;
@@ -1351,6 +1390,213 @@ void ppe_flow_ct_dscp_set(struct qca_ppe_priv *priv, bool on)
 	priv->ct_dscp = on;
 	ppe_flow_shaper_drop(priv, false);
 	ppe_flow_shaper_drop(priv, true);
+}
+
+#define PPE_HYBRID_PERIOD_MS	100
+
+static uint ppe_hybrid_hold_ms = 2000;
+module_param_named(hybrid_hold_ms, ppe_hybrid_hold_ms, uint, 0644);
+MODULE_PARM_DESC(hybrid_hold_ms,
+		 "How long the handed-over upload must stay below hybrid_demote_pct before its flows return to the switch");
+
+static uint ppe_hybrid_demote_pct = 60;
+module_param_named(hybrid_demote_pct, ppe_hybrid_demote_pct, uint, 0644);
+MODULE_PARM_DESC(hybrid_demote_pct,
+		 "Share of the uplink port's shaper rate the handed-over upload must stay below to return to the switch");
+
+/* Move one direction between its hardware path and its qdisc in place: every
+ * shaped nexthop of the direction is rewritten to the other path, which the
+ * flows behind it take from their next frame on, and the downloads to Wi-Fi,
+ * which reach the CPU on either path, change only where ppe_flow_xmit() sends
+ * them. A nexthop is four words that commit on the last.
+ */
+static void ppe_flow_hybrid_apply(struct qca_ppe_priv *priv, int dir, bool cake)
+{
+	struct ppe_flow_entry *entry;
+	u32 i;
+
+	lockdep_assert_held(&priv->flow_lock);
+
+	for (i = 0; i < priv->data->num_nexthop_entries; i++) {
+		struct ppe_nh_hyb *h = &priv->nh_hyb[i];
+
+		if (h->dir == dir && priv->nexthop[i].refcount)
+			ppe_tbl_write(priv, PPE_IN_NEXTHOP_TBL(i),
+				      cake ? h->handoff : h->direct,
+				      PPE_NEXTHOP_WORDS);
+	}
+
+	if (dir != PPE_XDEV_DL)
+		return;
+
+	list_for_each_entry(entry, &priv->flow_list, list) {
+		if (!entry->hyb_wifi)
+			continue;
+		if (cake)
+			entry->xdev |= PPE_XDEV_DL;
+		else
+			entry->xdev &= ~PPE_XDEV_DL;
+		WRITE_ONCE(priv->flow_xdev[entry->index], entry->xdev);
+	}
+}
+
+/* The hardware queue on the uplink built past hybrid_promote_us: hand the
+ * upload to its qdisc. Called by the AQM tick, so the flows are moved from
+ * a work item, which the flag already steers new flows ahead of.
+ */
+void ppe_flow_hybrid_promote(struct qca_ppe_priv *priv)
+{
+	if (!READ_ONCE(priv->hybrid) || READ_ONCE(priv->ul_cake))
+		return;
+
+	WRITE_ONCE(priv->ul_cake, true);
+	priv->hybrid_promotes++;
+	queue_work(system_highpri_wq, &priv->hybrid_work);
+}
+
+static void ppe_flow_hybrid_work(struct work_struct *work)
+{
+	struct qca_ppe_priv *priv = container_of(work, struct qca_ppe_priv,
+						 hybrid_work);
+
+	scoped_guard(mutex, &priv->flow_lock) {
+		guard(mutex)(&priv->vlan_lock);
+
+		if (!READ_ONCE(priv->ul_cake))
+			return;
+		ppe_flow_hybrid_apply(priv, PPE_XDEV_UL, true);
+		priv->ul_low_since = 0;
+		priv->ul_hyb_bytes = atomic64_read(&priv->ul_handoff_bytes);
+	}
+
+	schedule_delayed_work(&priv->hybrid_dwork,
+			      msecs_to_jiffies(PPE_HYBRID_PERIOD_MS));
+}
+
+/* The upload goes back to the switch once what was handed over has stayed
+ * well below the rate for hybrid_hold_ms: the qdisc has drained by then, so
+ * the hardware path cannot overtake frames still queued in it.
+ */
+static void ppe_flow_hybrid_dwork(struct work_struct *work)
+{
+	struct qca_ppe_priv *priv = container_of(work, struct qca_ppe_priv,
+						 hybrid_dwork.work);
+	u64 bytes = atomic64_read(&priv->ul_handoff_bytes);
+	u64 sent = bytes - priv->ul_hyb_bytes, rate;
+	int port = READ_ONCE(priv->ul_port);
+
+	priv->ul_hyb_bytes = bytes;
+	if (!READ_ONCE(priv->hybrid) || !READ_ONCE(priv->ul_cake))
+		return;
+	/* Without an uplink or its rate, as across a PPPoE reconnect, the
+	 * upload stays with its qdisc until they are back.
+	 */
+	rate = port < 0 ? 0 : priv->shaper[port].rate_bps;
+	sent *= BITS_PER_BYTE * (MSEC_PER_SEC / PPE_HYBRID_PERIOD_MS) * 100;
+	if (!rate || sent >= rate * ppe_hybrid_demote_pct) {
+		priv->ul_low_since = 0;
+	} else if (!priv->ul_low_since) {
+		priv->ul_low_since = jiffies ?: 1;
+	} else if (time_after_eq(jiffies, priv->ul_low_since +
+				 msecs_to_jiffies(ppe_hybrid_hold_ms))) {
+		guard(mutex)(&priv->flow_lock);
+		guard(mutex)(&priv->vlan_lock);
+
+		WRITE_ONCE(priv->ul_cake, false);
+		priv->hybrid_demotes++;
+		ppe_flow_hybrid_apply(priv, PPE_XDEV_UL, false);
+		return;
+	}
+
+	schedule_delayed_work(&priv->hybrid_dwork,
+			      msecs_to_jiffies(PPE_HYBRID_PERIOD_MS));
+}
+
+/* The download reached its rate: hand it to its qdisc, as for upload. */
+void ppe_flow_hybrid_dl_promote(struct qca_ppe_priv *priv)
+{
+	if (!READ_ONCE(priv->hybrid) || READ_ONCE(priv->dl_cake))
+		return;
+
+	WRITE_ONCE(priv->dl_cake, true);
+	priv->hybrid_dl_promotes++;
+	queue_work(system_highpri_wq, &priv->hybrid_dl_work);
+}
+
+static void ppe_flow_hybrid_dl_work(struct work_struct *work)
+{
+	struct qca_ppe_priv *priv = container_of(work, struct qca_ppe_priv,
+						 hybrid_dl_work);
+
+	scoped_guard(mutex, &priv->flow_lock) {
+		guard(mutex)(&priv->vlan_lock);
+
+		if (!READ_ONCE(priv->dl_cake))
+			return;
+		ppe_flow_hybrid_apply(priv, PPE_XDEV_DL, true);
+		priv->dl_low_since = 0;
+	}
+
+	schedule_delayed_work(&priv->hybrid_dl_dwork,
+			      msecs_to_jiffies(PPE_HYBRID_PERIOD_MS));
+}
+
+/* Back to the hardware path once the download has stayed well below the
+ * meter's rate for hybrid_hold_ms, by which time its qdisc has drained. The
+ * rate is the meter's, which counts the whole download the port takes in:
+ * just after a promotion the flows run in software until the flowtable
+ * offloads them again, and what was handed over would read as idle.
+ */
+static void ppe_flow_hybrid_dl_dwork(struct work_struct *work)
+{
+	struct qca_ppe_priv *priv = container_of(work, struct qca_ppe_priv,
+						 hybrid_dl_dwork.work);
+	int port = READ_ONCE(priv->ul_port);
+	u64 rate;
+
+	if (!READ_ONCE(priv->hybrid) || !READ_ONCE(priv->dl_cake))
+		return;
+	rate = port < 0 ? 0 : READ_ONCE(priv->meter_count_bps[port]);
+	if (!rate ||
+	    READ_ONCE(priv->dl_meter_bps) * 100 >= rate * ppe_hybrid_demote_pct) {
+		priv->dl_low_since = 0;
+	} else if (!priv->dl_low_since) {
+		priv->dl_low_since = jiffies ?: 1;
+	} else if (time_after_eq(jiffies, priv->dl_low_since +
+				 msecs_to_jiffies(ppe_hybrid_hold_ms))) {
+		guard(mutex)(&priv->flow_lock);
+		guard(mutex)(&priv->vlan_lock);
+
+		WRITE_ONCE(priv->dl_cake, false);
+		priv->hybrid_dl_demotes++;
+		ppe_flow_hybrid_apply(priv, PPE_XDEV_DL, false);
+		return;
+	}
+
+	schedule_delayed_work(&priv->hybrid_dl_dwork,
+			      msecs_to_jiffies(PPE_HYBRID_PERIOD_MS));
+}
+
+/* Turning hybrid on or off changes the path of every shaped flow. */
+void ppe_flow_hybrid_set(struct qca_ppe_priv *priv, bool on)
+{
+	scoped_guard(mutex, &priv->flow_lock) {
+		guard(mutex)(&priv->vlan_lock);
+
+		if (priv->hybrid == on)
+			return;
+		WRITE_ONCE(priv->hybrid, on);
+		if (priv->ul_cake)
+			priv->hybrid_demotes++;
+		if (priv->dl_cake)
+			priv->hybrid_dl_demotes++;
+		WRITE_ONCE(priv->ul_cake, false);
+		WRITE_ONCE(priv->dl_cake, false);
+		ppe_flow_shaper_drop(priv, true);
+		ppe_flow_shaper_drop(priv, false);
+	}
+
+	wake_up(&priv->aqm.wait);
 }
 
 void ppe_flow_uplink_get(struct qca_ppe_priv *priv, char *name)
@@ -1447,7 +1693,7 @@ static int ppe_flow_egress_path(struct qca_ppe_priv *priv,
 				int nh_port, bool push, bool snat, bool dnat,
 				u32 *nh)
 {
-	u32 words[PPE_NEXTHOP_WORDS] = {};
+	u32 words[PPE_NEXTHOP_WORDS + 1] = {};
 	struct dsa_port *odp;
 	int eg_l3_if, ret;
 	u32 eg_mtu;
@@ -1542,15 +1788,20 @@ static int ppe_flow_egress_path(struct qca_ppe_priv *priv,
 
 /* Build the egress L3 interface, nexthop and public-address entries this rule
  * needs, and program any that were not already in use by another flow.
+ *
+ * A flow of a shaped direction on a switch port gets both paths, so hybrid
+ * can switch it in place: its nexthop is keyed by the direct path and the
+ * direction, and holds whichever path the direction is on. A download to
+ * Wi-Fi reaches the CPU on either path and switches by its xdev instead.
  */
 static int ppe_flow_alloc_egress(struct qca_ppe_priv *priv,
 				 struct ppe_flow_data *data, bool snat,
 				 bool dnat, struct ppe_flow_entry *entry)
 {
-	u32 words[PPE_NEXTHOP_WORDS] = {};
+	u32 key[PPE_NEXTHOP_WORDS + 1] = {}, alt[PPE_NEXTHOP_WORDS];
 	struct dsa_port *odp;
-	int port, nh_port, ret;
-	bool push;
+	int port, nh_port, ret, dir;
+	bool push, direct;
 
 	port = ppe_flow_port_by_ifindex(priv, data->odev->ifindex);
 	if (port < 0 && ppe_cpu_xmit_ok(data)) {
@@ -1568,7 +1819,10 @@ static int ppe_flow_alloc_egress(struct qca_ppe_priv *priv,
 	 * lets its reverse offload.
 	 */
 	nh_port = ppe_flow_shape(priv, data, entry, port);
-	push = !(entry->xdev & (PPE_XDEV_UL | PPE_XDEV_DL));
+	dir = entry->xdev & (PPE_XDEV_UL | PPE_XDEV_DL);
+	push = !dir;
+	direct = dir == PPE_XDEV_UL ? ppe_flow_ul_direct(priv) :
+		 dir == PPE_XDEV_DL ? ppe_flow_dl_direct(priv) : false;
 
 	entry->oport = nh_port;
 	/* An untagged egress is credited to the port's PVID VLAN, the one an
@@ -1590,19 +1844,48 @@ static int ppe_flow_alloc_egress(struct qca_ppe_priv *priv,
 	}
 
 	ret = ppe_flow_egress_path(priv, data, entry, port, nh_port, push,
-				   snat, dnat, words);
+				   snat, dnat, key);
 	if (ret < 0)
 		goto err;
 	entry->eg_l3_if = ret;
 
-	ret = ppe_res_get(priv->nexthop, priv->data->num_nexthop_entries, words,
-			  PPE_NEXTHOP_WORDS);
+	if (dir && port != QCA_PPE_CPU_PORT) {
+		/* The key is the direct path, so a handed-over flow and its
+		 * direct twin share one nexthop, tagged with the direction so
+		 * that no unshaped flow ever shares it.
+		 */
+		memcpy(alt, key, sizeof(alt));
+		ret = ppe_flow_egress_path(priv, data, entry, port, port, true,
+					   snat, dnat, key);
+		if (ret < 0)
+			goto err;
+		entry->eg_l3_if_alt = ret;
+		key[PPE_NEXTHOP_WORDS] = dir;
+	} else if (dir) {
+		/* A download to Wi-Fi: the path is the CPU port either way. */
+		entry->hyb_wifi = true;
+		if (direct)
+			entry->xdev &= ~PPE_XDEV_DL;
+	}
+
+	ret = ppe_res_get(priv->nexthop, priv->data->num_nexthop_entries, key,
+			  PPE_NEXTHOP_WORDS + 1);
 	if (ret < 0)
 		goto err;
 	entry->nexthop = ret;
-	if (priv->nexthop[ret].refcount == 1)
-		ppe_tbl_write(priv, PPE_IN_NEXTHOP_TBL(ret), words,
+	if (priv->nexthop[ret].refcount == 1) {
+		struct ppe_nh_hyb *h = &priv->nh_hyb[ret];
+
+		h->dir = 0;
+		if (key[PPE_NEXTHOP_WORDS]) {
+			memcpy(h->direct, key, sizeof(h->direct));
+			memcpy(h->handoff, alt, sizeof(h->handoff));
+			h->dir = dir;
+		}
+		ppe_tbl_write(priv, PPE_IN_NEXTHOP_TBL(ret),
+			      h->dir && !direct ? h->handoff : key,
 			      PPE_NEXTHOP_WORDS);
+	}
 
 	/* The reverse of a flow that egresses PPPoE, or a VLAN of a port no
 	 * bridge classifies, arrives the same way on this port; set the port up
@@ -2081,6 +2364,7 @@ static int ppe_flow_offload_replace(struct ppe_flow_block *fb,
 	entry->block = fb->block;
 	entry->nexthop = -1;
 	entry->eg_l3_if = -1;
+	entry->eg_l3_if_alt = -1;
 	entry->pub_ip = -1;
 	entry->my_mac = -1;
 	entry->l3_if = -1;
@@ -2469,6 +2753,8 @@ int ppe_flow_offload_init(struct qca_ppe_priv *priv)
 				    sizeof(*priv->pub_ip), GFP_KERNEL);
 	priv->nexthop = devm_kcalloc(dev, priv->data->num_nexthop_entries,
 				     sizeof(*priv->nexthop), GFP_KERNEL);
+	priv->nh_hyb = devm_kcalloc(dev, priv->data->num_nexthop_entries,
+				    sizeof(*priv->nh_hyb), GFP_KERNEL);
 	priv->host_ref = devm_kcalloc(dev, priv->data->num_host_entries,
 				      sizeof(*priv->host_ref), GFP_KERNEL);
 	priv->my_mac = devm_kcalloc(dev, PPE_MY_MAC_ENTRIES,
@@ -2482,7 +2768,7 @@ int ppe_flow_offload_init(struct qca_ppe_priv *priv)
 				       sizeof(*priv->flow_dscp), GFP_KERNEL);
 	priv->flow_vid = devm_kcalloc(dev, priv->data->num_flow_entries,
 				      sizeof(*priv->flow_vid), GFP_KERNEL);
-	if (!priv->eg_l3_if || !priv->pub_ip || !priv->nexthop ||
+	if (!priv->eg_l3_if || !priv->pub_ip || !priv->nexthop || !priv->nh_hyb ||
 	    !priv->host_ref || !priv->my_mac || !priv->flow_xdev ||
 	    !priv->flow_ct || !priv->flow_dscp || !priv->flow_vid)
 		return -ENOMEM;
@@ -2500,6 +2786,10 @@ int ppe_flow_offload_init(struct qca_ppe_priv *priv)
 		return ret;
 	}
 
+	INIT_WORK(&priv->hybrid_work, ppe_flow_hybrid_work);
+	INIT_DELAYED_WORK(&priv->hybrid_dwork, ppe_flow_hybrid_dwork);
+	INIT_WORK(&priv->hybrid_dl_work, ppe_flow_hybrid_dl_work);
+	INIT_DELAYED_WORK(&priv->hybrid_dl_dwork, ppe_flow_hybrid_dl_dwork);
 	INIT_DELAYED_WORK(&priv->sparse_work, ppe_sparse_work);
 	schedule_delayed_work(&priv->sparse_work,
 			      msecs_to_jiffies(PPE_SPARSE_PERIOD_MS));
@@ -2513,6 +2803,11 @@ void ppe_flow_offload_exit(struct qca_ppe_priv *priv)
 
 	unregister_netdevice_notifier(&priv->netdev_nb);
 	cancel_delayed_work_sync(&priv->sparse_work);
+	WRITE_ONCE(priv->hybrid, false);
+	cancel_work_sync(&priv->hybrid_work);
+	cancel_delayed_work_sync(&priv->hybrid_dwork);
+	cancel_work_sync(&priv->hybrid_dl_work);
+	cancel_delayed_work_sync(&priv->hybrid_dl_dwork);
 
 	mutex_lock(&priv->flow_lock);
 	mutex_lock(&priv->vlan_lock);

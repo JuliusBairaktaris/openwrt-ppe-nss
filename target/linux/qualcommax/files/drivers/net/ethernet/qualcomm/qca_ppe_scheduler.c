@@ -2077,8 +2077,13 @@ module_param_named(aqm_interval_us, ppe_aqm_interval_us, uint, 0644);
 MODULE_PARM_DESC(aqm_interval_us,
 		 "How long a shaped queue may stay above the target before the AQM drops");
 
+static uint ppe_hybrid_promote_us = 1000;
+module_param_named(hybrid_promote_us, ppe_hybrid_promote_us, uint, 0644);
+MODULE_PARM_DESC(hybrid_promote_us,
+		 "Queue delay on the uplink port's hardware shaper at which hybrid upload hands its flows to the upload qdisc");
+
 static void ppe_aqm_add(struct ppe_aqm *a, u16 queue, u8 group, u64 rate_bps,
-			u32 frame_len)
+			u32 frame_len, int port)
 {
 	struct ppe_aqm_queue *q;
 
@@ -2095,6 +2100,7 @@ static void ppe_aqm_add(struct ppe_aqm *a, u16 queue, u8 group, u64 rate_bps,
 	if (group >= a->ngroups) {
 		a->g[group] = (struct ppe_aqm_group){
 			.rate_bps = rate_bps,
+			.port = port,
 		};
 		a->ngroups = group + 1;
 	}
@@ -2136,7 +2142,8 @@ static void ppe_aqm_rebuild(struct qca_ppe_priv *priv)
 		for (i = 0; i < PPE_FLOW_SPREAD_QUEUES; i++)
 			ppe_aqm_add(a, PPE_CPU_PORT_DL_QUEUE + i, group,
 				    priv->shaper[QCA_PPE_CPU_PORT].rate_bps,
-				    ppe_port_frame_len(priv, QCA_PPE_CPU_PORT));
+				    ppe_port_frame_len(priv, QCA_PPE_CPU_PORT),
+				    QCA_PPE_CPU_PORT);
 		group++;
 	}
 
@@ -2176,7 +2183,7 @@ static void ppe_aqm_rebuild(struct qca_ppe_priv *priv)
 			     i < p->ucast_count; i++)
 				if (!priv->red_max[p->ucast_base + i])
 					ppe_aqm_add(a, p->ucast_base + i, g,
-						    rate, frame);
+						    rate, frame, port);
 		}
 	}
 
@@ -2256,6 +2263,13 @@ static bool ppe_aqm_tick(struct qca_ppe_priv *priv, u64 now)
 		delay = div64_u64((u64)gsum[i] * PPE_BM_BUF_SIZE * BITS_PER_BYTE *
 				  NSEC_PER_SEC, g->rate_bps);
 
+		/* The upload has outgrown the hardware path: from here the
+		 * qdisc that can mark and keep flows apart takes it.
+		 */
+		if (g->port == READ_ONCE(priv->ul_port) &&
+		    delay >= (u64)ppe_hybrid_promote_us * NSEC_PER_USEC)
+			ppe_flow_hybrid_promote(priv);
+
 		if (delay < target || gsum[i] <= gframe[i]) {
 			g->first_above = 0;
 			g->dropping = false;
@@ -2296,6 +2310,83 @@ static bool ppe_aqm_tick(struct qca_ppe_priv *priv, u64 now)
 	return busy;
 }
 
+#define PPE_HYBRID_RED_WINDOW_NS	(10 * NSEC_PER_MSEC)
+
+static uint ppe_hybrid_red_pkts = 4;
+module_param_named(hybrid_red_pkts, ppe_hybrid_red_pkts, uint, 0644);
+MODULE_PARM_DESC(hybrid_red_pkts,
+		 "Frames over the download rate within 10 ms at which hybrid download hands its flows to the download qdisc");
+
+/* Whether a count-only meter on the uplink port arms hybrid download. */
+static bool ppe_hybrid_dl_armed(struct qca_ppe_priv *priv)
+{
+	int port = READ_ONCE(priv->ul_port);
+
+	return READ_ONCE(priv->hybrid) && port >= 0 &&
+	       READ_ONCE(priv->meter_count_bps[port]);
+}
+
+/* The download arrives at the line rate whatever the router does, and its
+ * queue builds at the ISP, so the trigger is the uplink port's count-only
+ * meter, which the qdisc's script sets below the rate it shapes to: nothing
+ * shapes the switch path, so a flow in slow start has to reach the qdisc
+ * before it exceeds that rate, not after. Red frames mean the download has
+ * passed the meter's rate. Ticks run fast while the download is above a
+ * third of that rate, so the switch to the qdisc follows within one tick.
+ */
+static bool ppe_hybrid_dl_tick(struct qca_ppe_priv *priv, u64 now)
+{
+	int port = READ_ONCE(priv->ul_port);
+	u32 g[PPE_CNT_WORDS], r[PPE_CNT_WORDS];
+	u64 rate, bytes, db;
+	u32 red;
+
+	if (!ppe_hybrid_dl_armed(priv))
+		return false;
+	rate = READ_ONCE(priv->meter_count_bps[port]);
+
+	if (regmap_bulk_read(priv->regmap, PPE_PORT_METER_CNT(port, 0), g,
+			     ARRAY_SIZE(g)) ||
+	    regmap_bulk_read(priv->regmap,
+			     PPE_PORT_METER_CNT(port, PPE_METER_CNT_RED), r,
+			     ARRAY_SIZE(r)))
+		return false;
+
+	/* A 32-bit packet count, then a 40-bit byte count. */
+	red = r[0];
+	bytes = (g[1] | (u64)(g[2] & 0xff) << 32) +
+		(r[1] | (u64)(r[2] & 0xff) << 32);
+
+	/* Counted over a fixed window, whatever the tick: a line that runs
+	 * only a few percent over the meter turns a few frames red per tick
+	 * at the fast tick, while the burst keeps an idle line green.
+	 */
+	if (now - priv->dl_red_ns >= PPE_HYBRID_RED_WINDOW_NS) {
+		u32 d = red - (u32)priv->dl_red_last;
+
+		if (d >= ppe_hybrid_red_pkts && !READ_ONCE(priv->dl_cake)) {
+			WRITE_ONCE(priv->dl_promote_red, d);
+			WRITE_ONCE(priv->dl_promote_ns, now);
+			ppe_flow_hybrid_dl_promote(priv);
+		}
+		priv->dl_red_last = red;
+		priv->dl_red_ns = now;
+	}
+
+	db = (bytes - priv->dl_meter_bytes) & GENMASK_ULL(39, 0);
+	priv->dl_meter_bytes = bytes;
+	if (!priv->dl_meter_ns || now <= priv->dl_meter_ns) {
+		priv->dl_meter_ns = now;
+		return false;
+	}
+	db = div64_u64(db * BITS_PER_BYTE * NSEC_PER_SEC,
+		       now - priv->dl_meter_ns);
+	priv->dl_meter_ns = now;
+	WRITE_ONCE(priv->dl_meter_bps, db);
+
+	return db * 3 > rate;
+}
+
 static int ppe_aqm_thread(void *data)
 {
 	struct qca_ppe_priv *priv = data;
@@ -2308,19 +2399,22 @@ static int ppe_aqm_thread(void *data)
 		/* The period is a module parameter nothing announces a change
 		 * of, so an idle wait looks again every second.
 		 */
-		if (!READ_ONCE(a->nqueues) || !READ_ONCE(ppe_aqm_tick_us)) {
+		if ((!READ_ONCE(a->nqueues) && !ppe_hybrid_dl_armed(priv)) ||
+		    !READ_ONCE(ppe_aqm_tick_us)) {
 			scoped_guard(mutex, &a->lock)
 				ppe_aqm_release(priv);
 			wait_event_interruptible_timeout(a->wait,
 							 kthread_should_stop() ||
-							 (READ_ONCE(a->nqueues) &&
-							  READ_ONCE(ppe_aqm_tick_us)), HZ);
+							 ((READ_ONCE(a->nqueues) ||
+							   ppe_hybrid_dl_armed(priv)) &&
+				 READ_ONCE(ppe_aqm_tick_us)), HZ);
 			continue;
 		}
 
 		scoped_guard(mutex, &a->lock) {
 			now = ktime_get_ns();
 			busy = ppe_aqm_tick(priv, now);
+			busy |= ppe_hybrid_dl_tick(priv, now);
 			a->ticks++;
 			a->busy_ns += ktime_get_ns() - now;
 		}
@@ -2463,6 +2557,9 @@ static int ppe_port_policer_set(struct qca_ppe_priv *priv, int port,
 	regmap_write(priv->regmap, PPE_PORT_METER_W2(port),
 		     count ? PPE_METER_VIOLATE_FWD : 0);
 	regmap_write(priv->regmap, PPE_PORT_METER_W3(port), 0);
+	WRITE_ONCE(priv->meter_count_bps[port],
+		   count && !pkt ? rate_bps : 0);
+	wake_up(&priv->aqm.wait);
 
 	/* Credit outlives the rate that filled it: what a re-armed meter would
 	 * spend on its first frames was bought at a rate the port has lost.
@@ -2488,7 +2585,8 @@ int qca_ppe_port_policer_add(struct dsa_switch *ds, int port,
 	 * Everything else the police action can carry is refused rather than
 	 * dropped on the floor: a filter that asked for something else would
 	 * report offloaded and police something other than what it says. A
-	 * meter that passes red only counts it.
+	 * meter that passes red only counts it, which is what hybrid download
+	 * watches (ppe_hybrid_dl_tick()).
 	 */
 	if (!policer->rate_bytes_ps == !policer->rate_pkt_ps ||
 	    policer->peakrate_bytes_ps || policer->avrate ||
@@ -3817,6 +3915,7 @@ enum {
 	PPE_DEVLINK_PARAM_UL_SHAPER,
 	PPE_DEVLINK_PARAM_CT_DSCP,
 	PPE_DEVLINK_PARAM_UPLINK,
+	PPE_DEVLINK_PARAM_HYBRID,
 };
 
 static int ppe_uplink_param_get(struct devlink *dl, u32 id,
@@ -3856,6 +3955,25 @@ static int ppe_ct_dscp_set(struct devlink *dl, u32 id,
 	return 0;
 }
 
+static int ppe_hybrid_get(struct devlink *dl, u32 id,
+			  struct devlink_param_gset_ctx *ctx)
+{
+	struct qca_ppe_priv *priv = ds_to_priv(dsa_devlink_to_ds(dl));
+
+	ctx->val.vbool = READ_ONCE(priv->hybrid);
+	return 0;
+}
+
+static int ppe_hybrid_param_set(struct devlink *dl, u32 id,
+				struct devlink_param_gset_ctx *ctx,
+				struct netlink_ext_ack *extack)
+{
+	struct qca_ppe_priv *priv = ds_to_priv(dsa_devlink_to_ds(dl));
+
+	ppe_flow_hybrid_set(priv, ctx->val.vbool);
+	return 0;
+}
+
 static int ppe_shaper_get(struct devlink *dl, u32 id,
 			  struct devlink_param_gset_ctx *ctx)
 {
@@ -3892,7 +4010,9 @@ static int ppe_shaper_validate(struct devlink *dl, u32 id,
  * devices whose qdiscs shape offloaded flows (ppe_flow_shape()), empty for
  * none. ct_dscp gives the frames handed to them the DSCP stamped into their
  * conntrack mark (ppe_flow_ct_dscp()). uplink names the WAN's L3 device,
- * which tells the shaped flows from the rest (ppe_flow_on_uplink()).
+ * which tells the shaped flows from the rest (ppe_flow_on_uplink()). hybrid
+ * keeps upload flows in the switch until the uplink port's hardware shaper
+ * queues (ppe_flow_hybrid_promote()).
  */
 static const struct devlink_param ppe_params[] = {
 	DEVLINK_PARAM_DRIVER(PPE_DEVLINK_PARAM_CPU_PORT_RATE, "cpu_port_rate",
@@ -3918,6 +4038,10 @@ static const struct devlink_param ppe_params[] = {
 			     BIT(DEVLINK_PARAM_CMODE_RUNTIME),
 			     ppe_uplink_param_get, ppe_uplink_param_set,
 			     ppe_shaper_validate),
+	DEVLINK_PARAM_DRIVER(PPE_DEVLINK_PARAM_HYBRID, "hybrid",
+			     DEVLINK_PARAM_TYPE_BOOL,
+			     BIT(DEVLINK_PARAM_CMODE_RUNTIME),
+			     ppe_hybrid_get, ppe_hybrid_param_set, NULL),
 };
 
 void ppe_scheduler_unready(struct qca_ppe_priv *priv)

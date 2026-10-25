@@ -307,7 +307,37 @@ static int ppe_offload_show(struct seq_file *s, void *data)
 		   atomic_read(&priv->flow_xmit_drop));
 	seq_printf(s, "%-24s %u\n", "shaper_miss",
 		   atomic_read(&priv->flow_shaper_miss));
+	seq_printf(s, "%-24s %s\n", "hybrid",
+		   !READ_ONCE(priv->hybrid) ? "off" :
+		   READ_ONCE(priv->ul_cake) ? "qdisc" : "switch");
+	seq_printf(s, "%-24s %u\n", "hybrid_promotes",
+		   READ_ONCE(priv->hybrid_promotes));
+	seq_printf(s, "%-24s %u\n", "hybrid_demotes",
+		   READ_ONCE(priv->hybrid_demotes));
+	seq_printf(s, "%-24s %llu\n", "ul_handoff_bytes",
+		   (u64)atomic64_read(&priv->ul_handoff_bytes));
+	seq_printf(s, "%-24s %s\n", "hybrid_dl",
+		   !READ_ONCE(priv->hybrid) ? "off" :
+		   READ_ONCE(priv->dl_cake) ? "qdisc" : "switch");
+	seq_printf(s, "%-24s %u\n", "hybrid_dl_promotes",
+		   READ_ONCE(priv->hybrid_dl_promotes));
+	seq_printf(s, "%-24s %u\n", "hybrid_dl_demotes",
+		   READ_ONCE(priv->hybrid_dl_demotes));
+	if (READ_ONCE(priv->dl_promote_ns)) {
+		seq_printf(s, "%-24s %u\n", "hybrid_dl_promote_red",
+			   READ_ONCE(priv->dl_promote_red));
+		seq_printf(s, "%-24s %llu\n", "hybrid_dl_promote_ago_ms",
+			   div_u64(ktime_get_ns() - READ_ONCE(priv->dl_promote_ns),
+				   NSEC_PER_MSEC));
+	}
+	seq_printf(s, "%-24s %llu\n", "dl_handoff_bytes",
+		   (u64)atomic64_read(&priv->dl_handoff_bytes));
 	seq_printf(s, "%-24s %d\n", "ul_port", READ_ONCE(priv->ul_port));
+	if (READ_ONCE(priv->ul_port) >= 0)
+		seq_printf(s, "%-24s %llu\n", "dl_meter_count_bps",
+			   READ_ONCE(priv->meter_count_bps[priv->ul_port]));
+	seq_printf(s, "%-24s %llu\n", "dl_meter_bps",
+		   READ_ONCE(priv->dl_meter_bps));
 	seq_printf(s, "%-24s %u\n", "sparse_promoted",
 		   priv->flow_sparse_promoted);
 	seq_printf(s, "%-24s %u\n", "sparse_demoted",

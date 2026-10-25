@@ -1306,10 +1306,23 @@ enum ppe_flow_reject {
 	PPE_REJECT_MAX,
 };
 
-/* One slot of a reference-counted hardware side table. */
+/* A shared table entry: its hardware words, plus one key word some tables
+ * keep apart entries that share their hardware words with.
+ */
 struct ppe_res {
-	u32 words[PPE_NEXTHOP_WORDS];
+	u32 words[PPE_NEXTHOP_WORDS + 1];
 	int refcount;
+};
+
+/* A nexthop of a shaped direction carries both of its paths, so hybrid
+ * switches every flow behind it by rewriting it: direct, out of its port with
+ * the headers pushed in hardware, or handed over to the qdisc through the CPU
+ * port. dir is PPE_XDEV_UL or PPE_XDEV_DL, zero for an unshaped nexthop.
+ */
+struct ppe_nh_hyb {
+	u32 direct[PPE_NEXTHOP_WORDS];
+	u32 handoff[PPE_NEXTHOP_WORDS];
+	int dir;
 };
 
 /* An uplink routes on a VSI of its own, separate from the L2 bridge, so its
@@ -1446,6 +1459,8 @@ struct ppe_aqm_queue {
  */
 struct ppe_aqm_group {
 	u64 rate_bps;
+	/* The port the group's queues belong to. */
+	int port;
 	u64 first_above;
 	u64 drop_next;
 	u32 count;
@@ -1490,6 +1505,7 @@ struct qca_ppe_priv {
 	struct ppe_res *eg_l3_if;
 	struct ppe_res *pub_ip;
 	struct ppe_res *nexthop;
+	struct ppe_nh_hyb *nh_hyb;
 	struct ppe_res *my_mac;
 	u16 *host_ref;
 	/* Per flow index: the device a frame the PPE routed to the CPU port
@@ -1535,6 +1551,45 @@ struct qca_ppe_priv {
 	int ul_port;
 	u16 ul_vid;
 	u16 ul_sid;
+	/* Hybrid upload: while hybrid is on and the uplink port has a hardware
+	 * shaper, upload flows stay in the switch until its queue builds, and
+	 * are handed to the upload shaper (ul_cake) until the upload has run
+	 * well below the rate for a while. ul_handoff_bytes counts what was
+	 * handed over, for that rate.
+	 */
+	bool hybrid;
+	bool ul_cake;
+	atomic64_t ul_handoff_bytes;
+	u64 ul_hyb_bytes;
+	unsigned long ul_low_since;
+	u32 hybrid_promotes;
+	u32 hybrid_demotes;
+	struct work_struct hybrid_work;
+	struct delayed_work hybrid_dwork;
+	/* Hybrid download: the same, with a count-only meter on the uplink
+	 * port at the download rate as the trigger, since the download's
+	 * queue builds at the ISP rather than here. Per port, the rate of a
+	 * meter that counts rather than drops, zero for none.
+	 */
+	u64 meter_count_bps[QCA_PPE_MAX_PORTS];
+	bool dl_cake;
+	atomic64_t dl_handoff_bytes;
+	u64 dl_red_last;
+	u64 dl_red_ns;
+	u64 dl_meter_bytes;
+	u64 dl_meter_ns;
+	/* What the meter measured over the last tick, all the download the
+	 * port took in whichever path it went on.
+	 */
+	u64 dl_meter_bps;
+	unsigned long dl_low_since;
+	u32 hybrid_dl_promotes;
+	u32 hybrid_dl_demotes;
+	/* The red frames that set off the last promotion, and when. */
+	u32 dl_promote_red;
+	u64 dl_promote_ns;
+	struct work_struct hybrid_dl_work;
+	struct delayed_work hybrid_dl_dwork;
 	u16 l3_if_ref[PPE_VSI_MAX];
 	struct ppe_uplink uplink[PPE_PPPOE_SESSIONS];
 	struct ppe_pppoe_session pppoe[PPE_PPPOE_SESSIONS];
@@ -1833,6 +1888,9 @@ int ppe_flow_offload_init(struct qca_ppe_priv *priv);
 bool ppe_flow_xmit(struct dsa_switch *ds, struct sk_buff *skb, u32 flow);
 void ppe_flow_shaper_get(struct qca_ppe_priv *priv, bool upload, char *name);
 void ppe_flow_ct_dscp_set(struct qca_ppe_priv *priv, bool on);
+void ppe_flow_hybrid_set(struct qca_ppe_priv *priv, bool on);
+void ppe_flow_hybrid_promote(struct qca_ppe_priv *priv);
+void ppe_flow_hybrid_dl_promote(struct qca_ppe_priv *priv);
 void ppe_flow_uplink_get(struct qca_ppe_priv *priv, char *name);
 int ppe_flow_uplink_set(struct qca_ppe_priv *priv, const char *name);
 int ppe_flow_shaper_set(struct qca_ppe_priv *priv, bool upload,
