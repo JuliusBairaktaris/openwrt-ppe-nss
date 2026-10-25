@@ -942,6 +942,7 @@
 #define PPE_PORT_METER_W1(p)		(PPE_POLICER_BASE + 0xc000 + (p) * 0x10 + 0x4)
 #define   PPE_METER_CIR_HI		GENMASK(14, 0)
 #define PPE_PORT_METER_W2(p)		(PPE_POLICER_BASE + 0xc000 + (p) * 0x10 + 0x8)
+#define   PPE_METER_VIOLATE_FWD		BIT(31)
 #define PPE_PORT_METER_W3(p)		(PPE_POLICER_BASE + 0xc000 + (p) * 0x10 + 0xc)
 
 /* The meter's token buckets, committed and excess, one entry per port and two

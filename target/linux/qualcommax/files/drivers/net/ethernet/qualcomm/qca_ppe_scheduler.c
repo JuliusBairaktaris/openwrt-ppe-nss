@@ -2082,7 +2082,7 @@ static int ppe_port_shaper_set(struct qca_ppe_priv *priv, int port,
  * dropped by the reset value of the violate command.
  */
 static int ppe_port_policer_set(struct qca_ppe_priv *priv, int port,
-				u64 rate_bps, u32 burst, bool pkt)
+				u64 rate_bps, u32 burst, bool pkt, bool count)
 {
 	u32 cir = 0, cbs = 0;
 	unsigned long clk;
@@ -2120,7 +2120,9 @@ static int ppe_port_policer_set(struct qca_ppe_priv *priv, int port,
 		     FIELD_PREP(PPE_METER_CIR_LO, cir));
 	regmap_write(priv->regmap, PPE_PORT_METER_W1(port),
 		     FIELD_PREP(PPE_METER_CIR_HI, cir >> 3));
-	regmap_write(priv->regmap, PPE_PORT_METER_W2(port), 0);
+	/* A meter that counts instead of policing forwards its red frames. */
+	regmap_write(priv->regmap, PPE_PORT_METER_W2(port),
+		     count ? PPE_METER_VIOLATE_FWD : 0);
 	regmap_write(priv->regmap, PPE_PORT_METER_W3(port), 0);
 
 	/* Credit outlives the rate that filled it: what a re-armed meter would
@@ -2143,17 +2145,20 @@ int qca_ppe_port_policer_add(struct dsa_switch *ds, int port,
 	u32 burst;
 	int pkt;
 
-	/* One rate, one burst, drop on red is all this meter has. Everything
-	 * else the police action can carry is refused rather than dropped on
-	 * the floor: a filter that asked for pass on exceed and got drop
-	 * would report offloaded and police something other than what it says.
+	/* One rate, one burst, and drop or pass on red is all this meter has.
+	 * Everything else the police action can carry is refused rather than
+	 * dropped on the floor: a filter that asked for something else would
+	 * report offloaded and police something other than what it says. A
+	 * meter that passes red only counts it.
 	 */
 	if (!policer->rate_bytes_ps == !policer->rate_pkt_ps ||
 	    policer->peakrate_bytes_ps || policer->avrate ||
-	    policer->exceed.act_id != FLOW_ACTION_DROP ||
+	    (policer->exceed.act_id != FLOW_ACTION_DROP &&
+	     policer->exceed.act_id != FLOW_ACTION_PIPE &&
+	     policer->exceed.act_id != FLOW_ACTION_ACCEPT) ||
 	    (policer->notexceed.act_id != FLOW_ACTION_PIPE &&
 	     policer->notexceed.act_id != FLOW_ACTION_ACCEPT)) {
-		NL_SET_ERR_MSG_MOD(extack, "the meter is one byte or packet rate, one burst and drop on red");
+		NL_SET_ERR_MSG_MOD(extack, "the meter is one byte or packet rate, one burst, and drop or pass on red");
 		return -EOPNOTSUPP;
 	}
 
@@ -2176,7 +2181,8 @@ int qca_ppe_port_policer_add(struct dsa_switch *ds, int port,
 		     FIELD_PREP(PPE_CMPST_LENGTH,
 				ETH_FCS_LEN + policer->overhead));
 
-	return ppe_port_policer_set(priv, port, rate_bps, burst, pkt);
+	return ppe_port_policer_set(priv, port, rate_bps, burst, pkt,
+				    policer->exceed.act_id != FLOW_ACTION_DROP);
 }
 
 void qca_ppe_port_policer_del(struct dsa_switch *ds, int port)
@@ -2185,7 +2191,7 @@ void qca_ppe_port_policer_del(struct dsa_switch *ds, int port)
 
 	regmap_write(priv->regmap, PPE_POLICER_CMPST_LEN(port),
 		     FIELD_PREP(PPE_CMPST_LENGTH, ETH_FCS_LEN));
-	ppe_port_policer_set(priv, port, 0, 0, false);
+	ppe_port_policer_set(priv, port, 0, 0, false, false);
 }
 
 /* The counters a shaped port can answer with are the MAC's own transmit MIB and
