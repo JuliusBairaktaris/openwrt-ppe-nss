@@ -54,7 +54,7 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  		offload_timeout = READ_ONCE(tn->offload_timeout);
 --- a/net/netfilter/nft_flow_offload.c
 +++ b/net/netfilter/nft_flow_offload.c
-@@ -72,7 +72,8 @@ static void nft_flow_offload_eval(const
+@@ -89,7 +89,8 @@ static void nft_flow_offload_eval(const
  		tcph = skb_header_pointer(pkt->skb, nft_thoff(pkt),
  					  sizeof(_tcph), &_tcph);
  		if (unlikely(!tcph || tcph->fin || tcph->rst ||
@@ -64,9 +64,9 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  			goto out;
  		break;
  	case IPPROTO_UDP:
-@@ -118,7 +119,8 @@ static void nft_flow_offload_eval(const
+@@ -135,7 +136,8 @@ static void nft_flow_offload_eval(const
  
- 	flow->priority = pkt->skb->priority;
+ 	flow->priority = nft_flow_offload_priority(pkt);
  
 -	__set_bit(NF_FLOW_HW_BIDIRECTIONAL, &flow->flags);
 +	if (!tcph || test_bit(IPS_ASSURED_BIT, &ct->status))

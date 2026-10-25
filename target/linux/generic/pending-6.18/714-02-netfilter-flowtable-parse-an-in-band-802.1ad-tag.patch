@@ -1,0 +1,51 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Date: Sat, 24 Oct 2026 23:16:42 +0200
+Subject: [PATCH] netfilter: flowtable: parse an in-band 802.1ad tag
+
+Path discovery records 802.1ad tags and nf_flow_encap_push() pushes
+them, but the receive side only parses an in-band 802.1Q tag. The
+outermost tag arrives in the hwaccel field, so a second tag with the
+802.1ad TPID, as an 802.1ad VLAN device on top of an 802.1Q one
+produces, never matches its flow and the packets take the classic
+path.
+
+Parse, look up and pop an in-band 802.1ad tag like an 802.1Q tag.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/net/netfilter/nf_flow_table_inet.c
++++ b/net/netfilter/nf_flow_table_inet.c
+@@ -17,6 +17,7 @@ nf_flow_offload_inet_hook(void *priv, st
+ 
+ 	switch (skb->protocol) {
+ 	case htons(ETH_P_8021Q):
++	case htons(ETH_P_8021AD):
+ 		if (!pskb_may_pull(skb, skb_mac_offset(skb) + sizeof(*veth)))
+ 			return NF_ACCEPT;
+ 
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -156,6 +156,7 @@ static void nf_flow_tuple_encap(struct s
+ 	}
+ 	switch (skb->protocol) {
+ 	case htons(ETH_P_8021Q):
++	case htons(ETH_P_8021AD):
+ 		veth = (struct vlan_ethhdr *)skb_mac_header(skb);
+ 		tuple->encap[i].id = ntohs(veth->h_vlan_TCI) & VLAN_VID_MASK;
+ 		tuple->encap[i].proto = skb->protocol;
+@@ -286,6 +287,7 @@ static bool nf_flow_skb_encap_protocol(s
+ 
+ 	switch (skb->protocol) {
+ 	case htons(ETH_P_8021Q):
++	case htons(ETH_P_8021AD):
+ 		if (!pskb_may_pull(skb, skb_mac_offset(skb) + sizeof(*veth)))
+ 			return false;
+ 
+@@ -320,6 +322,7 @@ static void nf_flow_encap_pop(struct sk_
+ 		}
+ 		switch (skb->protocol) {
+ 		case htons(ETH_P_8021Q):
++		case htons(ETH_P_8021AD):
+ 			vlan_hdr = (struct vlan_hdr *)skb->data;
+ 			__skb_pull(skb, VLAN_HLEN);
+ 			vlan_set_encap_proto(skb, vlan_hdr);

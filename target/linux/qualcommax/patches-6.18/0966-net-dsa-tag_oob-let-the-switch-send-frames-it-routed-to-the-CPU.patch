@@ -6,7 +6,6 @@ delivers the finished frame to the CPU port, marked with the flow it
 matched. Add a tagger_data hook, set through connect_tag_protocol, that
 lets the switch driver send such a frame on to the flow's egress device.
 
-Assisted-by: Claude:claude-opus-5-5
 Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 --- a/include/linux/dsa/oob.h
 +++ b/include/linux/dsa/oob.h

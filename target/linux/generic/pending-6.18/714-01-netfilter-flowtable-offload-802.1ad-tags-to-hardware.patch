@@ -1,0 +1,57 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Date: Sat, 24 Oct 2026 23:16:31 +0200
+Subject: [PATCH] netfilter: flowtable: offload 802.1ad tags to hardware
+
+The software path pushes 802.1Q and 802.1ad tags alike, but the
+hardware offload rule only knows 802.1Q. nf_flow_rule_match() drops an
+802.1ad tag from the match, so with an 802.1ad outer tag the inner tag
+becomes the vlan key and the driver cannot tell the outer VLAN apart.
+nf_flow_rule_route_common() emits no pop for an 802.1ad tag, and on
+push it takes an action entry without setting its id, which leaves a
+FLOW_ACTION_ACCEPT where the push belongs.
+
+Treat both TPIDs as a VLAN tag, as eth_type_vlan() does. The keys and
+the push action already carry the TPID.
+
+Fixes: 3e1b0c168f6c ("netfilter: flowtable: add vlan match offload support")
+Fixes: efce49dfe6a8 ("netfilter: flowtable: add vlan pop action offload support")
+Fixes: 17e52c0aaad7 ("netfilter: flowtable: support for FLOW_ACTION_PPPOE_PUSH")
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -119,7 +119,7 @@ static int nf_flow_rule_match(struct nf_
+ 	mask->meta.ingress_ifindex = 0xffffffff;
+ 
+ 	if (tuple->encap_num > 0 && !(tuple->in_vlan_ingress & BIT(0)) &&
+-	    tuple->encap[0].proto == htons(ETH_P_8021Q)) {
++	    eth_type_vlan(tuple->encap[0].proto)) {
+ 		NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_VLAN, vlan);
+ 		nf_flow_rule_vlan_match(&key->vlan, &mask->vlan,
+ 					tuple->encap[0].id,
+@@ -129,7 +129,7 @@ static int nf_flow_rule_match(struct nf_
+ 	}
+ 
+ 	if (tuple->encap_num > 1 && !(tuple->in_vlan_ingress & BIT(1)) &&
+-	    tuple->encap[1].proto == htons(ETH_P_8021Q)) {
++	    eth_type_vlan(tuple->encap[1].proto)) {
+ 		if (vlan_encap) {
+ 			NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_CVLAN,
+ 					  cvlan);
+@@ -718,7 +718,7 @@ nf_flow_rule_route_common(struct net *ne
+ 		if (tuple->in_vlan_ingress & BIT(i))
+ 			continue;
+ 
+-		if (tuple->encap[i].proto == htons(ETH_P_8021Q)) {
++		if (eth_type_vlan(tuple->encap[i].proto)) {
+ 			entry = flow_action_entry_next(flow_rule);
+ 			if (!entry)
+ 				return -1;
+@@ -744,6 +744,7 @@ nf_flow_rule_route_common(struct net *ne
+ 			entry->pppoe.sid = other_tuple->encap[i].id;
+ 			break;
+ 		case htons(ETH_P_8021Q):
++		case htons(ETH_P_8021AD):
+ 			entry->id = FLOW_ACTION_VLAN_PUSH;
+ 			entry->vlan.vid = other_tuple->encap[i].id;
+ 			entry->vlan.proto = other_tuple->encap[i].proto;

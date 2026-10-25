@@ -3,15 +3,13 @@ Date: Sun, 4 Oct 2026 15:20:14 +0200
 Subject: [PATCH] net/mlx5e: Ignore FLOW_ACTION_PRIORITY on flowtable offload
 
 The next patch makes the flowtable emit FLOW_ACTION_PRIORITY for flows
-with a non-zero skb->priority, which on IPv4 includes the priority
-ip_forward() derives from the TOS by default. mlx5 would reject these
+whose priority a rule set before "flow add". mlx5 would reject these
 rules and stop offloading flows it offloads today.
 
 The eswitch does not use skb->priority for these flows, so accept the
 action on flowtable flows and ignore it. tc flower rules with skbedit
 priority are still rejected.
 
-Assisted-by: Claude:claude-opus-5-5
 Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 ---
  .../net/ethernet/mellanox/mlx5/core/Makefile  |  2 +-

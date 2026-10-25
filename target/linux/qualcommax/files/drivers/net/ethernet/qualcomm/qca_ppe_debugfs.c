@@ -425,6 +425,64 @@ static int ppe_acl_show(struct seq_file *s, void *data)
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(ppe_acl);
+DEFINE_SHOW_ATTRIBUTE(ppe_aqm);
+
+/* DEBUG(vlan-toggle): the VLAN classification state as the hardware holds it. */
+static int ppe_vlan_show(struct seq_file *s, void *data)
+{
+	struct qca_ppe_priv *priv = s->private;
+	u32 a, b, c, d, e;
+	int i;
+
+	guard(mutex)(&priv->vlan_lock);
+
+	seq_printf(s, "vlan_filtering 0x%x\n", priv->vlan_filtering);
+	seq_puts(s, "port pvid def_vid vlan_cfg eg_vlan\n");
+	for (i = 0; i < QCA_PPE_MAX_PORTS; i++) {
+		regmap_read(priv->regmap, PPE_PORT_DEF_VID(i), &a);
+		regmap_read(priv->regmap, PPE_PORT_VLAN_CFG(i), &b);
+		regmap_read(priv->regmap, PPE_PORT_EG_VLAN(i), &c);
+		seq_printf(s, "%-4d %-4u 0x%08x 0x%08x 0x%08x\n", i,
+			   priv->port_pvid[i], a, b, c);
+	}
+
+	seq_puts(s, "xlt rule_w0 rule_w1 rule_w2 act_w0 act_w1\n");
+	for (i = 0; i < PPE_XLT_TBL_NUM; i++) {
+		if (!test_bit(i, priv->xlt_bitmap))
+			continue;
+		regmap_read(priv->regmap, PPE_XLT_RULE_TBL(i), &a);
+		regmap_read(priv->regmap, PPE_XLT_RULE_W1(i), &b);
+		regmap_read(priv->regmap, PPE_XLT_RULE_TBL(i) + 8, &c);
+		regmap_read(priv->regmap, PPE_XLT_ACTION_TBL(i), &d);
+		regmap_read(priv->regmap, PPE_XLT_ACTION_W1(i), &e);
+		seq_printf(s, "%-3d 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x\n", i,
+			   a, b, c, d, e);
+	}
+
+	seq_puts(s, "br vid vsi ports pvid_ports xlt xlt_pvid member vsi_w0 vsi_w1 eg_tag\n");
+	for (i = 0; i < PPE_VSI_MAX; i++) {
+		struct qca_ppe_vlan_entry *v = &priv->vlans[i];
+
+		if (!v->br_dev)
+			continue;
+		regmap_read(priv->regmap, PPE_VSI_TBL(v->vsi), &a);
+		regmap_read(priv->regmap, PPE_VSI_TBL(v->vsi) + 4, &b);
+		regmap_read(priv->regmap, PPE_EG_VSI_TAG(v->vsi), &c);
+		seq_printf(s, "%s %u %u 0x%02x 0x%02x %d %d 0x%02x 0x%08x 0x%08x 0x%08x\n",
+			   netdev_name(v->br_dev), v->vid, v->vsi, v->ports,
+			   v->pvid_ports, v->xlt_idx, v->xlt_pvid_idx,
+			   priv->vsi_member[v->vsi], a, b, c);
+	}
+
+	seq_puts(s, "port port_vsi br\n");
+	for (i = 0; i < QCA_PPE_MAX_PORTS; i++)
+		seq_printf(s, "%-4d %-8u %s\n", i, priv->port_vsi[i],
+			   priv->port_br_dev[i] ?
+			   netdev_name(priv->port_br_dev[i]) : "-");
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(ppe_vlan);
 
 void ppe_debugfs_init(struct qca_ppe_priv *priv)
 {
@@ -446,6 +504,8 @@ void ppe_debugfs_init(struct qca_ppe_priv *priv)
 	debugfs_create_file("egress", 0400, priv->debugfs, priv,
 			    &ppe_egress_fops);
 	debugfs_create_file("acl", 0400, priv->debugfs, priv, &ppe_acl_fops);
+	debugfs_create_file("aqm", 0400, priv->debugfs, priv, &ppe_aqm_fops);
+	debugfs_create_file("vlan", 0400, priv->debugfs, priv, &ppe_vlan_fops);
 }
 
 void ppe_debugfs_exit(struct qca_ppe_priv *priv)

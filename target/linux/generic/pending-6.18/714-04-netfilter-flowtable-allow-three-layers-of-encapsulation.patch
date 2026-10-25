@@ -1,0 +1,128 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Date: Sun, 25 Oct 2026 00:01:57 +0200
+Subject: [PATCH] netfilter: flowtable: allow three layers of encapsulation
+
+A PPPoE session over a QinQ link stacks an outer and an inner VLAN tag
+and a PPPoE header, three layers where NF_FLOW_TABLE_ENCAP_MAX allows
+two. nft_dev_path_info() fails on the third, so such flows are not
+offloaded at all, not even to the software fast path.
+
+Raise NF_FLOW_TABLE_ENCAP_MAX to 3. encap_num already holds 3, and the
+in_vlan_ingress and ingress_vlans bitmasks take their third bit from
+spare bitfield bits. Path discovery, the receive parser, pop, push and
+the hardware actions all walk the encapsulation up to the limit.
+nf_flow_rule_match() now walks the tags in a loop as well and maps the
+first VLAN tag to the vlan key and the second to the cvlan key. The
+dissector has no key for a third tag, so a flow with three VLAN tags is
+refused for hardware offload and stays in the software fast path.
+
+The third encap entry is part of the lookup key. On x86_64:
+
+  struct                    before  after
+  flow_offload_tuple           120    128
+  flow_offload_tuple_rhash     128    136
+  flow_offload                 296    312
+  nf_flow_route (stack)        176    192
+
+The lookup key grows from 88 to 92 bytes. flow_offload_tuple_rhash no
+longer fits in two cache lines, but the key of either direction still
+spans two, and flow_offload objects still take 320 bytes in their
+SLAB_HWCACHE_ALIGN cache.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -106,7 +106,7 @@ enum flow_offload_xmit_type {
+ 	FLOW_OFFLOAD_XMIT_TC,
+ };
+ 
+-#define NF_FLOW_TABLE_ENCAP_MAX		2
++#define NF_FLOW_TABLE_ENCAP_MAX		3
+ 
+ struct flow_offload_tuple {
+ 	union {
+@@ -137,7 +137,7 @@ struct flow_offload_tuple {
+ 	u8				dir:2,
+ 					xmit_type:3,
+ 					encap_num:2,
+-					in_vlan_ingress:2,
++					in_vlan_ingress:3,
+ 					bridge_path:1,
+ 					bridge_vlan:1,
+ 					port_vlans:2;
+@@ -213,7 +213,7 @@ struct nf_flow_route {
+ 				__be16		proto;
+ 			} encap[NF_FLOW_TABLE_ENCAP_MAX];
+ 			u8			num_encaps:2,
+-						ingress_vlans:2;
++						ingress_vlans:3;
+ 		} in;
+ 		struct {
+ 			u32			ifindex;
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -96,7 +96,7 @@ static int nf_flow_rule_match(struct nf_
+ 	struct nf_flow_key *mask = &match->mask;
+ 	struct nf_flow_key *key = &match->key;
+ 	struct ip_tunnel_info *tun_info;
+-	bool vlan_encap = false;
++	int i, vlans = 0;
+ 
+ 	NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_META, meta);
+ 	NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_CONTROL, control);
+@@ -118,34 +118,31 @@ static int nf_flow_rule_match(struct nf_
+ 
+ 	mask->meta.ingress_ifindex = 0xffffffff;
+ 
+-	if (tuple->encap_num > 0 && !(tuple->in_vlan_ingress & BIT(0)) &&
+-	    eth_type_vlan(tuple->encap[0].proto)) {
+-		NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_VLAN, vlan);
+-		nf_flow_rule_vlan_match(&key->vlan, &mask->vlan,
+-					tuple->encap[0].id,
+-					tuple->encap[0].proto);
+-		match->dissector.used_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_VLAN);
+-		vlan_encap = true;
+-	}
+-
+-	if (tuple->encap_num > 1 && !(tuple->in_vlan_ingress & BIT(1)) &&
+-	    eth_type_vlan(tuple->encap[1].proto)) {
+-		if (vlan_encap) {
++	for (i = 0; i < tuple->encap_num; i++) {
++		if (tuple->in_vlan_ingress & BIT(i) ||
++		    !eth_type_vlan(tuple->encap[i].proto))
++			continue;
++
++		switch (vlans++) {
++		case 0:
++			NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_VLAN, vlan);
++			nf_flow_rule_vlan_match(&key->vlan, &mask->vlan,
++						tuple->encap[i].id,
++						tuple->encap[i].proto);
++			match->dissector.used_keys |=
++				BIT_ULL(FLOW_DISSECTOR_KEY_VLAN);
++			break;
++		case 1:
+ 			NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_CVLAN,
+ 					  cvlan);
+ 			nf_flow_rule_vlan_match(&key->cvlan, &mask->cvlan,
+-						tuple->encap[1].id,
+-						tuple->encap[1].proto);
++						tuple->encap[i].id,
++						tuple->encap[i].proto);
+ 			match->dissector.used_keys |=
+ 				BIT_ULL(FLOW_DISSECTOR_KEY_CVLAN);
+-		} else {
+-			NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_VLAN,
+-					  vlan);
+-			nf_flow_rule_vlan_match(&key->vlan, &mask->vlan,
+-						tuple->encap[1].id,
+-						tuple->encap[1].proto);
+-			match->dissector.used_keys |=
+-				BIT_ULL(FLOW_DISSECTOR_KEY_VLAN);
++			break;
++		default:
++			return -EOPNOTSUPP;
+ 		}
+ 	}
+ 

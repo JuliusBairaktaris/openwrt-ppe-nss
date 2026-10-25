@@ -25,6 +25,8 @@
 #include <linux/unaligned.h>
 #include <net/dsa.h>
 #include <net/flow_offload.h>
+#include <net/dsfield.h>
+#include <net/netfilter/nf_conntrack.h>
 #include <net/netfilter/nf_flow_table.h>
 #include <net/pkt_cls.h>
 #include <net/tcp.h>
@@ -42,7 +44,11 @@ struct ppe_flow_data {
 
 	u16 vlan_id;
 	bool vlan_valid;
+	/* The outer 802.1ad tag of a QinQ uplink, pushed outside vlan_id. */
+	u16 svlan_id;
+	bool svlan_valid;
 	u16 ivid;
+	u16 isvid;
 	u16 pppoe_sid;
 	bool pppoe_valid;
 
@@ -72,11 +78,18 @@ struct ppe_flow_entry {
 	int my_mac;
 	int l3_if;
 	int eg_l3_if;
+	/* The other path's egress interface of a flow hybrid can switch. */
+	int eg_l3_if_alt;
+	/* A download to Wi-Fi: hybrid switches it by the DL bit of its xdev. */
+	bool hyb_wifi;
 	int pub_ip;
 	int uplink;
 	int in_uplink;
 	int session;
 	int xdev;
+	unsigned long ct;
+	u16 vid;
+	u8 dscp;
 	u8 iport;
 	u8 oport;
 	u16 ivid;
@@ -355,13 +368,47 @@ static int ppe_flow_port_by_ifindex(struct qca_ppe_priv *priv, int ifindex)
 	return -EOPNOTSUPP;
 }
 
-static int ppe_uplink_find(struct qca_ppe_priv *priv, int port, u16 vid)
+/* A port is a provider port while any QinQ uplink is on it, in both the
+ * parser and the egress tagging. With the default TPIDs (S 0x88a8, C 0x8100)
+ * a single 802.1Q tag there is still read as a C-tag. The CPU port is one
+ * while any QinQ uplink exists at all: a customer port's egress writes C-tags
+ * only, so the S-tag the egress translation puts back on a frame that missed
+ * the flow table would be lost, and the software stack would see the frame
+ * without the tag its device expects.
+ */
+static void ppe_port_core_set(struct qca_ppe_priv *priv, int port, bool on)
+{
+	bool port_on = on, cpu_on = on;
+	int i;
+
+	if (!on)
+		for (i = 0; i < PPE_PPPOE_SESSIONS; i++) {
+			if (!priv->uplink[i].ref || !priv->uplink[i].svid)
+				continue;
+			cpu_on = true;
+			if (priv->uplink[i].port == port)
+				port_on = true;
+		}
+
+	regmap_update_bits(priv->regmap, PPE_PORT_PARSING(port),
+			   PPE_PORT_PARSING_CORE,
+			   port_on ? PPE_PORT_PARSING_CORE : 0);
+	regmap_update_bits(priv->regmap, PPE_PORT_EG_VLAN(port),
+			   PPE_PORT_EG_VLAN_TYPE_CORE,
+			   port_on ? PPE_PORT_EG_VLAN_TYPE_CORE : 0);
+	regmap_update_bits(priv->regmap, PPE_PORT_EG_VLAN(QCA_PPE_CPU_PORT),
+			   PPE_PORT_EG_VLAN_TYPE_CORE,
+			   cpu_on ? PPE_PORT_EG_VLAN_TYPE_CORE : 0);
+}
+
+static int ppe_uplink_find(struct qca_ppe_priv *priv, int port, u16 svid,
+			   u16 vid)
 {
 	int i;
 
 	for (i = 0; i < PPE_PPPOE_SESSIONS; i++)
 		if (priv->uplink[i].ref && priv->uplink[i].port == port &&
-		    priv->uplink[i].vid == vid)
+		    priv->uplink[i].svid == svid && priv->uplink[i].vid == vid)
 			return i;
 
 	return -ENOENT;
@@ -378,14 +425,18 @@ static int ppe_uplink_find(struct qca_ppe_priv *priv, int port, u16 vid)
  * that path, so the software stack sees on-wire frames throughout. The MRU
  * leaves room for the tag and a PPPoE header whether or not either is there.
  */
-static int ppe_uplink_get(struct qca_ppe_priv *priv, int port, u16 vid,
-			  const u8 *mac, u32 mtu)
+static int ppe_uplink_get(struct qca_ppe_priv *priv, int port, u16 svid,
+			  u16 vid, const u8 *mac, u32 mtu)
 {
 	u32 words[PPE_MY_MAC_WORDS] = {};
 	struct ppe_uplink *up;
 	int i, vsi, xlt = -1, ret;
 
-	i = ppe_uplink_find(priv, port, vid);
+	/* An outer tag needs an inner one to match on. */
+	if (svid && !vid)
+		return -EOPNOTSUPP;
+
+	i = ppe_uplink_find(priv, port, svid, vid);
 	if (i >= 0) {
 		priv->uplink[i].ref++;
 		return i;
@@ -430,7 +481,8 @@ static int ppe_uplink_get(struct qca_ppe_priv *priv, int port, u16 vid,
 		     FIELD_PREP(PPE_L3_IF_TTL_EXCEED_CMD,
 				PPE_L3_IF_TTL_EXCEED_TO_CPU) |
 		     FIELD_PREP(PPE_L3_IF_MAC_BITMAP, GENMASK(7, 0)));
-	ppe_l3_if_mtu_set(priv, vsi, mtu + VLAN_ETH_HLEN + PPPOE_SES_HLEN);
+	ppe_l3_if_mtu_set(priv, vsi, mtu + VLAN_ETH_HLEN + PPPOE_SES_HLEN +
+			  (svid ? VLAN_HLEN : 0));
 	regmap_write(priv->regmap, PPE_L3_VSI_TBL(vsi),
 		     PPE_L3_VSI_IF_VALID | FIELD_PREP(PPE_L3_VSI_IF_INDEX, vsi));
 
@@ -444,7 +496,9 @@ static int ppe_uplink_get(struct qca_ppe_priv *priv, int port, u16 vid,
 		 * before the rule goes live.
 		 */
 		regmap_write(priv->regmap, PPE_XLT_ACTION_TBL(xlt),
-			     FIELD_PREP(PPE_XLT_CVID_CMD, PPE_XLT_CVID_DEL));
+			     FIELD_PREP(PPE_XLT_CVID_CMD, PPE_XLT_CVID_DEL) |
+			     (svid ? FIELD_PREP(PPE_XLT_SVID_CMD,
+						PPE_XLT_CVID_DEL) : 0));
 		regmap_write(priv->regmap, PPE_XLT_ACTION_W1(xlt),
 			     PPE_XLT_VSI_CMD | FIELD_PREP(PPE_XLT_VSI, vsi));
 
@@ -456,7 +510,10 @@ static int ppe_uplink_get(struct qca_ppe_priv *priv, int port, u16 vid,
 		regmap_write(priv->regmap, PPE_EG_XLT_ACTION(xlt),
 			     FIELD_PREP(PPE_EG_XLT_CVID_CMD,
 					PPE_EG_XLT_CVID_ADD) |
-			     FIELD_PREP(PPE_EG_XLT_CVID, vid));
+			     FIELD_PREP(PPE_EG_XLT_CVID, vid) |
+			     (svid ? FIELD_PREP(PPE_EG_XLT_SVID_CMD,
+						PPE_EG_XLT_CVID_ADD) |
+				     FIELD_PREP(PPE_EG_XLT_SVID, svid) : 0));
 		regmap_write(priv->regmap, PPE_EG_XLT_ACTION_W1(xlt), 0);
 		regmap_write(priv->regmap, PPE_EG_XLT_RULE(xlt),
 			     PPE_EG_XLT_VALID |
@@ -472,14 +529,22 @@ static int ppe_uplink_get(struct qca_ppe_priv *priv, int port, u16 vid,
 					PPE_XLT_SKEY_UNTAGGED));
 
 		/* The frame-format fields are match bitmaps: a zero matches no
-		 * frame at all. The uplink is single (C-)tagged, so the S-tag
-		 * side must accept the untagged format for the rule to hit.
+		 * frame at all. A single-tagged (C-tag) uplink has the S-tag
+		 * side accept the untagged format; a QinQ uplink keys on both
+		 * tags. Its port parses the outer 802.1ad tag as an S-tag only
+		 * as a provider port.
 		 */
+		if (svid)
+			ppe_port_core_set(priv, port, true);
 		regmap_write(priv->regmap, PPE_XLT_RULE_TBL(xlt),
 			     PPE_XLT_VALID |
 			     FIELD_PREP(PPE_XLT_PORT_BMP, BIT(port)) |
-			     FIELD_PREP(PPE_XLT_SKEY_FMT,
-					PPE_XLT_SKEY_UNTAGGED));
+			     (svid ? FIELD_PREP(PPE_XLT_SKEY_FMT,
+						PPE_XLT_SKEY_TAGGED) |
+				     PPE_XLT_SKEY_VID_INCL |
+				     FIELD_PREP(PPE_XLT_SKEY_VID, svid) :
+				     FIELD_PREP(PPE_XLT_SKEY_FMT,
+						PPE_XLT_SKEY_UNTAGGED)));
 		regmap_write(priv->regmap, PPE_XLT_RULE_W1(xlt),
 			     FIELD_PREP(PPE_XLT_CKEY_FMT_1,
 					PPE_XLT_CKEY_TAGGED >> 1) |
@@ -491,6 +556,7 @@ static int ppe_uplink_get(struct qca_ppe_priv *priv, int port, u16 vid,
 	up->ref = 1;
 	up->port = port;
 	up->vid = vid;
+	up->svid = svid;
 	up->vsi = vsi;
 	up->xlt = xlt;
 
@@ -532,6 +598,8 @@ static void ppe_uplink_put(struct qca_ppe_priv *priv, int i)
 		ppe_tbl_clear(priv, PPE_MY_MAC_TBL(up->mymac),
 			      PPE_MY_MAC_WORDS);
 	ppe_vsi_free(priv, up->vsi);
+	if (up->svid)
+		ppe_port_core_set(priv, up->port, false);
 }
 
 /* Recognise a PPPoE session on its uplink, so the header is parsed through to
@@ -644,12 +712,14 @@ static int ppe_flow_ingress_vsi(struct qca_ppe_priv *priv, int iport, u16 vid)
 /* The VSI a flow from this port and tag is keyed on: the uplink's, or the one
  * the port classifies into.
  */
-static int ppe_flow_src_if(struct qca_ppe_priv *priv, int iport, u16 vid)
+static int ppe_flow_src_if(struct qca_ppe_priv *priv, int iport, u16 svid,
+			   u16 vid)
 {
-	int up = ppe_uplink_find(priv, iport, vid);
+	int up = ppe_uplink_find(priv, iport, svid, vid);
 
-	return up >= 0 ? priv->uplink[up].vsi :
-			 ppe_flow_ingress_vsi(priv, iport, vid);
+	if (up >= 0)
+		return priv->uplink[up].vsi;
+	return svid ? -EOPNOTSUPP : ppe_flow_ingress_vsi(priv, iport, vid);
 }
 
 /* The flow lookup only runs on packets the L3 stage accepted, and nothing in
@@ -662,7 +732,8 @@ static int ppe_flow_src_if(struct qca_ppe_priv *priv, int iport, u16 vid)
  * index keeps the two in step without a second allocator.
  */
 static int ppe_flow_alloc_ingress(struct qca_ppe_priv *priv, int iport,
-				  u16 vid, struct ppe_flow_entry *entry)
+				  u16 svid, u16 vid,
+				  struct ppe_flow_entry *entry)
 {
 	struct dsa_port *dp = dsa_to_port(&priv->ds, iport);
 	u32 words[PPE_MY_MAC_WORDS] = {};
@@ -676,7 +747,7 @@ static int ppe_flow_alloc_ingress(struct qca_ppe_priv *priv, int iport,
 	 * reference rather than programming anything: a sibling flow going away
 	 * must not pull the classification out from under this one.
 	 */
-	ret = ppe_uplink_find(priv, iport, vid);
+	ret = ppe_uplink_find(priv, iport, svid, vid);
 	if (ret >= 0) {
 		priv->uplink[ret].ref++;
 		entry->in_uplink = ret;
@@ -684,6 +755,10 @@ static int ppe_flow_alloc_ingress(struct qca_ppe_priv *priv, int iport,
 		entry->ivid = vid;
 		return 0;
 	}
+
+	/* Two tags are only routed on a QinQ uplink. */
+	if (svid)
+		return -EOPNOTSUPP;
 
 	vsi = ppe_flow_ingress_vsi(priv, iport, vid);
 	if (vsi < 0)
@@ -798,6 +873,146 @@ static void ppe_flow_drop_port(struct qca_ppe_priv *priv, int port)
 			ppe_flow_drop(priv, entry);
 }
 
+/* Only the flows of one direction change path when its shaper does: those
+ * already handed to a shaper of it, and those it would now take, by the rules
+ * of ppe_flow_shape().
+ */
+static void ppe_flow_shaper_drop(struct qca_ppe_priv *priv, bool upload)
+{
+	struct ppe_flow_entry *entry, *tmp;
+
+	lockdep_assert_held(&priv->flow_lock);
+
+	list_for_each_entry_safe(entry, tmp, &priv->flow_list, list) {
+		bool hit;
+
+		if (upload)
+			hit = entry->xdev & PPE_XDEV_UL ||
+			      (entry->oport != QCA_PPE_CPU_PORT &&
+			       !priv->port_br_dev[entry->oport]);
+		else
+			hit = entry->xdev & PPE_XDEV_DL ||
+			      entry->in_uplink >= 0 ||
+			      !priv->port_br_dev[entry->iport];
+		if (hit)
+			ppe_flow_drop(priv, entry);
+	}
+}
+
+/* Find where the uplink device - or, unnamed, the upload shaper's - meets the
+ * switch, the way the flowtable resolves a device: down through PPPoE and
+ * VLAN to a port of this switch. A path that does not reach one leaves
+ * ul_port at -1. Returns whether it changed.
+ */
+static bool ppe_flow_shaper_path(struct qca_ppe_priv *priv)
+{
+	int port = -1, vid = 0, svid = 0, sid = 0, i;
+	struct net_device_path_ctx ctx = {};
+	struct net_device_path_stack stack;
+	struct net_device *dev;
+	bool changed;
+
+	lockdep_assert_held(&priv->flow_lock);
+
+	rcu_read_lock();
+	i = priv->uplink_dev ?: priv->ul_shaper;
+	dev = i ? dev_get_by_index_rcu(&init_net, i) : NULL;
+	ctx.dev = dev;
+	if (dev && !dev_fill_forward_path(&ctx, &stack)) {
+		for (i = 0; i < stack.num_paths; i++) {
+			const struct net_device_path *path = &stack.path[i];
+			struct dsa_port *dp;
+
+			switch (path->type) {
+			case DEV_PATH_PPPOE:
+				sid = path->encap.id;
+				break;
+			case DEV_PATH_VLAN:
+				/* Down the stack the inner tag comes first. */
+				if (!vid)
+					vid = path->encap.id;
+				else if (!svid)
+					svid = path->encap.id;
+				break;
+			case DEV_PATH_DSA:
+				dp = dsa_port_from_netdev((struct net_device *)path->dev);
+				if (!IS_ERR(dp) && dp->ds == &priv->ds)
+					port = path->dsa.port;
+				break;
+			default:
+				break;
+			}
+		}
+	}
+	rcu_read_unlock();
+
+	if (port < 0)
+		vid = svid = sid = 0;
+	changed = port != priv->ul_port || vid != priv->ul_vid ||
+		  svid != priv->ul_svid ||
+		  sid != priv->ul_sid;
+	priv->ul_port = port;
+	priv->ul_vid = vid;
+	priv->ul_svid = svid;
+	priv->ul_sid = sid;
+
+	return changed;
+}
+
+/* A shaper is named, and the device of that name can go and come back with
+ * another ifindex: a PPPoE session that reconnects brings up a new ppp
+ * device. While it is gone that direction is not shaped rather than sent
+ * to an ifindex that no longer exists, and a device that takes the name
+ * becomes the shaper again.
+ */
+static void ppe_flow_shaper_track(struct qca_ppe_priv *priv,
+				  struct net_device *dev, unsigned long event)
+{
+	int i;
+
+	lockdep_assert_held(&priv->flow_lock);
+
+	if (!net_eq(dev_net(dev), &init_net))
+		return;
+
+	for (i = 0; i < 3; i++) {
+		bool upload = i == 1, uplink = i == 2;
+		int *shaper = uplink ? &priv->uplink_dev :
+			      upload ? &priv->ul_shaper : &priv->dl_shaper;
+		const char *name = uplink ? priv->uplink_name :
+				   upload ? priv->ul_shaper_name :
+				   priv->dl_shaper_name;
+		int now = *shaper;
+
+		if (!*name)
+			continue;
+
+		if (now == dev->ifindex &&
+		    (event == NETDEV_UNREGISTER || strcmp(dev->name, name)))
+			now = 0;
+		else if (event != NETDEV_UNREGISTER && !strcmp(dev->name, name) &&
+			 dev->ifindex <= PPE_XDEV_IFINDEX)
+			now = dev->ifindex;
+
+		if (now == *shaper) {
+			/* A PPPoE device is up before its session is. */
+			if ((upload || uplink) && now && now == dev->ifindex &&
+			    event == NETDEV_UP && ppe_flow_shaper_path(priv)) {
+				ppe_flow_shaper_drop(priv, true);
+				ppe_flow_shaper_drop(priv, false);
+			}
+			continue;
+		}
+
+		WRITE_ONCE(*shaper, now);
+		if (upload || uplink) {
+			ppe_flow_shaper_path(priv);
+			ppe_flow_shaper_drop(priv, false);
+		}
+		ppe_flow_shaper_drop(priv, upload || uplink);
+	}
+}
+
 /* Each half of the size check follows the device that owns it: the routing
  * domain's MRU follows the device that routes for the port, and the egress size
  * a flow was built with follows the port itself.
@@ -822,6 +1037,14 @@ static int ppe_flow_netdev_event(struct notifier_block *nb, unsigned long event,
 	struct ppe_flow_entry *entry, *tmp;
 	struct dsa_port *dp;
 	int i;
+
+	if (event == NETDEV_REGISTER || event == NETDEV_UNREGISTER ||
+	    event == NETDEV_CHANGENAME || event == NETDEV_UP) {
+		guard(mutex)(&priv->flow_lock);
+		guard(mutex)(&priv->vlan_lock);
+		ppe_flow_shaper_track(priv, dev, event);
+		return NOTIFY_DONE;
+	}
 
 	if (event != NETDEV_CHANGEMTU && event != NETDEV_CHANGEADDR)
 		return NOTIFY_DONE;
@@ -926,20 +1149,26 @@ static void ppe_flow_purge_ingress(struct qca_ppe_priv *priv,
 	}
 }
 
+static void ppe_flow_eg_l3_if_put(struct qca_ppe_priv *priv, int idx)
+{
+	if (ppe_res_put(priv->eg_l3_if, idx)) {
+		ppe_tbl_clear(priv, PPE_EG_L3_IF_TBL(idx), PPE_EG_L3_IF_WORDS);
+		ppe_tbl_clear(priv, PPE_IN_L3_IF_TBL(idx), PPE_L3_IF_WORDS);
+	}
+}
+
 static void ppe_flow_free_egress(struct qca_ppe_priv *priv,
 				 struct ppe_flow_entry *entry)
 {
-	if (ppe_res_put(priv->nexthop, entry->nexthop))
+	if (ppe_res_put(priv->nexthop, entry->nexthop)) {
 		ppe_tbl_clear(priv, PPE_IN_NEXTHOP_TBL(entry->nexthop),
 			      PPE_NEXTHOP_WORDS);
+		priv->nh_hyb[entry->nexthop].dir = 0;
+	}
 	if (ppe_res_put(priv->pub_ip, entry->pub_ip))
 		regmap_write(priv->regmap, PPE_PUB_IP_TBL(entry->pub_ip), 0);
-	if (ppe_res_put(priv->eg_l3_if, entry->eg_l3_if)) {
-		ppe_tbl_clear(priv, PPE_EG_L3_IF_TBL(entry->eg_l3_if),
-			      PPE_EG_L3_IF_WORDS);
-		ppe_tbl_clear(priv, PPE_IN_L3_IF_TBL(entry->eg_l3_if),
-			      PPE_L3_IF_WORDS);
-	}
+	ppe_flow_eg_l3_if_put(priv, entry->eg_l3_if);
+	ppe_flow_eg_l3_if_put(priv, entry->eg_l3_if_alt);
 
 	if (entry->session >= 0)
 		ppe_pppoe_session_put(priv, entry->session);
@@ -960,29 +1189,208 @@ MODULE_PARM_DESC(cpu_xmit,
 static bool ppe_cpu_xmit_ok(const struct ppe_flow_data *data)
 {
 	return ppe_cpu_xmit && data->odev->type == ARPHRD_ETHER &&
-	       !data->vlan_valid && !data->pppoe_valid;
+	       !data->vlan_valid && !data->svlan_valid && !data->pppoe_valid;
+}
+
+/* Whether a flow's side of the switch is the shaped uplink: the port, VLAN
+ * and, upstream, the PPPoE session the upload shaper's device sits on. A
+ * second routed port, a DMZ or another VLAN on the WAN port is not, and its
+ * flows stay in hardware. Until the path is known, any routed port is.
+ */
+static bool ppe_flow_on_uplink(struct qca_ppe_priv *priv, int port, u16 svid,
+			       u16 vid, u16 sid, bool upload)
+{
+	if (priv->ul_port < 0)
+		return !priv->port_br_dev[port];
+
+	return port == priv->ul_port && vid == priv->ul_vid &&
+	       svid == priv->ul_svid && (!upload || sid == priv->ul_sid);
+}
+
+/* Hybrid upload keeps a flow in the switch while the uplink port's hardware
+ * shaper is the bottleneck in waiting and its queue stays short. Without that
+ * shaper nothing on the router would see the upload queue build, so the flow
+ * goes to the qdisc as it does without hybrid.
+ */
+static bool ppe_flow_ul_direct(struct qca_ppe_priv *priv)
+{
+	int port = READ_ONCE(priv->ul_port);
+
+	return READ_ONCE(priv->hybrid) && !READ_ONCE(priv->ul_cake) &&
+	       port >= 0 && priv->shaper[port].rate_bps;
+}
+
+/* Hybrid download keeps a flow on its hardware path while the uplink port's
+ * count-only meter at the download rate stays green. Without that meter
+ * nothing would see the download reach the rate, so the flow goes to the
+ * qdisc as it does without hybrid.
+ */
+static bool ppe_flow_dl_direct(struct qca_ppe_priv *priv)
+{
+	int port = READ_ONCE(priv->ul_port);
+
+	return READ_ONCE(priv->hybrid) && !READ_ONCE(priv->dl_cake) &&
+	       port >= 0 && READ_ONCE(priv->meter_count_bps[port]);
+}
+
+/* The PPE has no queue that can run CAKE or an L4S AQM: it drops on a
+ * buffer count and cannot mark. Where the shaping is done by a qdisc
+ * instead, the flows that cross the shaped link still have their lookup,
+ * NAT and nexthop done in hardware, and only their frames come to the CPU,
+ * finished, to pass the qdisc on the way out: a download flow through the
+ * ifb that carries the download qdisc, an upload flow through the uplink
+ * device, whose own qdisc, PPPoE and VLAN stack then do the rest. The
+ * uplink is where the upload shaper's device meets the switch; a download
+ * enters by it. Returns the port the frames leave the switch by.
+ */
+static int ppe_flow_shape(struct qca_ppe_priv *priv, struct ppe_flow_data *data,
+			  struct ppe_flow_entry *entry, int port)
+{
+	int ul = READ_ONCE(priv->ul_shaper), dl = READ_ONCE(priv->dl_shaper);
+
+	if (ul && port != QCA_PPE_CPU_PORT &&
+	    ppe_flow_on_uplink(priv, port,
+			       data->svlan_valid ? data->svlan_id : 0,
+			       data->vlan_valid ? data->vlan_id : 0,
+			       data->pppoe_valid ? data->pppoe_sid : 0, true)) {
+		entry->xdev = ul | PPE_XDEV_UL;
+		return QCA_PPE_CPU_PORT;
+	}
+
+	/* A download to a tagged LAN VLAN comes to the CPU untagged: the tag
+	 * is added after the shaper, as the VLAN stack would.
+	 */
+	if (dl && !data->pppoe_valid &&
+	    ppe_flow_on_uplink(priv, entry->iport, data->isvid, data->ivid, 0,
+			       false)) {
+		if (port != QCA_PPE_CPU_PORT)
+			entry->xdev = data->odev->ifindex;
+		entry->xdev |= PPE_XDEV_DL;
+		entry->vid = data->vlan_valid ? data->vlan_id : 0;
+		return QCA_PPE_CPU_PORT;
+	}
+
+	return port;
+}
+
+/* An upload frame arrives NATed, without the conntrack the stack would have
+ * attached, so the qdisc could not tell the LAN host behind it: CAKE's nat
+ * mode finds the connection by the frame's own tuple, which after NAT is
+ * neither of the connection's. The conntrack goes with the frame as it would
+ * on the forward path. The entry holds a reference until it is destroyed; a
+ * conntrack is freed by RCU and reused only as one, so taking a reference
+ * that is not zero is safe here.
+ */
+static void ppe_flow_ct_attach(struct qca_ppe_priv *priv, struct sk_buff *skb,
+			       u32 flow)
+{
+	unsigned long v = READ_ONCE(priv->flow_ct[flow]);
+	struct nf_conn *ct = (struct nf_conn *)(v & ~1UL);
+
+	if (ct && refcount_inc_not_zero(&ct->ct_general.use))
+		nf_ct_set(skb, ct, v & 1 ? IP_CT_ESTABLISHED_REPLY :
+				   IP_CT_ESTABLISHED);
+}
+
+/* The flowtable's cookie is the tuple of the offloaded direction. */
+static unsigned long ppe_flow_ct_get(unsigned long cookie)
+{
+	const struct flow_offload_tuple *tuple = (void *)cookie;
+	struct flow_offload_tuple_rhash *th;
+	struct flow_offload *flow;
+
+	th = container_of(tuple, struct flow_offload_tuple_rhash, tuple);
+	flow = container_of(th, struct flow_offload, tuplehash[tuple->dir]);
+	nf_conntrack_get(&flow->ct->ct_general);
+
+	return (unsigned long)flow->ct | (tuple->dir == FLOW_OFFLOAD_DIR_REPLY);
+}
+
+/* The DSCP a firewall rule stamped into the conntrack mark on the flow's
+ * first packets, as act_ctinfo reads it: bit 7 says it is set, bits 0-5 are
+ * the value. An offloaded flow's later packets pass no such rule, so its
+ * frames are given it when they are handed over.
+ */
+static u8 ppe_flow_ct_dscp(unsigned long cookie)
+{
+#if IS_ENABLED(CONFIG_NF_CONNTRACK_MARK)
+	const struct flow_offload_tuple *tuple = (void *)cookie;
+	struct flow_offload_tuple_rhash *th;
+	struct flow_offload *flow;
+	u32 mark;
+
+	th = container_of(tuple, struct flow_offload_tuple_rhash, tuple);
+	flow = container_of(th, struct flow_offload, tuplehash[tuple->dir]);
+	mark = READ_ONCE(flow->ct->mark);
+	if (mark & 0x80)
+		return 0x80 | (mark & 0x3f);
+#endif
+	return 0;
+}
+
+/* Only the DSCP bits: the ECN field stays as the sender and the path set it. */
+static void ppe_flow_dscp_apply(struct sk_buff *skb, u8 dscp)
+{
+	if (skb->protocol == htons(ETH_P_IP))
+		ipv4_change_dsfield(ip_hdr(skb), INET_ECN_MASK, dscp << 2);
+	else if (skb->protocol == htons(ETH_P_IPV6))
+		ipv6_change_dsfield(ipv6_hdr(skb), INET_ECN_MASK, dscp << 2);
+}
+
+static void ppe_flow_slot_set(struct qca_ppe_priv *priv,
+			      struct ppe_flow_entry *entry, u32 index)
+{
+	WRITE_ONCE(priv->flow_dscp[index], entry->dscp);
+	WRITE_ONCE(priv->flow_vid[index], entry->vid);
+	WRITE_ONCE(priv->flow_ct[index], entry->ct);
+	WRITE_ONCE(priv->flow_xdev[index], entry->xdev);
+}
+
+static void ppe_flow_slot_clear(struct qca_ppe_priv *priv, u32 index)
+{
+	WRITE_ONCE(priv->flow_xdev[index], 0);
+	WRITE_ONCE(priv->flow_ct[index], 0);
+	WRITE_ONCE(priv->flow_dscp[index], 0);
+	WRITE_ONCE(priv->flow_vid[index], 0);
 }
 
 /* A frame the PPE routed to the CPU port for a flow whose egress is a
- * device outside the switch. It arrives finished, so it goes straight out.
+ * device outside the switch, or behind a software shaper. It arrives
+ * finished, so it goes straight out.
  */
 bool ppe_flow_xmit(struct dsa_switch *ds, struct sk_buff *skb, u32 flow)
 {
 	struct qca_ppe_priv *priv = ds_to_priv(ds);
-	struct net_device *dev;
-	int ifindex;
+	struct net_device *dev, *shaper, *uplink;
+	int xdev, up;
+	u8 dscp;
 
 	if (flow >= priv->data->num_flow_entries)
 		return false;
-	ifindex = READ_ONCE(priv->flow_xdev[flow]);
-	if (!ifindex)
+	xdev = READ_ONCE(priv->flow_xdev[flow]);
+	if (!xdev)
 		return false;
 
-	dev = dev_get_by_index_rcu(dev_net(skb->dev), ifindex);
+	dev = dev_get_by_index_rcu(dev_net(skb->dev), xdev & PPE_XDEV_IFINDEX);
 	if (unlikely(!dev || !netif_running(dev))) {
 		atomic_inc(&priv->flow_xmit_drop);
 		kfree_skb(skb);
 		return true;
+	}
+
+	/* An upload shaper may sit on an ifb in front of the uplink, as the
+	 * download one does: the frame is then built for the uplink and the
+	 * ifb hands it on there once its qdisc lets it go.
+	 */
+	uplink = dev;
+	up = READ_ONCE(priv->uplink_dev);
+	if ((xdev & PPE_XDEV_UL) && up && up != dev->ifindex) {
+		uplink = dev_get_by_index_rcu(dev_net(dev), up);
+		if (unlikely(!uplink || !netif_running(uplink))) {
+			atomic_inc(&priv->flow_xmit_drop);
+			kfree_skb(skb);
+			return true;
+		}
 	}
 
 	/* What the egress classifies on - tc, the Wi-Fi access category -
@@ -994,41 +1402,379 @@ bool ppe_flow_xmit(struct dsa_switch *ds, struct sk_buff *skb, u32 flow)
 	skb_set_network_header(skb, ETH_HLEN);
 	skb->protocol = eth_hdr(skb)->h_proto;
 	skb_set_hash(skb, hash_32(flow, 32), PKT_HASH_TYPE_L4);
+
+	/* An uplink that is not Ethernet, PPPoE's ppp device, takes the IP
+	 * packet and builds its own link header.
+	 */
+	if ((xdev & PPE_XDEV_UL) && uplink->type != ARPHRD_ETHER) {
+		__skb_pull(skb, ETH_HLEN);
+		skb_reset_network_header(skb);
+		skb_reset_mac_header(skb);
+	}
+
+	dscp = READ_ONCE(priv->flow_dscp[flow]);
+	if (dscp)
+		ppe_flow_dscp_apply(skb, dscp & 0x3f);
+
+	/* Into the download shaper the way act_mirred sends an egress frame
+	 * to an ifb: the ifb sends it on to skb_iif once its qdisc lets it go.
+	 * A shaper that has gone away leaves the frame unshaped, not lost.
+	 */
+	if (xdev & PPE_XDEV_DL) {
+		shaper = dev_get_by_index_rcu(dev_net(dev),
+					      READ_ONCE(priv->dl_shaper));
+		if (likely(shaper && netif_running(shaper))) {
+			u16 vid = READ_ONCE(priv->flow_vid[flow]);
+
+			atomic64_add(skb->len, &priv->dl_handoff_bytes);
+
+			skb->skb_iif = dev->ifindex;
+			skb_set_redirected(skb, false);
+			skb->dev = shaper;
+			if (vid)
+				__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
+						       vid);
+		} else {
+			atomic_inc(&priv->flow_shaper_miss);
+		}
+	} else if (xdev & PPE_XDEV_UL) {
+		atomic64_add(skb->len, &priv->ul_handoff_bytes);
+		ppe_flow_ct_attach(priv, skb, flow);
+		if (uplink != dev) {
+			skb->skb_iif = uplink->ifindex;
+			skb_set_redirected(skb, false);
+		}
+	}
+
 	dev_queue_xmit(skb);
 	return true;
 }
 
-/* Build the egress L3 interface, nexthop and public-address entries this rule
- * needs, and program any that were not already in use by another flow.
+/* Flows already handed over keep the DSCP they were built with, so a change
+ * rebuilds them.
  */
-static int ppe_flow_alloc_egress(struct qca_ppe_priv *priv,
-				 struct ppe_flow_data *data, bool snat,
-				 bool dnat, struct ppe_flow_entry *entry)
+void ppe_flow_ct_dscp_set(struct qca_ppe_priv *priv, bool on)
 {
-	u32 words[PPE_NEXTHOP_WORDS] = {};
+	guard(mutex)(&priv->flow_lock);
+	guard(mutex)(&priv->vlan_lock);
+
+	if (priv->ct_dscp == on)
+		return;
+	priv->ct_dscp = on;
+	ppe_flow_shaper_drop(priv, false);
+	ppe_flow_shaper_drop(priv, true);
+}
+
+#define PPE_HYBRID_PERIOD_MS	100
+
+static uint ppe_hybrid_hold_ms = 2000;
+module_param_named(hybrid_hold_ms, ppe_hybrid_hold_ms, uint, 0644);
+MODULE_PARM_DESC(hybrid_hold_ms,
+		 "How long the handed-over upload must stay below hybrid_demote_pct before its flows return to the switch");
+
+static uint ppe_hybrid_demote_pct = 60;
+module_param_named(hybrid_demote_pct, ppe_hybrid_demote_pct, uint, 0644);
+MODULE_PARM_DESC(hybrid_demote_pct,
+		 "Share of the uplink port's shaper rate the handed-over upload must stay below to return to the switch");
+
+/* Move one direction between its hardware path and its qdisc in place: every
+ * shaped nexthop of the direction is rewritten to the other path, which the
+ * flows behind it take from their next frame on, and the downloads to Wi-Fi,
+ * which reach the CPU on either path, change only where ppe_flow_xmit() sends
+ * them. A nexthop is four words that commit on the last.
+ */
+static void ppe_flow_hybrid_apply(struct qca_ppe_priv *priv, int dir, bool cake)
+{
+	struct ppe_flow_entry *entry;
+	u32 i;
+
+	lockdep_assert_held(&priv->flow_lock);
+
+	for (i = 0; i < priv->data->num_nexthop_entries; i++) {
+		struct ppe_nh_hyb *h = &priv->nh_hyb[i];
+
+		if (h->dir == dir && priv->nexthop[i].refcount)
+			ppe_tbl_write(priv, PPE_IN_NEXTHOP_TBL(i),
+				      cake ? h->handoff : h->direct,
+				      PPE_NEXTHOP_WORDS);
+	}
+
+	if (dir != PPE_XDEV_DL)
+		return;
+
+	list_for_each_entry(entry, &priv->flow_list, list) {
+		if (!entry->hyb_wifi)
+			continue;
+		if (cake)
+			entry->xdev |= PPE_XDEV_DL;
+		else
+			entry->xdev &= ~PPE_XDEV_DL;
+		WRITE_ONCE(priv->flow_xdev[entry->index], entry->xdev);
+	}
+}
+
+/* The hardware queue on the uplink built past hybrid_promote_us: hand the
+ * upload to its qdisc. Called by the AQM tick, so the flows are moved from
+ * a work item, which the flag already steers new flows ahead of.
+ */
+void ppe_flow_hybrid_promote(struct qca_ppe_priv *priv)
+{
+	if (!READ_ONCE(priv->hybrid) || READ_ONCE(priv->ul_cake))
+		return;
+
+	WRITE_ONCE(priv->ul_cake, true);
+	priv->hybrid_promotes++;
+	queue_work(system_highpri_wq, &priv->hybrid_work);
+}
+
+static void ppe_flow_hybrid_work(struct work_struct *work)
+{
+	struct qca_ppe_priv *priv = container_of(work, struct qca_ppe_priv,
+						 hybrid_work);
+
+	scoped_guard(mutex, &priv->flow_lock) {
+		guard(mutex)(&priv->vlan_lock);
+
+		if (!READ_ONCE(priv->ul_cake))
+			return;
+		ppe_flow_hybrid_apply(priv, PPE_XDEV_UL, true);
+		priv->ul_low_since = 0;
+		priv->ul_hyb_bytes = atomic64_read(&priv->ul_handoff_bytes);
+	}
+
+	schedule_delayed_work(&priv->hybrid_dwork,
+			      msecs_to_jiffies(PPE_HYBRID_PERIOD_MS));
+}
+
+/* The upload goes back to the switch once what was handed over has stayed
+ * well below the rate for hybrid_hold_ms: the qdisc has drained by then, so
+ * the hardware path cannot overtake frames still queued in it.
+ */
+static void ppe_flow_hybrid_dwork(struct work_struct *work)
+{
+	struct qca_ppe_priv *priv = container_of(work, struct qca_ppe_priv,
+						 hybrid_dwork.work);
+	u64 bytes = atomic64_read(&priv->ul_handoff_bytes);
+	u64 sent = bytes - priv->ul_hyb_bytes, rate;
+	int port = READ_ONCE(priv->ul_port);
+
+	priv->ul_hyb_bytes = bytes;
+	if (!READ_ONCE(priv->hybrid) || !READ_ONCE(priv->ul_cake))
+		return;
+	/* Without an uplink or its rate, as across a PPPoE reconnect, the
+	 * upload stays with its qdisc until they are back.
+	 */
+	rate = port < 0 ? 0 : priv->shaper[port].rate_bps;
+	sent *= BITS_PER_BYTE * (MSEC_PER_SEC / PPE_HYBRID_PERIOD_MS) * 100;
+	if (!rate || sent >= rate * ppe_hybrid_demote_pct) {
+		priv->ul_low_since = 0;
+	} else if (!priv->ul_low_since) {
+		priv->ul_low_since = jiffies ?: 1;
+	} else if (time_after_eq(jiffies, priv->ul_low_since +
+				 msecs_to_jiffies(ppe_hybrid_hold_ms))) {
+		guard(mutex)(&priv->flow_lock);
+		guard(mutex)(&priv->vlan_lock);
+
+		WRITE_ONCE(priv->ul_cake, false);
+		priv->hybrid_demotes++;
+		ppe_flow_hybrid_apply(priv, PPE_XDEV_UL, false);
+		return;
+	}
+
+	schedule_delayed_work(&priv->hybrid_dwork,
+			      msecs_to_jiffies(PPE_HYBRID_PERIOD_MS));
+}
+
+/* The download reached its rate: hand it to its qdisc, as for upload. */
+void ppe_flow_hybrid_dl_promote(struct qca_ppe_priv *priv)
+{
+	if (!READ_ONCE(priv->hybrid) || READ_ONCE(priv->dl_cake))
+		return;
+
+	WRITE_ONCE(priv->dl_cake, true);
+	priv->hybrid_dl_promotes++;
+	queue_work(system_highpri_wq, &priv->hybrid_dl_work);
+}
+
+static void ppe_flow_hybrid_dl_work(struct work_struct *work)
+{
+	struct qca_ppe_priv *priv = container_of(work, struct qca_ppe_priv,
+						 hybrid_dl_work);
+
+	scoped_guard(mutex, &priv->flow_lock) {
+		guard(mutex)(&priv->vlan_lock);
+
+		if (!READ_ONCE(priv->dl_cake))
+			return;
+		ppe_flow_hybrid_apply(priv, PPE_XDEV_DL, true);
+		priv->dl_low_since = 0;
+	}
+
+	schedule_delayed_work(&priv->hybrid_dl_dwork,
+			      msecs_to_jiffies(PPE_HYBRID_PERIOD_MS));
+}
+
+/* Back to the hardware path once the download has stayed well below the
+ * meter's rate for hybrid_hold_ms, by which time its qdisc has drained. The
+ * rate is the meter's, which counts the whole download the port takes in:
+ * just after a promotion the flows run in software until the flowtable
+ * offloads them again, and what was handed over would read as idle.
+ */
+static void ppe_flow_hybrid_dl_dwork(struct work_struct *work)
+{
+	struct qca_ppe_priv *priv = container_of(work, struct qca_ppe_priv,
+						 hybrid_dl_dwork.work);
+	int port = READ_ONCE(priv->ul_port);
+	u64 rate;
+
+	if (!READ_ONCE(priv->hybrid) || !READ_ONCE(priv->dl_cake))
+		return;
+	rate = port < 0 ? 0 : READ_ONCE(priv->meter_count_bps[port]);
+	if (!rate ||
+	    READ_ONCE(priv->dl_meter_bps) * 100 >= rate * ppe_hybrid_demote_pct) {
+		priv->dl_low_since = 0;
+	} else if (!priv->dl_low_since) {
+		priv->dl_low_since = jiffies ?: 1;
+	} else if (time_after_eq(jiffies, priv->dl_low_since +
+				 msecs_to_jiffies(ppe_hybrid_hold_ms))) {
+		guard(mutex)(&priv->flow_lock);
+		guard(mutex)(&priv->vlan_lock);
+
+		WRITE_ONCE(priv->dl_cake, false);
+		priv->hybrid_dl_demotes++;
+		ppe_flow_hybrid_apply(priv, PPE_XDEV_DL, false);
+		return;
+	}
+
+	schedule_delayed_work(&priv->hybrid_dl_dwork,
+			      msecs_to_jiffies(PPE_HYBRID_PERIOD_MS));
+}
+
+/* Turning hybrid on or off changes the path of every shaped flow. */
+void ppe_flow_hybrid_set(struct qca_ppe_priv *priv, bool on)
+{
+	scoped_guard(mutex, &priv->flow_lock) {
+		guard(mutex)(&priv->vlan_lock);
+
+		if (priv->hybrid == on)
+			return;
+		WRITE_ONCE(priv->hybrid, on);
+		if (priv->ul_cake)
+			priv->hybrid_demotes++;
+		if (priv->dl_cake)
+			priv->hybrid_dl_demotes++;
+		WRITE_ONCE(priv->ul_cake, false);
+		WRITE_ONCE(priv->dl_cake, false);
+		ppe_flow_shaper_drop(priv, true);
+		ppe_flow_shaper_drop(priv, false);
+	}
+
+	wake_up(&priv->aqm.wait);
+}
+
+void ppe_flow_uplink_get(struct qca_ppe_priv *priv, char *name)
+{
+	guard(mutex)(&priv->flow_lock);
+
+	strscpy(name, priv->uplink_name, IFNAMSIZ);
+}
+
+/* Name the WAN's L3 device, or clear it with an empty name. It decides which
+ * flows are the shaped ones in both directions, so the flows of both are
+ * rebuilt.
+ */
+int ppe_flow_uplink_set(struct qca_ppe_priv *priv, const char *name)
+{
+	struct net_device *dev;
+	int ifindex = 0;
+
+	if (*name) {
+		dev = dev_get_by_name(&init_net, name);
+		if (!dev)
+			return -ENODEV;
+		ifindex = dev->ifindex;
+		dev_put(dev);
+	}
+
+	guard(mutex)(&priv->flow_lock);
+	guard(mutex)(&priv->vlan_lock);
+
+	priv->uplink_dev = ifindex;
+	strscpy(priv->uplink_name, name, IFNAMSIZ);
+	ppe_flow_shaper_path(priv);
+	ppe_flow_shaper_drop(priv, false);
+	ppe_flow_shaper_drop(priv, true);
+
+	return 0;
+}
+
+void ppe_flow_shaper_get(struct qca_ppe_priv *priv, bool upload, char *name)
+{
+	guard(mutex)(&priv->flow_lock);
+
+	strscpy(name, upload ? priv->ul_shaper_name : priv->dl_shaper_name,
+		IFNAMSIZ);
+}
+
+/* Name the device whose qdisc shapes one direction, or clear it with an
+ * empty name. The flows of that direction already in the table were built
+ * for the old path, so they are dropped and the flowtable offloads them
+ * again on the new one.
+ */
+int ppe_flow_shaper_set(struct qca_ppe_priv *priv, bool upload,
+			const char *name)
+{
+	struct net_device *dev;
+	int ifindex = 0;
+
+	if (*name) {
+		dev = dev_get_by_name(&init_net, name);
+		if (!dev)
+			return -ENODEV;
+		ifindex = dev->ifindex;
+		dev_put(dev);
+		if (ifindex > PPE_XDEV_IFINDEX)
+			return -ERANGE;
+	}
+
+	guard(mutex)(&priv->flow_lock);
+	guard(mutex)(&priv->vlan_lock);
+
+	if (upload) {
+		WRITE_ONCE(priv->ul_shaper, ifindex);
+		strscpy(priv->ul_shaper_name, name, IFNAMSIZ);
+		/* The uplink decides which downloads are shaped as well. */
+		ppe_flow_shaper_path(priv);
+		ppe_flow_shaper_drop(priv, false);
+	} else {
+		WRITE_ONCE(priv->dl_shaper, ifindex);
+		strscpy(priv->dl_shaper_name, name, IFNAMSIZ);
+	}
+
+	ppe_flow_shaper_drop(priv, upload);
+
+	return 0;
+}
+
+/* One path's egress L3 interface and nexthop words: out of @port with the
+ * headers pushed in hardware (@push), or handed over through the CPU port for
+ * the host to build them. Returns the egress interface index.
+ */
+static int ppe_flow_egress_path(struct qca_ppe_priv *priv,
+				struct ppe_flow_data *data,
+				struct ppe_flow_entry *entry, int port,
+				int nh_port, bool push, bool snat, bool dnat,
+				u32 *nh)
+{
+	u32 words[PPE_NEXTHOP_WORDS + 1] = {};
 	struct dsa_port *odp;
+	int eg_l3_if, ret;
 	u32 eg_mtu;
 	u64 mac;
-	int port, ret;
-
-	port = ppe_flow_port_by_ifindex(priv, data->odev->ifindex);
-	if (port < 0 && ppe_cpu_xmit_ok(data)) {
-		port = QCA_PPE_CPU_PORT;
-		entry->xdev = data->odev->ifindex;
-	}
-	if (port < 0)
-		return port;
-
-	entry->oport = port;
-	/* An untagged egress is credited to the port's PVID VLAN, the one an
-	 * untagged frame on that port belongs to.
-	 */
-	entry->ovid = data->vlan_valid ? data->vlan_id :
-		      ppe_port_pvid(priv, port);
 
 	mac = ether_addr_to_u64(data->eth.h_source);
 	ppe_entry_set(words, PPE_EG_L3_IF_MAC_OFF, PPE_EG_L3_IF_MAC_LEN, mac);
-	if (data->pppoe_valid) {
+	if (data->pppoe_valid && push) {
 		ppe_entry_set(words, PPE_EG_L3_IF_SESSION_OFF,
 			      PPE_EG_L3_IF_SESSION_LEN, data->pppoe_sid);
 		ppe_entry_set(words, PPE_EG_L3_IF_PPPOE_EN_OFF,
@@ -1042,7 +1788,29 @@ static int ppe_flow_alloc_egress(struct qca_ppe_priv *priv,
 	 * separate entries when they do not share a size.
 	 */
 	odp = dsa_to_port(&priv->ds, port);
-	eg_mtu = odp->user->mtu + ETH_HLEN + (data->vlan_valid ? VLAN_HLEN : 0);
+	eg_mtu = odp->user->mtu + ETH_HLEN +
+		 (data->vlan_valid && push ? VLAN_HLEN : 0) +
+		 (data->svlan_valid && push ? VLAN_HLEN : 0);
+	/* A flow handed to the uplink device leaves at that device's size,
+	 * which for PPPoE is under the port's; a larger frame then takes the
+	 * host's path, which fragments it or answers with ICMP.
+	 */
+	if (!push) {
+		int ifindex = entry->xdev & PPE_XDEV_IFINDEX;
+		struct net_device *ul;
+
+		/* An upload shaper on an ifb hands the frame on to the uplink,
+		 * whose size is the one that counts.
+		 */
+		if ((entry->xdev & PPE_XDEV_UL) && READ_ONCE(priv->uplink_dev))
+			ifindex = READ_ONCE(priv->uplink_dev);
+
+		rcu_read_lock();
+		ul = dev_get_by_index_rcu(&init_net, ifindex);
+		if (ul)
+			eg_mtu = min_t(u32, eg_mtu, ul->mtu + ETH_HLEN);
+		rcu_read_unlock();
+	}
 	words[PPE_EG_L3_IF_WORDS] = eg_mtu;
 
 	/* An L3 interface is one index with an ingress half and an egress half.
@@ -1056,12 +1824,93 @@ static int ppe_flow_alloc_egress(struct qca_ppe_priv *priv,
 			  PPE_EG_L3_IF_WORDS + 1);
 	if (ret < 0)
 		return ret;
-	entry->eg_l3_if = ret + PPE_VSI_MAX;
-	if (priv->eg_l3_if[entry->eg_l3_if].refcount == 1) {
-		ppe_tbl_write(priv, PPE_EG_L3_IF_TBL(entry->eg_l3_if), words,
+	eg_l3_if = ret + PPE_VSI_MAX;
+	if (priv->eg_l3_if[eg_l3_if].refcount == 1) {
+		ppe_tbl_write(priv, PPE_EG_L3_IF_TBL(eg_l3_if), words,
 			      PPE_EG_L3_IF_WORDS);
-		ppe_eg_l3_if_mtu_set(priv, entry->eg_l3_if, eg_mtu);
+		ppe_eg_l3_if_mtu_set(priv, eg_l3_if, eg_mtu);
 	}
+
+	memset(nh, 0, PPE_NEXTHOP_WORDS * sizeof(*nh));
+	/* Type selects how the port field is read: as a physical port (1) or,
+	 * left at 0, as a VSI whose FDB resolves the port. The egress port is
+	 * known exactly here, so name it directly; left at 0 the port number
+	 * would be read as a VSI.
+	 */
+	ppe_entry_set(nh, PPE_NEXTHOP_TYPE_OFF, PPE_NEXTHOP_TYPE_LEN,
+		      PPE_NEXTHOP_TYPE_PORT);
+	ppe_entry_set(nh, PPE_NEXTHOP_PORT_OFF, PPE_NEXTHOP_PORT_LEN, nh_port);
+	ppe_entry_set(nh, PPE_NEXTHOP_POST_L3_IF_OFF,
+		      PPE_NEXTHOP_POST_L3_IF_LEN, eg_l3_if);
+	if (data->svlan_valid && push) {
+		ppe_entry_set(nh, PPE_NEXTHOP_STAG_FMT_OFF,
+			      PPE_NEXTHOP_STAG_FMT_LEN, 1);
+		ppe_entry_set(nh, PPE_NEXTHOP_SVID_OFF,
+			      PPE_NEXTHOP_SVID_LEN, data->svlan_id);
+	}
+	if (data->vlan_valid && push) {
+		ppe_entry_set(nh, PPE_NEXTHOP_CTAG_FMT_OFF,
+			      PPE_NEXTHOP_CTAG_FMT_LEN, 1);
+		ppe_entry_set(nh, PPE_NEXTHOP_CVID_OFF,
+			      PPE_NEXTHOP_CVID_LEN, data->vlan_id);
+	}
+	if (snat)
+		ppe_entry_set(nh, PPE_NEXTHOP_PUB_IP_IDX_OFF,
+			      PPE_NEXTHOP_PUB_IP_IDX_LEN, entry->pub_ip);
+	ppe_entry_set(nh, PPE_NEXTHOP_MAC_OFF, PPE_NEXTHOP_MAC_LEN,
+		      ether_addr_to_u64(data->eth.h_dest));
+	if (dnat)
+		ppe_entry_set(nh, PPE_NEXTHOP_DNAT_IP_OFF,
+			      PPE_NEXTHOP_DNAT_IP_LEN, ntohl(data->v4_dst_new));
+
+	return eg_l3_if;
+}
+
+/* Build the egress L3 interface, nexthop and public-address entries this rule
+ * needs, and program any that were not already in use by another flow.
+ *
+ * A flow of a shaped direction on a switch port gets both paths, so hybrid
+ * can switch it in place: its nexthop is keyed by the direct path and the
+ * direction, and holds whichever path the direction is on. A download to
+ * Wi-Fi reaches the CPU on either path and switches by its xdev instead.
+ */
+static int ppe_flow_alloc_egress(struct qca_ppe_priv *priv,
+				 struct ppe_flow_data *data, bool snat,
+				 bool dnat, struct ppe_flow_entry *entry)
+{
+	u32 key[PPE_NEXTHOP_WORDS + 1] = {}, alt[PPE_NEXTHOP_WORDS];
+	struct dsa_port *odp;
+	int port, nh_port, ret, dir;
+	bool push, direct;
+
+	port = ppe_flow_port_by_ifindex(priv, data->odev->ifindex);
+	if (port < 0 && ppe_cpu_xmit_ok(data)) {
+		port = QCA_PPE_CPU_PORT;
+		entry->xdev = data->odev->ifindex;
+	}
+	if (port < 0)
+		return port;
+	odp = dsa_to_port(&priv->ds, port);
+
+	/* A flow handed to a shaper leaves the switch by the CPU port with its
+	 * link headers still to be built by the host: an upload's PPPoE and
+	 * VLAN by the uplink device, a download's LAN VLAN tag by
+	 * ppe_flow_xmit(). An upload keeps the uplink below, which is what
+	 * lets its reverse offload.
+	 */
+	nh_port = ppe_flow_shape(priv, data, entry, port);
+	dir = entry->xdev & (PPE_XDEV_UL | PPE_XDEV_DL);
+	push = !dir;
+	direct = dir == PPE_XDEV_UL ? ppe_flow_ul_direct(priv) :
+		 dir == PPE_XDEV_DL ? ppe_flow_dl_direct(priv) : false;
+
+	entry->oport = nh_port;
+	/* An untagged egress is credited to the port's PVID VLAN, the one an
+	 * untagged frame on that port belongs to.
+	 */
+	entry->ovid = data->vlan_valid && !(entry->xdev & PPE_XDEV_UL) ?
+		      data->vlan_id :
+		      ppe_port_pvid(priv, nh_port);
 
 	if (snat) {
 		u32 pub = ntohl(data->v4_src_new);
@@ -1074,40 +1923,49 @@ static int ppe_flow_alloc_egress(struct qca_ppe_priv *priv,
 			regmap_write(priv->regmap, PPE_PUB_IP_TBL(ret), pub);
 	}
 
-	memset(words, 0, sizeof(words));
-	/* Type selects how the port field is read: as a physical port (1) or,
-	 * left at 0, as a VSI whose FDB resolves the port. The egress port is
-	 * known exactly here, so name it directly; left at 0 the port number
-	 * would be read as a VSI.
-	 */
-	ppe_entry_set(words, PPE_NEXTHOP_TYPE_OFF, PPE_NEXTHOP_TYPE_LEN,
-		      PPE_NEXTHOP_TYPE_PORT);
-	ppe_entry_set(words, PPE_NEXTHOP_PORT_OFF, PPE_NEXTHOP_PORT_LEN, port);
-	ppe_entry_set(words, PPE_NEXTHOP_POST_L3_IF_OFF,
-		      PPE_NEXTHOP_POST_L3_IF_LEN, entry->eg_l3_if);
-	if (data->vlan_valid) {
-		ppe_entry_set(words, PPE_NEXTHOP_CTAG_FMT_OFF,
-			      PPE_NEXTHOP_CTAG_FMT_LEN, 1);
-		ppe_entry_set(words, PPE_NEXTHOP_CVID_OFF,
-			      PPE_NEXTHOP_CVID_LEN, data->vlan_id);
-	}
-	if (snat)
-		ppe_entry_set(words, PPE_NEXTHOP_PUB_IP_IDX_OFF,
-			      PPE_NEXTHOP_PUB_IP_IDX_LEN, entry->pub_ip);
-	ppe_entry_set(words, PPE_NEXTHOP_MAC_OFF, PPE_NEXTHOP_MAC_LEN,
-		      ether_addr_to_u64(data->eth.h_dest));
-	if (dnat)
-		ppe_entry_set(words, PPE_NEXTHOP_DNAT_IP_OFF,
-			      PPE_NEXTHOP_DNAT_IP_LEN, ntohl(data->v4_dst_new));
+	ret = ppe_flow_egress_path(priv, data, entry, port, nh_port, push,
+				   snat, dnat, key);
+	if (ret < 0)
+		goto err;
+	entry->eg_l3_if = ret;
 
-	ret = ppe_res_get(priv->nexthop, priv->data->num_nexthop_entries, words,
-			  PPE_NEXTHOP_WORDS);
+	if (dir && port != QCA_PPE_CPU_PORT) {
+		/* The key is the direct path, so a handed-over flow and its
+		 * direct twin share one nexthop, tagged with the direction so
+		 * that no unshaped flow ever shares it.
+		 */
+		memcpy(alt, key, sizeof(alt));
+		ret = ppe_flow_egress_path(priv, data, entry, port, port, true,
+					   snat, dnat, key);
+		if (ret < 0)
+			goto err;
+		entry->eg_l3_if_alt = ret;
+		key[PPE_NEXTHOP_WORDS] = dir;
+	} else if (dir) {
+		/* A download to Wi-Fi: the path is the CPU port either way. */
+		entry->hyb_wifi = true;
+		if (direct)
+			entry->xdev &= ~PPE_XDEV_DL;
+	}
+
+	ret = ppe_res_get(priv->nexthop, priv->data->num_nexthop_entries, key,
+			  PPE_NEXTHOP_WORDS + 1);
 	if (ret < 0)
 		goto err;
 	entry->nexthop = ret;
-	if (priv->nexthop[ret].refcount == 1)
-		ppe_tbl_write(priv, PPE_IN_NEXTHOP_TBL(ret), words,
+	if (priv->nexthop[ret].refcount == 1) {
+		struct ppe_nh_hyb *h = &priv->nh_hyb[ret];
+
+		h->dir = 0;
+		if (key[PPE_NEXTHOP_WORDS]) {
+			memcpy(h->direct, key, sizeof(h->direct));
+			memcpy(h->handoff, alt, sizeof(h->handoff));
+			h->dir = dir;
+		}
+		ppe_tbl_write(priv, PPE_IN_NEXTHOP_TBL(ret),
+			      h->dir && !direct ? h->handoff : key,
 			      PPE_NEXTHOP_WORDS);
+	}
 
 	/* The reverse of a flow that egresses PPPoE, or a VLAN of a port no
 	 * bridge classifies, arrives the same way on this port; set the port up
@@ -1116,6 +1974,7 @@ static int ppe_flow_alloc_egress(struct qca_ppe_priv *priv,
 	if (data->pppoe_valid ||
 	    (data->vlan_valid && !priv->port_br_dev[port])) {
 		ret = ppe_uplink_get(priv, port,
+				     data->svlan_valid ? data->svlan_id : 0,
 				     data->vlan_valid ? data->vlan_id : 0,
 				     data->eth.h_source, odp->user->mtu);
 		if (ret < 0)
@@ -1260,9 +2119,12 @@ static void ppe_flow_entry_destroy(struct qca_ppe_priv *priv,
 	/* A slot handed on may carry another flow's egress by now. */
 	if (age != -ENOENT) {
 		if (entry->xdev)
-			WRITE_ONCE(priv->flow_xdev[entry->index], 0);
+			ppe_flow_slot_clear(priv, entry->index);
 		ppe_flow_entry_delete(priv, entry->index);
 	}
+	/* The conntrack core may be a module: put it through its hook. */
+	if (entry->ct)
+		nf_conntrack_put(&((struct nf_conn *)(entry->ct & ~1UL))->ct_general);
 	ppe_host_ref_put(priv, entry->host_index);
 	ppe_flow_free_egress(priv, entry);
 	ppe_flow_free_ingress(priv, entry);
@@ -1384,15 +2246,34 @@ static int ppe_flow_offload_replace(struct ppe_flow_block *fb,
 	 * A tag this driver has no classification for, and a second tag,
 	 * stay in software.
 	 */
-	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CVLAN))
-		return ppe_flow_reject(priv, PPE_REJECT_INGRESS_VLAN);
+	/* One 802.1Q tag, or QinQ: an 802.1ad outer tag over an 802.1Q one,
+	 * the TPIDs the switch parses S- and C-tags by.
+	 */
 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN)) {
-		struct flow_match_vlan match;
+		struct flow_match_vlan match, cmatch;
 
 		flow_rule_match_vlan(rule, &match);
-		if (match.key->vlan_tpid != htons(ETH_P_8021Q))
+		if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CVLAN)) {
+			/* Once a QinQ uplink routes in hardware, the frames of
+			 * its PPPoE session that miss the flow table never
+			 * reach the CPU, LCP included, and the session drops.
+			 * Until that is fixed, QinQ flows stay in software.
+			 */
 			return ppe_flow_reject(priv, PPE_REJECT_INGRESS_VLAN);
-		data.ivid = match.key->vlan_id;
+			flow_rule_match_cvlan(rule, &cmatch);
+			if (match.key->vlan_tpid != htons(ETH_P_8021AD) ||
+			    cmatch.key->vlan_tpid != htons(ETH_P_8021Q))
+				return ppe_flow_reject(priv,
+						       PPE_REJECT_INGRESS_VLAN);
+			data.isvid = match.key->vlan_id;
+			data.ivid = cmatch.key->vlan_id;
+		} else if (match.key->vlan_tpid != htons(ETH_P_8021Q)) {
+			return ppe_flow_reject(priv, PPE_REJECT_INGRESS_VLAN);
+		} else {
+			data.ivid = match.key->vlan_id;
+		}
+	} else if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CVLAN)) {
+		return ppe_flow_reject(priv, PPE_REJECT_INGRESS_VLAN);
 	}
 
 	/* A replace for a cookie already held is the kernel refreshing a flow
@@ -1406,7 +2287,8 @@ static int ppe_flow_offload_replace(struct ppe_flow_block *fb,
 	entry = rhashtable_lookup_fast(&priv->flow_table, &f->cookie,
 				       ppe_flow_ht_params);
 	if (entry) {
-		if (entry->src_if == ppe_flow_src_if(priv, iport, data.ivid) &&
+		if (entry->src_if == ppe_flow_src_if(priv, iport, data.isvid,
+						     data.ivid) &&
 		    ppe_flow_entry_age(priv, entry) >= 0)
 			return 0;
 
@@ -1462,6 +2344,19 @@ static int ppe_flow_offload_replace(struct ppe_flow_block *fb,
 		case FLOW_ACTION_CSUM:
 			break;
 		case FLOW_ACTION_VLAN_PUSH:
+			/* The TPID tells the tags apart, whatever order the
+			 * pushes come in: 802.1ad is the outer S-tag.
+			 */
+			if (act->vlan.proto == htons(ETH_P_8021AD)) {
+				/* QinQ uplinks stay in software, see above. */
+				return ppe_flow_reject(priv, PPE_REJECT_ACTION);
+				if (data.svlan_valid)
+					return ppe_flow_reject(priv,
+							       PPE_REJECT_ACTION);
+				data.svlan_id = act->vlan.vid;
+				data.svlan_valid = true;
+				break;
+			}
 			if (data.vlan_valid ||
 			    act->vlan.proto != htons(ETH_P_8021Q))
 				return ppe_flow_reject(priv, PPE_REJECT_ACTION);
@@ -1475,9 +2370,13 @@ static int ppe_flow_offload_replace(struct ppe_flow_block *fb,
 			 */
 			break;
 		case FLOW_ACTION_PRIORITY:
-			if (act->priority > PPE_QOS_MAX_PRI)
-				return ppe_flow_reject(priv, PPE_REJECT_ACTION);
-			data.priority = act->priority;
+			/* A priority the profiles cannot hold, such as the
+			 * 802.1d tags of 256 and up that Wi-Fi stamps take,
+			 * leaves the flow to DSCP: refusing it would send the
+			 * whole flow to the CPU for the sake of its queue.
+			 */
+			if (act->priority <= PPE_QOS_MAX_PRI)
+				data.priority = act->priority;
 			break;
 		case FLOW_ACTION_PPPOE_PUSH:
 			if (data.pppoe_valid)
@@ -1489,6 +2388,10 @@ static int ppe_flow_offload_replace(struct ppe_flow_block *fb,
 			return ppe_flow_reject(priv, PPE_REJECT_ACTION);
 		}
 	}
+
+	/* An S-tag is only pushed outside a C-tag. */
+	if (data.svlan_valid && !data.vlan_valid)
+		return ppe_flow_reject(priv, PPE_REJECT_ACTION);
 
 	if (!data.odev || !is_valid_ether_addr(data.eth.h_source) ||
 	    !is_valid_ether_addr(data.eth.h_dest))
@@ -1579,6 +2482,7 @@ static int ppe_flow_offload_replace(struct ppe_flow_block *fb,
 	entry->block = fb->block;
 	entry->nexthop = -1;
 	entry->eg_l3_if = -1;
+	entry->eg_l3_if_alt = -1;
 	entry->pub_ip = -1;
 	entry->my_mac = -1;
 	entry->l3_if = -1;
@@ -1587,7 +2491,7 @@ static int ppe_flow_offload_replace(struct ppe_flow_block *fb,
 	entry->session = -1;
 	entry->iport = iport;
 
-	ret = ppe_flow_alloc_ingress(priv, iport, data.ivid, entry);
+	ret = ppe_flow_alloc_ingress(priv, iport, data.isvid, data.ivid, entry);
 	if (ret) {
 		priv->flow_reject[ret == -EOPNOTSUPP ? PPE_REJECT_INGRESS_VLAN :
 				  PPE_REJECT_RESOURCE]++;
@@ -1615,8 +2519,12 @@ static int ppe_flow_offload_replace(struct ppe_flow_block *fb,
 	}
 
 	ppe_host_ref_get(priv, entry->host_index);
+	if (entry->xdev & PPE_XDEV_UL)
+		entry->ct = ppe_flow_ct_get(f->cookie);
+	if (entry->xdev && priv->ct_dscp)
+		entry->dscp = ppe_flow_ct_dscp(f->cookie);
 	if (entry->xdev)
-		WRITE_ONCE(priv->flow_xdev[entry->index], entry->xdev);
+		ppe_flow_slot_set(priv, entry, entry->index);
 
 	/* The hardware writes the host index it resolved into the entry and
 	 * counts the age down from there, so the stored image carries the one
@@ -1874,7 +2782,7 @@ static int ppe_flow_profile_set(struct qca_ppe_priv *priv,
 	if (ret)
 		return ret;
 	if (entry->xdev)
-		WRITE_ONCE(priv->flow_xdev[entry->index], 0);
+		ppe_flow_slot_clear(priv, entry->index);
 
 	ret = ppe_flow_op(priv, PPE_TBL_OP_ADD, w, entry->nwords,
 			  entry->hwords, entry->nhwords, &index, &host_index);
@@ -1882,7 +2790,7 @@ static int ppe_flow_profile_set(struct qca_ppe_priv *priv,
 		return ret;
 	/* The re-added entry may sit in another slot, and its frames name it. */
 	if (entry->xdev)
-		WRITE_ONCE(priv->flow_xdev[index], entry->xdev);
+		ppe_flow_slot_set(priv, entry, index);
 
 	if (host_index != entry->host_index) {
 		ppe_host_ref_get(priv, host_index);
@@ -1963,14 +2871,24 @@ int ppe_flow_offload_init(struct qca_ppe_priv *priv)
 				    sizeof(*priv->pub_ip), GFP_KERNEL);
 	priv->nexthop = devm_kcalloc(dev, priv->data->num_nexthop_entries,
 				     sizeof(*priv->nexthop), GFP_KERNEL);
+	priv->nh_hyb = devm_kcalloc(dev, priv->data->num_nexthop_entries,
+				    sizeof(*priv->nh_hyb), GFP_KERNEL);
 	priv->host_ref = devm_kcalloc(dev, priv->data->num_host_entries,
 				      sizeof(*priv->host_ref), GFP_KERNEL);
 	priv->my_mac = devm_kcalloc(dev, PPE_MY_MAC_ENTRIES,
 				    sizeof(*priv->my_mac), GFP_KERNEL);
 	priv->flow_xdev = devm_kcalloc(dev, priv->data->num_flow_entries,
 				       sizeof(*priv->flow_xdev), GFP_KERNEL);
-	if (!priv->eg_l3_if || !priv->pub_ip || !priv->nexthop ||
-	    !priv->host_ref || !priv->my_mac || !priv->flow_xdev)
+	priv->ul_port = -1;
+	priv->flow_ct = devm_kcalloc(dev, priv->data->num_flow_entries,
+				     sizeof(*priv->flow_ct), GFP_KERNEL);
+	priv->flow_dscp = devm_kcalloc(dev, priv->data->num_flow_entries,
+				       sizeof(*priv->flow_dscp), GFP_KERNEL);
+	priv->flow_vid = devm_kcalloc(dev, priv->data->num_flow_entries,
+				      sizeof(*priv->flow_vid), GFP_KERNEL);
+	if (!priv->eg_l3_if || !priv->pub_ip || !priv->nexthop || !priv->nh_hyb ||
+	    !priv->host_ref || !priv->my_mac || !priv->flow_xdev ||
+	    !priv->flow_ct || !priv->flow_dscp || !priv->flow_vid)
 		return -ENOMEM;
 
 	INIT_LIST_HEAD(&priv->flow_list);
@@ -1986,6 +2904,10 @@ int ppe_flow_offload_init(struct qca_ppe_priv *priv)
 		return ret;
 	}
 
+	INIT_WORK(&priv->hybrid_work, ppe_flow_hybrid_work);
+	INIT_DELAYED_WORK(&priv->hybrid_dwork, ppe_flow_hybrid_dwork);
+	INIT_WORK(&priv->hybrid_dl_work, ppe_flow_hybrid_dl_work);
+	INIT_DELAYED_WORK(&priv->hybrid_dl_dwork, ppe_flow_hybrid_dl_dwork);
 	INIT_DELAYED_WORK(&priv->sparse_work, ppe_sparse_work);
 	schedule_delayed_work(&priv->sparse_work,
 			      msecs_to_jiffies(PPE_SPARSE_PERIOD_MS));
@@ -1999,6 +2921,11 @@ void ppe_flow_offload_exit(struct qca_ppe_priv *priv)
 
 	unregister_netdevice_notifier(&priv->netdev_nb);
 	cancel_delayed_work_sync(&priv->sparse_work);
+	WRITE_ONCE(priv->hybrid, false);
+	cancel_work_sync(&priv->hybrid_work);
+	cancel_delayed_work_sync(&priv->hybrid_dwork);
+	cancel_work_sync(&priv->hybrid_dl_work);
+	cancel_delayed_work_sync(&priv->hybrid_dl_dwork);
 
 	mutex_lock(&priv->flow_lock);
 	mutex_lock(&priv->vlan_lock);
