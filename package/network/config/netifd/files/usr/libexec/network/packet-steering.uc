@@ -69,7 +69,7 @@ function set_netdev_cpu(dev, cpu, rx_queue) {
 	rx_queue ??= "rx-*";
 	let queues = glob(`/sys/class/net/${dev}/queues/${rx_queue}/rps_cpus`);
 	let val = cpu_mask(cpu);
-	if (disable)
+	if (disable || cpu == null)
 		val = 0;
 	for (let queue in queues) {
 		if (debug || do_nothing)
@@ -233,6 +233,16 @@ function assign_dev_cpu(dev) {
 	if (length(dev.rx_queues) > 1 &&
 		length(dev.rx_tasks) > 1)
 		return assign_dev_queues_cpu(dev);
+
+	// Hardware RSS with a softirq NAPI per queue already spreads the load
+	// over every CPU, as long as the driver spreads the queue interrupts;
+	// steering all queues to one CPU would funnel it back
+	if (!all_cpus && length(dev.rx_queues) >= length(cpus) &&
+	    !length(dev.rx_tasks)) {
+		for (let netdev in dev.netdev)
+			set_netdev_cpu(netdev, null);
+		return;
+	}
 
 	if (length(dev.tasks) > 0) {
 		let cpu = dev.napi_cpu = get_next_cpu(napi_weight);
