@@ -170,6 +170,13 @@ for (let dev in netdevs) {
 		let phy = `phy${phyidx}`;
 		if (index(pdev.phy, phy) < 0)
 			push(pdev.phy, phy);
+
+		// mac80211 gives the netdev one receive queue even when the
+		// driver spreads its receive rings over the CPUs by RSS
+		let wiphy = trim(readfile(`/sys/class/net/${dev}/phy80211/name`));
+		let hwflags = readfile(`/sys/kernel/debug/ieee80211/${wiphy}/hwflags`);
+		if (hwflags && index(hwflags, "USES_RSS") >= 0)
+			pdev.rss = true;
 	}
 
 	push(pdev.netdev, dev);
@@ -234,11 +241,12 @@ function assign_dev_cpu(dev) {
 		length(dev.rx_tasks) > 1)
 		return assign_dev_queues_cpu(dev);
 
-	// Hardware RSS with a softirq NAPI per queue already spreads the load
-	// over every CPU, as long as the driver spreads the queue interrupts;
-	// steering all queues to one CPU would funnel it back
-	if (!all_cpus && length(dev.rx_queues) >= length(cpus) &&
-	    !length(dev.rx_tasks)) {
+	// Hardware RSS with a softirq NAPI per queue or ring already spreads
+	// the load over every CPU, as long as the driver spreads the
+	// interrupts; steering it all to one CPU would funnel it back
+	let hw_spread = dev.rss ||
+		(length(dev.rx_queues) >= length(cpus) && !length(dev.rx_tasks));
+	if (!all_cpus && hw_spread) {
 		for (let netdev in dev.netdev)
 			set_netdev_cpu(netdev, null);
 		return;
