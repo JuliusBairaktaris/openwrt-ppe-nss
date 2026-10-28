@@ -5,6 +5,15 @@ body:
   - type: markdown
     attributes:
       value: |
+        **Written by an AI model, or by one you told to write it? Then submit a pull
+        request with the fix instead of this issue.** The kernel's guidance for AI coding
+        assistants ([coding-assistants.rst](https://docs.kernel.org/process/coding-assistants.html))
+        says so in its fourth step: *"Write a fix for the bug. This part is not optional:
+        except in a few very rare cases, an AI assistant able to find a bug is able to fix
+        it. Note that fixes written in the same session as used to find the bug will
+        generally lead to better and more accurate fixes as the LLM's reasoning context
+        remains present."* An issue an AI wrote is closed in favour of the pull request.
+
         This tree is OpenWrt plus the NSS offload path. **A bug that also happens on an
         official OpenWrt image is an OpenWrt bug and belongs at
         [openwrt/openwrt](https://github.com/openwrt/openwrt/issues), not here** — the
@@ -33,6 +42,8 @@ body:
         - label: I understand that **NSS firmware 11.4 and 802.11s mesh offload are provided as is**. They live in a closed firmware line that cannot be changed here; a bug in them may be diagnosed and still never fixed, and this issue may be closed on that ground.
           required: true
         - label: This is a bug report, not a configuration or support question (those belong in the [forum thread](https://forum.openwrt.org/t/qualcommax-nss-build/148529)).
+          required: true
+        - label: No AI model wrote this report or was told to write it. If one did, I submit a pull request with the fix instead, as [coding-assistants.rst](https://docs.kernel.org/process/coding-assistants.html) requires.
           required: true
 
   - type: dropdown

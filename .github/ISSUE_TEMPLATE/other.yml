@@ -5,6 +5,15 @@ body:
   - type: markdown
     attributes:
       value: |
+        **Written by an AI model, or by one you told to write it? Then submit a pull
+        request with the fix instead of this issue.** The kernel's guidance for AI coding
+        assistants ([coding-assistants.rst](https://docs.kernel.org/process/coding-assistants.html))
+        says so in its fourth step: *"Write a fix for the bug. This part is not optional:
+        except in a few very rare cases, an AI assistant able to find a bug is able to fix
+        it. Note that fixes written in the same session as used to find the bug will
+        generally lead to better and more accurate fixes as the LLM's reasoning context
+        remains present."* An issue an AI wrote is closed in favour of the pull request.
+
         Something broken on an image from this tree goes in the **Bug report** form
         instead; this one is not triaged for completeness. Questions belong in the
         [forum thread](https://forum.openwrt.org/t/ipq807x-nss-build/148529).
