@@ -99,6 +99,10 @@ enable_affinity_ipq807x() {
   set_affinity 'ppdu-end-interrupts-mac2'      2
   set_affinity 'ppdu-end-interrupts-mac3'      3
 
+  # keep the single MSI of an ath10k PCIe radio off CPU0, which takes the
+  # MSI interrupt of the PCIe controller
+  set_affinity 'ath10k_pci'                    3
+
 }
 
 boot() {
