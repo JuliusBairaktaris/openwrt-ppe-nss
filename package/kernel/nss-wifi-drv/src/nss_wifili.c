@@ -1150,8 +1150,10 @@ int nss_wifi_mesh_register(int id, struct net_device *dev, u8 radio,
 	core = nss_wifili_core;
 	if (!core || !soc->started)
 		return -EAGAIN;
-	/* The capability is asked of the internal instance alone. */
-	if (!core->mesh_capable || id)
+	/* The mesh nodes belong to the core, so every instance it drives,
+	 * a QCN9074 beside the SoC's radios included, can carry a mesh.
+	 */
+	if (!core->mesh_capable)
 		return -EOPNOTSUPP;
 	if (radio >= soc->pdevs || soc->radio_if[radio] < 0)
 		return -ENODEV;
