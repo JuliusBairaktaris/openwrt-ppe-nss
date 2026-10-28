@@ -547,6 +547,8 @@ struct nss_flow_br_dir {
 	int ifnum;
 	u32 mtu;
 	u8 dmac[ETH_ALEN];
+	u16 vid;		/* tag of the port this direction arrives on */
+	u16 vtpid;		/* 0: untagged */
 };
 
 int nss_flow_br_add(struct nf_conn *ct, const struct nss_flow_br_dir *dir,

@@ -1487,6 +1487,9 @@ int nss_flow_br_add(struct nf_conn *ct, const struct nss_flow_br_dir *dir,
 		e->dir[d].mtu = dir[d].mtu;
 		ether_addr_copy(e->dir[d].mac, dir[d].dmac);
 		e->dir[d].seen = true;
+		/* A side's tag is what the other direction pushes. */
+		e->dir[!d].vid = dir[d].vid;
+		e->dir[!d].vtpid = dir[d].vtpid;
 	}
 
 	ret = rhashtable_insert_fast(&nss_flow_table, &e->node,
