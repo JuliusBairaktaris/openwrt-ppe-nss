@@ -62,15 +62,15 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  	mutex_unlock(&ar->conf_mutex);
  }
  
-@@ -7105,6 +7138,11 @@ static void ath11k_nss_vdev_register(str
- 	}
+@@ -7110,6 +7143,11 @@ static int ath11k_nss_vdev_register(stru
  
  	arvif->nss_ifnum = ret;
-+
+ 
 +	/* A firmware restart registers the vdev again, and its isolation
 +	 * starts over with it.
 +	 */
 +	ath11k_nss_vdev_isolate(arvif, vif);
++
+ 	return 0;
  }
  
- static void ath11k_mac_op_update_vif_offload(struct ieee80211_hw *hw,

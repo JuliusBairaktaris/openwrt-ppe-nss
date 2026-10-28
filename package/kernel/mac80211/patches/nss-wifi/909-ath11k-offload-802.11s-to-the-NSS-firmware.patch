@@ -146,12 +146,12 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 +	.rx = ath11k_nss_mesh_rx,
 +};
 +
- static void ath11k_nss_vdev_register(struct ath11k_vif *arvif,
- 				     struct ieee80211_vif *vif)
- {
-@@ -6993,13 +7065,22 @@ static void ath11k_nss_vdev_register(str
+ /* The firmware owns the radio's rings, so an interface it does not take
+  * cannot carry data at all and is refused.
+  */
+@@ -6996,13 +7069,22 @@ static int ath11k_nss_vdev_register(stru
  	if (!wdev || !wdev->netdev)
- 		return;
+ 		return 0;
  
 -	ret = nss_wifi_vdev_register(ar->ab->nss_soc, wdev->netdev,
 -				     ar->pdev_idx, arvif->vdev_id, vif->addr,
@@ -179,7 +179,7 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  	if (ret < 0) {
  		ath11k_warn(ar->ab, "failed to give vdev %d to the NSS firmware: %d\n",
  			    arvif->vdev_id, ret);
-@@ -10294,6 +10375,44 @@ static int ath11k_mac_op_net_setup_tc(st
+@@ -10302,6 +10384,44 @@ static int ath11k_mac_op_net_setup_tc(st
   * The subsystem only asks once it has resolved the destination to a
   * station it holds.
   */
@@ -224,7 +224,7 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  static int ath11k_mac_op_net_fill_forward_path(struct ieee80211_hw *hw,
  					       struct ieee80211_vif *vif,
  					       struct ieee80211_sta *sta,
-@@ -10350,6 +10469,7 @@ static const struct ieee80211_ops ath11k
+@@ -10358,6 +10478,7 @@ static const struct ieee80211_ops ath11k
  	.flush_sta			= ath11k_mac_op_flush_sta,
  	.sta_statistics			= ath11k_mac_op_sta_statistics,
  	.net_setup_tc			= ath11k_mac_op_net_setup_tc,
