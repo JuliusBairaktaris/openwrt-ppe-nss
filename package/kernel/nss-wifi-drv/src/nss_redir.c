@@ -80,7 +80,10 @@ MODULE_PARM_DESC(redir, "carry raw-IP (cellular) devices and radios the firmware
 
 static bool nss_redir_wanted(const struct net_device *dev)
 {
-	if (dev->addr_len != ETH_ALEN)
+	/* The firmware routes in this namespace only; a device anywhere else
+	 * would have its frames forwarded by flows it does not belong to.
+	 */
+	if (dev->addr_len != ETH_ALEN || !net_eq(dev_net(dev), &init_net))
 		return false;
 
 	return dev->type == ARPHRD_RAWIP ||
@@ -273,8 +276,12 @@ static bool nss_redir_inject(struct nss_redir *r, struct sk_buff *skb)
 
 	if (r->eth) {
 		/* The device's own header and nothing between it and IP. */
+		/* A frame for another host is the host's to forward only
+		 * when the device is a bridge port.
+		 */
 		if (skb->pkt_type != PACKET_HOST &&
-		    skb->pkt_type != PACKET_OTHERHOST)
+		    (skb->pkt_type != PACKET_OTHERHOST ||
+		     !netif_is_bridge_port(skb->dev)))
 			return false;
 		if (skb_vlan_tag_present(skb) || skb->mac_len != ETH_HLEN)
 			return false;
