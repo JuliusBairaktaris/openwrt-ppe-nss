@@ -94,11 +94,31 @@ static struct nss_br_conn *nss_br_find(const struct nf_conn *ct)
 	return NULL;
 }
 
+/* The device a bridge port stands on, and the tag a VLAN port adds to it.
+ * NULL for a tag on a tag: the rule carries one per side.
+ */
+static struct net_device *nss_br_real(struct net_device *dev, u16 *vid,
+				      u16 *vtpid)
+{
+	*vid = 0;
+	*vtpid = 0;
+	if (!is_vlan_dev(dev))
+		return dev;
+
+	*vid = vlan_dev_vlan_id(dev);
+	*vtpid = ntohs(vlan_dev_vlan_proto(dev));
+	dev = vlan_dev_real_dev(dev);
+
+	return is_vlan_dev(dev) ? NULL : dev;
+}
+
 /* Why this frame's connection cannot be offloaded, or NSS_BR_WHY_MAX. */
 static int nss_br_check(struct sk_buff *skb, const struct nf_conn *ct,
 			const struct nf_hook_state *state,
 			struct nss_flow_br_dir *in)
 {
+	struct net_device *rin, *rout;
+	u16 vid, vtpid;
 	u32 mtu;
 
 	if (ct->status & IPS_NAT_MASK || nfct_help(ct))
@@ -108,9 +128,13 @@ static int nss_br_check(struct sk_buff *skb, const struct nf_conn *ct,
 	 */
 	if (skb_vlan_tag_present(skb))
 		return NSS_BR_VLAN;
-	in->ifnum = nss_flow_ifnum(nss_br_core, state->in->ifindex, &in->mtu);
-	if (in->ifnum < 0 ||
-	    nss_flow_ifnum(nss_br_core, state->out->ifindex, &mtu) < 0)
+	/* A VLAN port is its device with the tag the rule then carries. */
+	rin = nss_br_real(state->in, &in->vid, &in->vtpid);
+	rout = nss_br_real(state->out, &vid, &vtpid);
+	if (!rin || !rout)
+		return NSS_BR_VLAN;
+	in->ifnum = nss_flow_ifnum(nss_br_core, rin->ifindex, &in->mtu);
+	if (in->ifnum < 0 || nss_flow_ifnum(nss_br_core, rout->ifindex, &mtu) < 0)
 		return NSS_BR_PORT;
 
 	return NSS_BR_WHY_MAX;
@@ -120,7 +144,9 @@ static unsigned int nss_br_hook(void *priv, struct sk_buff *skb,
 				const struct nf_hook_state *state)
 {
 	struct nss_flow_br_dir in = {};
+	struct net_device *rin, *rout;
 	enum ip_conntrack_info ctinfo;
+	u16 vid, vtpid;
 	struct nss_br_conn *e;
 	struct nf_conn *ct;
 	bool kick = false;
@@ -135,8 +161,12 @@ static unsigned int nss_br_hook(void *priv, struct sk_buff *skb,
 	if (e && READ_ONCE(e->state) != NSS_BR_LEARN)
 		return NF_ACCEPT;
 
-	/* Wired to wired is the switch's. */
-	if (!state->in->ieee80211_ptr && !state->out->ieee80211_ptr)
+	/* Wired to wired is the switch's; a VLAN port is as wireless as the
+	 * device under it.
+	 */
+	rin = nss_br_real(state->in, &vid, &vtpid);
+	rout = nss_br_real(state->out, &vid, &vtpid);
+	if ((!rin || !rin->ieee80211_ptr) && (!rout || !rout->ieee80211_ptr))
 		return NF_ACCEPT;
 
 	/* A UDP sender may fall silent once the reply starts, so its
