@@ -1,0 +1,73 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Date: Wed, 28 Oct 2026 07:30:00 +0100
+Subject: [PATCH] wifi: ath11k: spread the PCI DP ring interrupts over the CPUs
+
+ath11k hashes received frames over four REO destination rings and sets
+IEEE80211_HW_USES_RSS, but with multiple MSI vectors on PCI it leaves
+the affinity of every DP group interrupt at its default, which puts all
+of them on one CPU. The receive work of every ring then runs there.
+
+Give each REO destination ring interrupt its own CPU and each TX
+completion ring interrupt the CPU after its ring number, the layout the
+AHB devices on ipq8074 get from OpenWrt's smp_affinity script. Only
+groups with a vector of their own are placed; with a single shared MSI
+vector nothing changes.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/drivers/net/wireless/ath/ath11k/pcic.c
++++ b/drivers/net/wireless/ath/ath11k/pcic.c
+@@ -333,8 +333,12 @@ static void ath11k_pcic_free_ext_irq(str
+ 	for (i = 0; i < ATH11K_EXT_IRQ_GRP_NUM_MAX; i++) {
+ 		struct ath11k_ext_irq_grp *irq_grp = &ab->ext_irq_grp[i];
+ 
+-		for (j = 0; j < irq_grp->num_irq; j++)
+-			free_irq(ab->irq_num[irq_grp->irqs[j]], irq_grp);
++		for (j = 0; j < irq_grp->num_irq; j++) {
++			int irq = ab->irq_num[irq_grp->irqs[j]];
++
++			irq_update_affinity_hint(irq, NULL);
++			free_irq(irq, irq_grp);
++		}
+ 
+ 		netif_napi_del(&irq_grp->napi);
+ 		free_netdev(irq_grp->napi_ndev);
+@@ -578,6 +582,27 @@ ath11k_pcic_get_msi_irq(struct ath11k_ba
+ 	return ab->pci.ops->get_msi_irq(ab, vector);
+ }
+ 
++static void ath11k_pcic_ext_irq_set_affinity(struct ath11k_base *ab,
++					     int grp_id, int irq)
++{
++	const struct ath11k_hw_ring_mask *ring_mask = ab->hw_params.ring_mask;
++	unsigned int cpu;
++
++	/* Put each REO destination ring, over which the hardware hashes
++	 * the received frames, on its own CPU, and each TX completion ring
++	 * on the CPU after its number.
++	 */
++	if (ring_mask->rx[grp_id])
++		cpu = __ffs(ring_mask->rx[grp_id]);
++	else if (ring_mask->tx[grp_id])
++		cpu = __ffs(ring_mask->tx[grp_id]) + 1;
++	else
++		return;
++
++	cpu = cpumask_local_spread(cpu, dev_to_node(ab->dev));
++	irq_set_affinity_and_hint(irq, cpumask_of(cpu));
++}
++
+ static int ath11k_pcic_ext_irq_config(struct ath11k_base *ab)
+ {
+ 	int i, j, n, ret, num_vectors = 0;
+@@ -651,6 +676,10 @@ static int ath11k_pcic_ext_irq_config(st
+ 				}
+ 				return ret;
+ 			}
++
++			if (test_bit(ATH11K_FLAG_MULTI_MSI_VECTORS,
++				     &ab->dev_flags) && i < num_vectors)
++				ath11k_pcic_ext_irq_set_affinity(ab, i, irq);
+ 		}
+ 		ath11k_pcic_ext_grp_disable(irq_grp);
+ 	}
