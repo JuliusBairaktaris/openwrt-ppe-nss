@@ -1,0 +1,69 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: wifi: ath11k: take the rate of a TB PPDU from its UL user info
+
+A trigger-based HE PPDU, the uplink of an HE station answering a trigger,
+carries no HE-SIG-A SU, so no TLV parser sets its NSS, while the PPDU
+end user stats mark it HE from the preamble type. A monitor interface
+then hands mac80211 an HE rate with NSS 0, which mac80211 refuses with
+"Rate marked as an HE rate but data is invalid: MCS: 0, NSS: 0" and a
+dropped frame; an IPQ8074 AP logged this with an HE160 client uploading.
+
+The same TLV carries the user's uplink OFDMA info, which ath11k already
+stores in ul_ofdma_user_v0_word0/1 but never reads; the words sit where
+ath12k reads them and decodes NSS and MCS (HAL_RX_UL_OFDMA_USER_INFO_V0_*).
+When an HE PPDU has no NSS from a SIG, take NSS and MCS from that info
+when it is valid.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/drivers/net/wireless/ath/ath11k/hal_rx.h
++++ b/drivers/net/wireless/ath/ath11k/hal_rx.h
+@@ -203,6 +203,11 @@ struct hal_rx_ppdu_start {
+ 
+ #define HAL_RX_PPDU_END_USER_STATS_INFO0_MPDU_CNT_FCS_ERR	GENMASK(25, 16)
+ 
++#define HAL_RX_UL_OFDMA_USER_INFO_V0_W0_VALID		BIT(30)
++#define HAL_RX_UL_OFDMA_USER_INFO_V0_W0_VER		BIT(31)
++#define HAL_RX_UL_OFDMA_USER_INFO_V0_W1_NSS		GENMASK(2, 0)
++#define HAL_RX_UL_OFDMA_USER_INFO_V0_W1_MCS		GENMASK(6, 3)
++
+ #define HAL_RX_PPDU_END_USER_STATS_INFO1_MPDU_CNT_FCS_OK	GENMASK(8, 0)
+ #define HAL_RX_PPDU_END_USER_STATS_INFO1_FC_VALID		BIT(9)
+ #define HAL_RX_PPDU_END_USER_STATS_INFO1_QOS_CTRL_VALID		BIT(10)
+--- a/drivers/net/wireless/ath/ath11k/hal_rx.c
++++ b/drivers/net/wireless/ath/ath11k/hal_rx.c
+@@ -818,6 +818,26 @@ ath11k_hal_rx_handle_ofdma_info(void *rx
+ 	rx_user_status->ul_ofdma_user_v0_word1 = __le32_to_cpu(ppdu_end_user->info10);
+ }
+ 
++/* A trigger-based uplink PPDU carries no HE-SIG-A SU, which is where
++ * the NSS and MCS of an HE PPDU come from otherwise; take them from the
++ * user's uplink OFDMA info.
++ */
++static void
++ath11k_hal_rx_ul_ofdma_rate(struct hal_rx_user_status *rx_user_status,
++			    struct hal_rx_mon_ppdu_info *ppdu_info)
++{
++	u32 w0 = rx_user_status->ul_ofdma_user_v0_word0;
++	u32 w1 = rx_user_status->ul_ofdma_user_v0_word1;
++
++	if (!ppdu_info->he_flags || ppdu_info->nss ||
++	    !u32_get_bits(w0, HAL_RX_UL_OFDMA_USER_INFO_V0_W0_VALID) ||
++	    u32_get_bits(w0, HAL_RX_UL_OFDMA_USER_INFO_V0_W0_VER))
++		return;
++
++	ppdu_info->nss = u32_get_bits(w1, HAL_RX_UL_OFDMA_USER_INFO_V0_W1_NSS) + 1;
++	ppdu_info->mcs = u32_get_bits(w1, HAL_RX_UL_OFDMA_USER_INFO_V0_W1_MCS);
++}
++
+ static inline void
+ ath11k_hal_rx_populate_byte_count(void *rx_tlv, void *ppduinfo,
+ 				  struct hal_rx_user_status *rx_user_status)
+@@ -944,6 +964,7 @@ ath11k_hal_rx_parse_mon_status_tlv(struc
+ 				&ppdu_info->userstats;
+ 
+ 			ath11k_hal_rx_handle_ofdma_info(tlv_data, rxuser_stats);
++			ath11k_hal_rx_ul_ofdma_rate(rxuser_stats, ppdu_info);
+ 			ath11k_hal_rx_populate_mu_user_info(tlv_data, ppdu_info,
+ 							    rxuser_stats);
+ 		}
