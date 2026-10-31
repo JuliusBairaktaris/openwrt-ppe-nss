@@ -1,0 +1,35 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: wifi: mac80211: mark L4S traffic in the TXQs at a shallow threshold
+
+The TXQ CoDel targets 20 ms and marks ECN-capable packets instead of
+dropping them. An L4S sender (RFC 9331) takes each mark as a small
+signal and expects marks at a shallow queue, so under CoDel's sparse
+marks it keeps its TXQ backlog far above the target: a QUIC Prague
+download (picoquic) to an AP-limited station waited +60.1, +72.0 and
++66.2 ms at the median between the AP's netdev and the station (3 runs).
+
+Mark ECT(1) packets CE once their sojourn exceeds 3 ms, as fq_codel
+does with ce_threshold and an ECT(1) selector. ECT(0) and Not-ECT
+packets keep CoDel's target, and fq keeps them apart from L4S flows.
+With the threshold the same download waited +20.0, +19.9 and +20.3 ms
+at 112.5-115.5 instead of 116.9-117.5 Mbit/s; the rest is the airtime
+AQL lets the firmware hold (12 ms for one active station).
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -1745,6 +1745,13 @@ int ieee80211_txq_setup_flows(struct iee
+ 	local->cparams.interval = MS2TIME(100);
+ 	local->cparams.target = MS2TIME(20);
+ 	local->cparams.ecn = true;
++	/* mark L4S (ECT(1)) traffic at a shallow queue, as fq_codel does with
++	 * ce_threshold and an ECT(1) selector; other traffic keeps CoDel's
++	 * target
++	 */
++	local->cparams.ce_threshold = MS2TIME(3);
++	local->cparams.ce_threshold_selector = INET_ECN_ECT_1;
++	local->cparams.ce_threshold_mask = INET_ECN_MASK;
+ 
+ 	local->cvars = kvzalloc_objs(local->cvars[0], fq->flows_cnt);
+ 	if (!local->cvars) {
