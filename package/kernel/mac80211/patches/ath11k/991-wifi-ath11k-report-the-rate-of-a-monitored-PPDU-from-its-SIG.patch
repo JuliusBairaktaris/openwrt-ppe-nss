@@ -1,0 +1,59 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: wifi: ath11k: report the rate of a monitored PPDU from its SIG
+
+ath11k_update_radiotap() reports ppduinfo->rate as the rate of HT, VHT
+and HE PPDUs, but only the L-SIG parser sets it, so a monitor interface
+shows the legacy rate code of the L-SIG instead of the MCS: on an
+IPQ8074 AP every VHT frame of an 80 MHz one-stream station capturing at
+VHT-MCS 9 was reported as VHT-MCS 11 (65956 frames in 9 s), and the HE-MU
+branch leaves rate_idx at its previous value. A PPDU flagged HT, VHT or
+HE whose SIG was not parsed carries no NSS, which mac80211 refuses with
+"Rate marked as a VHT rate but data is invalid: MCS: 0, NSS: 0" and a
+dropped frame.
+
+Report the MCS the SIG parsers store in ppduinfo->mcs, with the stream
+offset for HT, and report a PPDU without NSS at its L-SIG rate. With
+this the same capture shows VHT-MCS 9 and 7 and no warning.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/drivers/net/wireless/ath/ath11k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
+@@ -5237,23 +5237,33 @@ static void ath11k_update_radiotap(struc
+ 	if (ppduinfo->nss)
+ 		rxs->nss = ppduinfo->nss;
+ 
+-	if (ppduinfo->he_mu_flags) {
++	/* ppduinfo->rate is the legacy L-SIG rate; the SIG fields of HT, VHT
++	 * and HE PPDUs give their MCS in ppduinfo->mcs and their NSS. A PPDU
++	 * whose SIG was not parsed has no NSS: report its L-SIG rate only.
++	 */
++	if (!ppduinfo->nss) {
++		rxs->encoding = RX_ENC_LEGACY;
++		sband = &ar->mac.sbands[rxs->band];
++		rxs->rate_idx = ath11k_mac_hw_rate_to_idx(sband, ppduinfo->rate,
++							  ppduinfo->cck_flag);
++	} else if (ppduinfo->he_mu_flags) {
+ 		rxs->flag |= RX_FLAG_RADIOTAP_HE_MU;
+ 		rxs->encoding = RX_ENC_HE;
+ 		ptr = skb_push(mon_skb, sizeof(struct ieee80211_radiotap_he_mu));
+ 		ath11k_dp_rx_update_radiotap_he_mu(ppduinfo, ptr);
++		rxs->rate_idx = ppduinfo->mcs;
+ 	} else if (ppduinfo->he_flags) {
+ 		rxs->flag |= RX_FLAG_RADIOTAP_HE;
+ 		rxs->encoding = RX_ENC_HE;
+ 		ptr = skb_push(mon_skb, sizeof(struct ieee80211_radiotap_he));
+ 		ath11k_dp_rx_update_radiotap_he(ppduinfo, ptr);
+-		rxs->rate_idx = ppduinfo->rate;
++		rxs->rate_idx = ppduinfo->mcs;
+ 	} else if (ppduinfo->vht_flags) {
+ 		rxs->encoding = RX_ENC_VHT;
+-		rxs->rate_idx = ppduinfo->rate;
++		rxs->rate_idx = ppduinfo->mcs;
+ 	} else if (ppduinfo->ht_flags) {
+ 		rxs->encoding = RX_ENC_HT;
+-		rxs->rate_idx = ppduinfo->rate;
++		rxs->rate_idx = ppduinfo->mcs + 8 * (ppduinfo->nss - 1);
+ 	} else {
+ 		rxs->encoding = RX_ENC_LEGACY;
+ 		sband = &ar->mac.sbands[rxs->band];
