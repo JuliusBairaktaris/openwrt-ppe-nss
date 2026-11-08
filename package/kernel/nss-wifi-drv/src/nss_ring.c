@@ -180,7 +180,8 @@ static void nss_notify_recv(struct nss_core *core,
 
 	if (nss_wifili_is_soc(ncm->interface))
 		nss_wifili_notify(core, ncm, desc->payload_len);
-	else if (!nss_mesh_notify(core, ncm, desc->payload_len))
+	else if (!nss_core_load_notify(core, ncm, desc->payload_len) &&
+		 !nss_mesh_notify(core, ncm, desc->payload_len))
 		nss_wifili_vdev_notify(core, ncm, desc->payload_len);
 }
 

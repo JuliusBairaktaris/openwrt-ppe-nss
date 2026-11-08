@@ -792,10 +792,34 @@ int nss_wifi_pool_set(struct nss_core *core, u32 payloads)
 /* The firmware reports its own load for clock scaling about a thousand times
  * a second until told not to, and this driver scales nothing. It is told
  * the rate the core already runs at, so the clock is not moved by this.
+ * load=1 keeps the reports on, for measuring; debugfs "load_report" turns
+ * them on and off on a running core.
  */
 #define NSS_INTERFACE_COREFREQ		175
 #define NSS_COREFREQ_CHANGE		1
+#define NSS_COREFREQ_CORE_STATS		3
 #define NSS_CLK_CORE			14
+
+/* As qca-nss-drv's nss_freq.c, three quarters of an instruction per cycle
+ * counts as full, about a second of reports is averaged, and a report above
+ * one instruction per cycle, or of none, is discarded. Unlike there, a report
+ * is not taken to cover a millisecond: IPQ8074's firmware at 1689.6 MHz sends
+ * about 1128 a second, so each covers some 1.5 million cycles, and dividing
+ * by 1.69 million read the load 11% low. The cycles a report covers are
+ * measured instead, from each window's reports and the time they took, and
+ * apply to the next window; the first window assumes a millisecond.
+ */
+#define NSS_LOAD_FULL_PCT		75
+#define NSS_LOAD_SAMPLES		1000
+
+static bool nss_load_report;
+module_param_named(load, nss_load_report, bool, 0644);
+MODULE_PARM_DESC(load, "keep the firmware's load reports on, read when a core boots");
+
+struct nss_corefreq_stats_msg {
+	struct nss_cmn_msg cm;
+	u32 inst_cnt_total;
+};
 
 struct nss_corefreq_msg {
 	struct nss_cmn_msg cm;
@@ -806,7 +830,7 @@ struct nss_corefreq_msg {
 	s32 ack;
 };
 
-static void nss_core_stats_off(struct nss_core *core)
+static void nss_core_load_reports(struct nss_core *core, bool on)
 {
 	struct nss_corefreq_msg m = {};
 	int ret;
@@ -818,10 +842,75 @@ static void nss_core_stats_off(struct nss_core *core)
 	m.cm.type = NSS_COREFREQ_CHANGE;
 	m.frequency = clk_get_rate(core->clks[NSS_CLK_CORE].clk);
 	m.start_or_end = 1;
-	ret = nss_msg_send(core, &m, sizeof(m));
+	m.stats_enable = on;
 
-	dev_info(core->dev, "load reports off at %u Hz: %d ack %d\n",
-		 m.frequency, ret, m.ack);
+	core->load = (struct nss_core_load){
+		.khz = m.frequency / 1000,
+		.cycles = m.frequency / 1000,
+		.min = 100,
+		.start = ktime_get_ns(),
+	};
+	ret = nss_msg_send(core, &m, sizeof(m));
+	WRITE_ONCE(core->load.on, on && !ret);
+
+	dev_info(core->dev, "load reports %s at %u Hz: %d ack %d\n",
+		 on ? "on" : "off", m.frequency, ret, m.ack);
+}
+
+/* One report. Reports arrive on one CPU at a time, from the core's notify
+ * ring; debugfs reads what they leave without a lock. "total" only grows,
+ * so a reader that keeps its own samples gets the load between two of them
+ * as the difference in total over the difference in reports kept.
+ */
+bool nss_core_load_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
+			  u32 len)
+{
+	const struct nss_corefreq_stats_msg *m;
+	struct nss_core_load *l = &core->load;
+	u64 full, now, ns;
+	u32 pct;
+
+	if (NSS_INTERFACE_NUM_GET(ncm->interface) != NSS_INTERFACE_COREFREQ)
+		return false;
+	if (ncm->type != NSS_COREFREQ_CORE_STATS || len < sizeof(*m) ||
+	    !READ_ONCE(l->on) || !l->cycles)
+		return true;
+
+	m = container_of_const(ncm, struct nss_corefreq_stats_msg, cm);
+	l->reports++;
+	l->n++;
+	if (!m->inst_cnt_total || m->inst_cnt_total > l->cycles) {
+		l->discarded++;
+	} else {
+		full = (u64)l->cycles * NSS_LOAD_FULL_PCT;
+		pct = div64_u64((u64)m->inst_cnt_total * 100 * 100 + full / 2,
+				full);
+		l->sum += pct;
+		l->kept++;
+		WRITE_ONCE(l->total, l->total + pct);
+	}
+	if (l->n < NSS_LOAD_SAMPLES)
+		return true;
+
+	now = ktime_get_ns();
+	ns = now - l->start;
+	if (l->kept) {
+		pct = min_t(u32, l->sum / l->kept, 100);
+		WRITE_ONCE(l->pct, pct);
+		WRITE_ONCE(l->min, min(l->min, pct));
+		WRITE_ONCE(l->max, max(l->max, pct));
+	}
+	WRITE_ONCE(l->window_ms, div_u64(ns, NSEC_PER_MSEC));
+	full = div64_u64((u64)l->khz * ns, (u64)l->n * NSEC_PER_MSEC);
+	if (full)
+		WRITE_ONCE(l->cycles, min_t(u64, full, U32_MAX));
+	l->start = now;
+	l->windows++;
+	l->sum = 0;
+	l->n = 0;
+	l->kept = 0;
+
+	return true;
 }
 
 static int nss_core_boot(struct nss_core *core)
@@ -902,7 +991,7 @@ static int nss_core_boot(struct nss_core *core)
 	nss_accel_in_core(core);
 	nss_rps_enable(core);
 	nss_pbuf_pool_add(core, nss_pbuf_bytes);
-	nss_core_stats_off(core);
+	nss_core_load_reports(core, READ_ONCE(nss_load_report));
 	nss_bridge_start(core);
 
 	return 0;
@@ -1241,6 +1330,47 @@ static int nss_redir_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(nss_redir);
 
+static int nss_load_show(struct seq_file *s, void *unused)
+{
+	struct nss_core *core = s->private;
+	struct nss_core_load *l = &core->load;
+
+	seq_printf(s, "reports %d clock %u kHz cycles %u\n", READ_ONCE(l->on),
+		   l->khz, READ_ONCE(l->cycles));
+	if (!READ_ONCE(l->windows))
+		return 0;
+	seq_printf(s, "load %u%% min %u%% max %u%% window %u ms\n",
+		   READ_ONCE(l->pct), READ_ONCE(l->min), READ_ONCE(l->max),
+		   READ_ONCE(l->window_ms));
+	seq_printf(s, "windows %llu reports %llu discarded %llu total %llu\n",
+		   l->windows, l->reports, l->discarded, READ_ONCE(l->total));
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(nss_load);
+
+static int nss_load_report_get(void *data, u64 *val)
+{
+	*val = READ_ONCE(nss_load_report);
+
+	return 0;
+}
+
+static int nss_load_report_set(void *data, u64 val)
+{
+	struct nss_core *core = data;
+
+	guard(mutex)(&core->lock);
+	WRITE_ONCE(nss_load_report, !!val);
+	if (core->running)
+		nss_core_load_reports(core, !!val);
+
+	return 0;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(nss_load_report_fops, nss_load_report_get,
+			 nss_load_report_set, "%llu\n");
+
 static int nss_mesh_show(struct seq_file *s, void *unused)
 {
 	nss_mesh_print(s);
@@ -1466,6 +1596,10 @@ static int nss_probe(struct platform_device *pdev)
 			    &nss_mesh_fops);
 	debugfs_create_file("redir", 0400, core->debugfs, core,
 			    &nss_redir_fops);
+	debugfs_create_file("load", 0400, core->debugfs, core,
+			    &nss_load_fops);
+	debugfs_create_file("load_report", 0600, core->debugfs, core,
+			    &nss_load_report_fops);
 
 	return 0;
 }
