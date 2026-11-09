@@ -1,0 +1,91 @@
+From: Christian Martinez <xtian437@gmail.com>
+Subject: nat46: export a device's rules for hardware offload
+
+An offload engine that translates in hardware has to be given the same rules
+the device translates with. Export a copy of them, taken under the instance
+reference, and nothing that hands out the live instance.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Christian Martinez <xtian437@gmail.com>
+---
+diff --git a/nat46/modules/nat46-core.h b/nat46/modules/nat46-core.h
+index 4bb0f5f..0799566 100644
+--- a/nat46/modules/nat46-core.h
++++ b/nat46/modules/nat46-core.h
+@@ -78,6 +78,7 @@ int nat46_get_config(nat46_instance_t *nat46, char *buf, int count);
+ 
+ char *get_next_arg(char **ptail);
+ nat46_instance_t *get_nat46_instance(struct sk_buff *sk);
++nat46_instance_t *get_nat46_instance_dev(struct net_device *dev);
+ 
+ nat46_instance_t *alloc_nat46_instance(int npairs, nat46_instance_t *old, int from_ipair, int to_ipair, int remove_ipair);
+ void release_nat46_instance(nat46_instance_t *nat46);
+diff --git a/nat46/modules/nat46-glue.c b/nat46/modules/nat46-glue.c
+index 9f338bd..513f669 100644
+--- a/nat46/modules/nat46-glue.c
++++ b/nat46/modules/nat46-glue.c
+@@ -49,7 +49,11 @@ nat46_instance_t *alloc_nat46_instance(int npairs, nat46_instance_t *old, int fr
+ 
+ 
+ nat46_instance_t *get_nat46_instance(struct sk_buff *sk) {
+-  nat46_instance_t *nat46 = netdev_nat46_instance(sk->dev);
++  return get_nat46_instance_dev(sk->dev);
++}
++
++nat46_instance_t *get_nat46_instance_dev(struct net_device *dev) {
++  nat46_instance_t *nat46 = netdev_nat46_instance(dev);
+   mutex_lock(&ref_lock);
+   if (is_valid_nat46(nat46)) {
+     nat46->refcount++;
+diff --git a/nat46/modules/nat46-netdev.c b/nat46/modules/nat46-netdev.c
+index a5a0797..c8bd5a6 100644
+--- a/nat46/modules/nat46-netdev.c
++++ b/nat46/modules/nat46-netdev.c
+@@ -96,6 +96,37 @@ void *netdev_nat46_instance(struct net_device *dev) {
+ 	return priv->nat46;
+ }
+ 
++/*
++ * For an offload engine that mirrors the translation in hardware: copy up to
++ * @max of @dev's rule pairs into @pairs, @pair_size bytes each, which must be
++ * the size of nat46_xlate_rulepair_t. Returns how many pairs the device has,
++ * which may be more than were copied, -ENODEV for a device that is not a
++ * nat46 device and -EPROTO for a caller built against another layout. May
++ * sleep.
++ */
++int nat46_get_rules(struct net_device *dev, void *pairs, size_t pair_size, int max) {
++	nat46_instance_t *nat46;
++	int n;
++
++	if (dev->netdev_ops != &nat46_netdev_ops)
++		return -ENODEV;
++	if (pair_size != sizeof(nat46_xlate_rulepair_t))
++		return -EPROTO;
++
++	nat46 = get_nat46_instance_dev(dev);
++	if (!nat46)
++		return -ENODEV;
++	n = nat46->npairs;
++	if (max > n)
++		max = n;
++	if (max > 0)
++		memcpy(pairs, nat46->pairs, max * sizeof(nat46_xlate_rulepair_t));
++	release_nat46_instance(nat46);
++
++	return n;
++}
++EXPORT_SYMBOL_GPL(nat46_get_rules);
++
+ static void netdev_nat46_set_instance(struct net_device *dev, nat46_instance_t *new_nat46) {
+ 	nat46_netdev_priv_t *priv = netdev_priv(dev);
+ 	if(priv->nat46) {
+diff --git a/nat46/modules/nat46-netdev.h b/nat46/modules/nat46-netdev.h
+index 75c4d4f..e74234e 100644
+--- a/nat46/modules/nat46-netdev.h
++++ b/nat46/modules/nat46-netdev.h
+@@ -25,4 +25,5 @@ void nat46_destroy_all(struct net *net);
+ void nat64_show_all_configs(struct net *net, struct seq_file *m);
+ void nat46_netdev_count_xmit(struct sk_buff *skb, struct net_device *dev);
+ void *netdev_nat46_instance(struct net_device *dev);
++int nat46_get_rules(struct net_device *dev, void *pairs, size_t pair_size, int max);
+ 

@@ -328,12 +328,13 @@ static bool nss_flow_is_wireless(int ifindex)
 	return dev && dev->ieee80211_ptr;
 }
 
-/* A connection this firmware may carry has a station or a modem at one end;
- * between two switch ports the switch carries it.
+/* A connection this firmware may carry has a station, a modem or a CLAT at
+ * one end; between two switch ports the switch carries it.
  */
 bool nss_flow_is_ours(int ifindex)
 {
-	return nss_flow_is_wireless(ifindex) || nss_redir_bound(ifindex);
+	return nss_flow_is_wireless(ifindex) || nss_redir_bound(ifindex) ||
+	       nss_xlat_bound(ifindex);
 }
 
 /* Everything the firmware is told about one direction, out of that
@@ -359,7 +360,13 @@ static int nss_flow_take_dir(struct nss_core *core, struct nss_flow_entry *e,
 
 	flow_rule_match_meta(rule, &meta);
 	d->ifindex = meta.key->ingress_ifindex;
-	d->ifnum = nss_flow_ifnum(core, meta.key->ingress_ifindex, &d->mtu);
+	/* A CLAT is the translator's node of the rule's own family: what the
+	 * other connection hands it arrives there translated.
+	 */
+	d->ifnum = nss_xlat_ifnum(meta.key->ingress_ifindex, e->v6, &d->mtu);
+	if (d->ifnum < 0)
+		d->ifnum = nss_flow_ifnum(core, meta.key->ingress_ifindex,
+					  &d->mtu);
 	if (d->ifnum < 0) {
 		nss_flow_last_ifindex = meta.key->ingress_ifindex;
 		return nss_flow_reject_at(NSS_FLOW_REJECT_INTERFACE, d->ifnum, f,
@@ -430,6 +437,14 @@ static int nss_flow_take_dir(struct nss_core *core, struct nss_flow_entry *e,
 		ether_addr_copy(eth.h_dest, out->dev_addr);
 		if (!is_valid_ether_addr(eth.h_source))
 			ether_addr_copy(eth.h_source, out->dev_addr);
+	}
+
+	/* Nor has a CLAT, and it has no address of its own either. */
+	if (!is_valid_ether_addr(eth.h_dest) && out &&
+	    nss_xlat_bound(out->ifindex)) {
+		ether_addr_copy(eth.h_dest, nss_xlat_mac);
+		if (!is_valid_ether_addr(eth.h_source))
+			ether_addr_copy(eth.h_source, nss_xlat_mac);
 	}
 
 	if (!is_valid_ether_addr(eth.h_dest))
@@ -1377,8 +1392,9 @@ void nss_flow_withdraw_dev(const struct net_device *dev)
 }
 
 /* Take the flow table's block on @dev. A wireless device's driver forwards
- * the offer from its own traffic-control entry point; a raw-IP device has
- * none, and the offer arrives through the indirect callback with @cleanup.
+ * the offer from its own traffic-control entry point; a raw-IP device or a
+ * CLAT has none, and the offer arrives through the indirect callback with
+ * @cleanup.
  */
 static int nss_flow_block(struct net_device *dev, struct flow_block_offload *f,
 			  struct Qdisc *sch, void *data,
@@ -1444,18 +1460,29 @@ int nss_flow_setup_block(struct net_device *dev, struct flow_block_offload *f)
 }
 EXPORT_SYMBOL_GPL(nss_flow_setup_block);
 
-/* Every raw-IP device is taken, paired or not: a core restart unpairs it for
- * a while, and whether the firmware reaches it is decided per connection.
+/* Every raw-IP device and CLAT is taken, paired or not: a core restart
+ * unpairs it for a while, and whether the firmware reaches it is decided per
+ * connection.
  */
 static int nss_flow_indr_cb(struct net_device *dev, struct Qdisc *sch,
 			    void *cb_priv, enum tc_setup_type type,
 			    void *type_data, void *data,
 			    void (*cleanup)(struct flow_block_cb *block_cb))
 {
-	if (!dev || type != TC_SETUP_FT || dev->type != ARPHRD_RAWIP)
+	struct flow_block_offload *f = type_data;
+
+	if (!dev || type != TC_SETUP_FT)
 		return -EOPNOTSUPP;
 
-	return nss_flow_block(dev, type_data, sch, data, cleanup);
+	/* A CLAT's unbind may come after it left the translator's table, and
+	 * finds no block of ours if it was never one.
+	 */
+	if (dev->type != ARPHRD_RAWIP &&
+	    !(dev->type == ARPHRD_NONE &&
+	      (f->command == FLOW_BLOCK_UNBIND || nss_xlat_known(dev))))
+		return -EOPNOTSUPP;
+
+	return nss_flow_block(dev, f, sch, data, cleanup);
 }
 
 /* A bridged connection, keyed by its conntrack entry: nothing in it is

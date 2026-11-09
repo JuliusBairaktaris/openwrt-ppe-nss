@@ -7,6 +7,10 @@
 # offload. nss-wifi-drv takes the device's flow block, and the firmware
 # carries the connections it can route; without the driver the device only
 # joins the software fast path.
+#
+# A 464XLAT interface's layer-3 device is its nat46 device, which fw4 leaves
+# out the same way. Its two halves - IPv4 into the device, IPv6 out of it -
+# are separate connections, and the firmware's translator joins them.
 
 ft=$(nft list flowtable inet fw4 ft 2>/dev/null) || exit 0
 case "$ft" in
@@ -20,7 +24,13 @@ esac
 
 for dev in $(ubus call network.interface dump 2>/dev/null |
 	     jsonfilter -e '@.interface[@.up=true].l3_device' | sort -u); do
-	[ "$(cat "/sys/class/net/$dev/type" 2>/dev/null)" = 519 ] || continue
+	case "$(cat "/sys/class/net/$dev/type" 2>/dev/null)" in
+	519) ;;
+	65534)
+		grep -qx "add $dev" /proc/net/nat46/control 2>/dev/null || continue
+		;;
+	*) continue ;;
+	esac
 	case "$ft" in
 	*"\"$dev\""*) continue ;;
 	esac
