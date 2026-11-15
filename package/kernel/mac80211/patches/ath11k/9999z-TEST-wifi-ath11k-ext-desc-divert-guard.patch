@@ -1,0 +1,303 @@
+TEST: wifi: ath11k: guard the extension descriptor frames against a firmware divert
+
+After a station associates the firmware releases buffer ids it never owned,
+with addresses that match no queued buffer. Each part has its own module
+parameter, read for each frame, default on:
+
+ext_sg_tcp_only sends a frame with fragments through an extension descriptor
+only if it is plain IPv4 or IPv6 TCP; any other is made linear. The refusals
+are counted by reason in soc_dp_stats.
+
+ext_after_compl holds every extension descriptor frame to a station, TSO
+batch or scatter-gather, until the hardware has completed one frame of it on
+the normal path. The flag is in ath11k_sta, which is cleared when the station
+is added. The held frames are counted.
+
+ext_log_first logs the first 8 frames of each station sent through extension
+descriptors, with the time since the station was added.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -601,6 +601,14 @@
+ 
+ 	u32 bw_prev;
+ 
++	/* TEST: jiffies at station add, whether the hardware has completed a
++	 * frame of the station on the normal path, and how many frames sent
++	 * through extension descriptors were logged
++	 */
++	unsigned long add_jiffies;
++	bool ext_compl_seen;
++	atomic_t ext_logged;
++
+ #ifdef CPTCFG_ATH11K_CFR
+ 	struct ath11k_per_peer_cfr_capture cfr_capture;
+ #endif
+@@ -965,6 +973,12 @@
+ 	atomic_t tx_sg;
+ 	atomic_t tx_ext_mcast;
+ 	atomic_t tx_ext_nosta;
++	/* TEST: non-TSO scatter-gather frames refused for the TCP-only guard,
++	 * and ext frames held back until the station's first normal completion
++	 */
++	atomic_t tx_ext_sg_not_ip;
++	atomic_t tx_ext_sg_not_tcp;
++	atomic_t tx_ext_held;
+ 	/* TEST: completions of a buffer id whose generation is not the
+ 	 * one issued, and whose returned address is not the queued one
+ 	 */
+--- a/drivers/net/wireless/ath/ath11k/debugfs.c
++++ b/drivers/net/wireless/ath/ath11k/debugfs.c
+@@ -757,6 +757,11 @@
+ 			 atomic_read(&soc_stats->tx_ext_mcast),
+ 			 atomic_read(&soc_stats->tx_ext_nosta));
+ 	len += scnprintf(buf + len, size - len,
++			 "Scatter-gather frames refused for the TCP-only guard: not IP %d, not plain TCP %d; extension descriptor frames held until the station's first completion: %d\n",
++			 atomic_read(&soc_stats->tx_ext_sg_not_ip),
++			 atomic_read(&soc_stats->tx_ext_sg_not_tcp),
++			 atomic_read(&soc_stats->tx_ext_held));
++	len += scnprintf(buf + len, size - len,
+ 			 "TX completions of a stale buffer id generation: %d, with an address other than the queued one: %d\n",
+ 			 atomic_read(&soc_stats->tx_stale_compl),
+ 			 atomic_read(&soc_stats->tx_addr_mismatch));
+--- a/drivers/net/wireless/ath/ath11k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_tx.c
+@@ -72,6 +72,84 @@
+ #define ATH11K_TX_COOKIE_ID(c)	(FIELD_GET(DP_TX_DESC_ID_MSDU_ID, c) & ATH11K_TX_ID_MASK)
+ #define ATH11K_TX_EXT_SLOT_WIDE	136
+ 
++/* TEST-ONLY: the non-TSO scatter-gather use of extension descriptors is taken
++ * only for an IPv4 or IPv6 (no extension headers) TCP frame; others are made
++ * linear. Read for each frame.
++ */
++static bool ath11k_ext_sg_tcp_only = true;
++module_param_named(ext_sg_tcp_only, ath11k_ext_sg_tcp_only, bool, 0644);
++MODULE_PARM_DESC(ext_sg_tcp_only,
++		 "Scatter-gather through extension descriptors for plain TCP frames only (default: on)");
++
++/* TEST-ONLY: no extension descriptor frame to a station until the hardware
++ * has completed one frame of it on the normal path. Read for each frame.
++ */
++static bool ath11k_ext_after_compl = true;
++module_param_named(ext_after_compl, ath11k_ext_after_compl, bool, 0644);
++MODULE_PARM_DESC(ext_after_compl,
++		 "No extension descriptor frames to a station before its first normal completion (default: on)");
++
++/* TEST-ONLY: log the first frames of each station sent through extension
++ * descriptors. Read for each frame.
++ */
++static bool ath11k_ext_log_first = true;
++module_param_named(ext_log_first, ath11k_ext_log_first, bool, 0644);
++MODULE_PARM_DESC(ext_log_first,
++		 "Log the first frames of a station sent through extension descriptors (default: on)");
++
++#define ATH11K_EXT_LOG_MAX	8
++
++/* The ethertype, IP protocol and L4 ports of an Ethernet frame. Returns 0 for
++ * plain IPv4 or IPv6 TCP, 1 for a frame that is not IP, 2 for another IP
++ * protocol, a fragment, IP options past the header or an IPv6 extension header.
++ */
++static int ath11k_dp_tx_ext_l4(struct sk_buff *skb, u16 *etype, u8 *proto,
++			       u16 *sport, u16 *dport)
++{
++	struct ethhdr *eth = (struct ethhdr *)skb->data;
++	__be16 _ports[2], *ports;
++	struct ipv6hdr _ip6, *ip6;
++	struct iphdr _ip, *ip;
++	unsigned int off;
++	u8 p;
++
++	*etype = ntohs(eth->h_proto);
++	*proto = 0;
++	*sport = 0;
++	*dport = 0;
++
++	switch (*etype) {
++	case ETH_P_IP:
++		ip = skb_header_pointer(skb, ETH_HLEN, sizeof(_ip), &_ip);
++		if (!ip || ip->ihl < 5)
++			return 2;
++		p = ip->protocol;
++		off = ETH_HLEN + ip->ihl * 4;
++		if (ip->frag_off & htons(IP_OFFSET | IP_MF))
++			p = 0;
++		break;
++	case ETH_P_IPV6:
++		ip6 = skb_header_pointer(skb, ETH_HLEN, sizeof(_ip6), &_ip6);
++		if (!ip6)
++			return 2;
++		p = ip6->nexthdr;
++		off = ETH_HLEN + sizeof(_ip6);
++		break;
++	default:
++		return 1;
++	}
++
++	*proto = p;
++	if (p != IPPROTO_TCP && p != IPPROTO_UDP)
++		return 2;
++	ports = skb_header_pointer(skb, off, sizeof(_ports), _ports);
++	if (ports) {
++		*sport = ntohs(ports[0]);
++		*dport = ntohs(ports[1]);
++	}
++	return p == IPPROTO_TCP ? 0 : 2;
++}
++
+ static_assert(DP_TX_IDR_SIZE <= ATH11K_TX_ID_MASK + 1);
+ 
+ static inline struct hal_tx_msdu_ext *
+@@ -662,7 +740,8 @@
+  * taken before the first is queued.
+  */
+ static int ath11k_dp_tx_ext(struct ath11k *ar, struct ath11k_vif *arvif,
+-			    struct sk_buff *skb, int held_ring)
++			    struct ath11k_sta *arsta, struct sk_buff *skb,
++			    int held_ring)
+ {
+ 	struct skb_shared_info *shinfo = skb_shinfo(skb);
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+@@ -678,7 +757,11 @@
+ 	u32 seq = 0, flags = 0, ip_id = 0;
+ 	dma_addr_t hdr_dma;
+ 	struct tcphdr *th;
+-	int i, j;
++	u16 lg_etype = 0, lg_sport = 0, lg_dport = 0;
++	u8 lg_proto = 0;
++	unsigned int lg_len = 0, lg_frags = 0, lg_segs = 0;
++	bool dolog = false;
++	int i, j, r;
+ 
+ 	if (!READ_ONCE(ath11k_tso) || !ab->hw_params.tx_tso ||
+ 	    !(info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP) ||
+@@ -713,6 +796,41 @@
+ 		    shinfo->nr_frags > HAL_TX_MSDU_EXT_NUM_BUFS - 1 ||
+ 		    hdr_len < ETH_HLEN || ath11k_dp_tx_ctl_frame(skb))
+ 			return -EAGAIN;
++
++		/* TEST: only a plain TCP frame takes the extension descriptor */
++		if (READ_ONCE(ath11k_ext_sg_tcp_only)) {
++			u16 et, sp, dp;
++			u8 pr;
++
++			r = ath11k_dp_tx_ext_l4(skb, &et, &pr, &sp, &dp);
++			if (r) {
++				atomic_inc(r == 1 ? &ab->soc_stats.tx_ext_sg_not_ip :
++					   &ab->soc_stats.tx_ext_sg_not_tcp);
++				return -EAGAIN;
++			}
++		}
++	}
++
++	/* TEST: no extension descriptor frame before the hardware has
++	 * completed one frame of the station on the normal path
++	 */
++	if (READ_ONCE(ath11k_ext_after_compl) &&
++	    (!arsta || !READ_ONCE(arsta->ext_compl_seen))) {
++		atomic_inc(&ab->soc_stats.tx_ext_held);
++		return -EAGAIN;
++	}
++
++	/* TEST: what the first frames of a station look like; read now, the
++	 * frame may be completed and freed once it is queued
++	 */
++	if (arsta && READ_ONCE(ath11k_ext_log_first) &&
++	    atomic_read(&arsta->ext_logged) < ATH11K_EXT_LOG_MAX) {
++		ath11k_dp_tx_ext_l4(skb, &lg_etype, &lg_proto, &lg_sport,
++				    &lg_dport);
++		lg_len = skb->len;
++		lg_frags = shinfo->nr_frags;
++		lg_segs = tso ? shinfo->gso_segs : 0;
++		dolog = true;
+ 	}
+ 
+ 	if (held_ring >= 0)
+@@ -876,6 +994,18 @@
+ 		atomic_inc(&ab->soc_stats.tx_sg);
+ 	}
+ 
++	if (dolog) {
++		int k = atomic_fetch_add(1, &arsta->ext_logged);
++
++		if (k < ATH11K_EXT_LOG_MAX)
++			ath11k_info(ab, "ext desc frame %d sta %pM +%u ms: %s etype 0x%04x proto %u ports %u>%u len %u frags %u gso_segs %u compl_seen %d\n",
++				    k, container_of((void *)arsta, struct ieee80211_sta, drv_priv)->addr,
++				    jiffies_to_msecs(jiffies - arsta->add_jiffies),
++				    tso ? "tso" : "sg", lg_etype, lg_proto,
++				    lg_sport, lg_dport, lg_len, lg_frags,
++				    lg_segs, READ_ONCE(arsta->ext_compl_seen));
++	}
++
+ 	return 0;
+ 
+ fail_unmap:
+@@ -900,9 +1030,9 @@
+  * frame untouched, for one that has to be made linear instead.
+  */
+ int ath11k_dp_tx_sg(struct ath11k *ar, struct ath11k_vif *arvif,
+-		    struct sk_buff *skb, int held_ring)
++		    struct ath11k_sta *arsta, struct sk_buff *skb, int held_ring)
+ {
+-	return ath11k_dp_tx_ext(ar, arvif, skb, held_ring);
++	return ath11k_dp_tx_ext(ar, arvif, arsta, skb, held_ring);
+ }
+ 
+ /* A GSO frame from mac80211 is a batch of frames. The TCL takes a TCP batch
+@@ -919,7 +1049,7 @@
+ 	struct ieee80211_tx_info *info;
+ 	int ret = 0;
+ 
+-	if (!ath11k_dp_tx_ext(ar, arvif, skb, held_ring))
++	if (!ath11k_dp_tx_ext(ar, arvif, arsta, skb, held_ring))
+ 		return 0;
+ 
+ 	atomic_inc(&ar->ab->soc_stats.tx_tso_sw);
+@@ -1541,8 +1671,15 @@
+ 		peer = ath11k_peer_find_by_id(ab, ts->peer_id);
+ 		c->sta = peer ? peer->sta : NULL;
+ 		c->peer_id = ts->peer_id;
+-		if (c->sta)
++		if (c->sta) {
+ 			c->rate = ath11k_sta_to_arsta(c->sta)->last_txrate;
++			/* TEST: a frame of the station completed on the
++			 * normal path
++			 */
++			if (!seg_len)
++				WRITE_ONCE(ath11k_sta_to_arsta(c->sta)->ext_compl_seen,
++					   true);
++		}
+ 		spin_unlock_bh(&ab->base_lock);
+ 	}
+ 
+--- a/drivers/net/wireless/ath/ath11k/dp_tx.h
++++ b/drivers/net/wireless/ath/ath11k/dp_tx.h
+@@ -27,7 +27,7 @@
+ 		     struct ath11k_sta *arsta, struct sk_buff *skb,
+ 		     int held_ring);
+ int ath11k_dp_tx_sg(struct ath11k *ar, struct ath11k_vif *arvif,
+-		    struct sk_buff *skb, int held_ring);
++		    struct ath11k_sta *arsta, struct sk_buff *skb, int held_ring);
+ int ath11k_dp_tx_bufs_init(struct ath11k_base *ab, struct dp_tx_ring *tx_ring);
+ void ath11k_dp_tx_bufs_free(struct ath11k_base *ab, struct dp_tx_ring *tx_ring);
+ struct sk_buff *ath11k_dp_tx_buf_put_id(struct ath11k_base *ab,
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -6638,7 +6638,7 @@
+ 	if (unlikely(skb_is_nonlinear(skb))) {
+ 		if (!arsta)
+ 			atomic_inc(&ar->ab->soc_stats.tx_ext_nosta);
+-		else if (!ath11k_dp_tx_sg(ar, arvif, skb, held_ring))
++		else if (!ath11k_dp_tx_sg(ar, arvif, arsta, skb, held_ring))
+ 			return 0;
+ 
+ 		if (skb_linearize(skb)) {
+@@ -10107,6 +10107,7 @@
+ 	    new_state == IEEE80211_STA_NONE) {
+ 		memset(arsta, 0, sizeof(*arsta));
+ 		arsta->arvif = arvif;
++		arsta->add_jiffies = jiffies;
+ 		arsta->peer_ps_state = WMI_PEER_PS_STATE_DISABLED;
+ 		INIT_WORK(&arsta->update_wk, ath11k_sta_rc_update_wk);
+ 		INIT_WORK(&arsta->set_4addr_wk, ath11k_sta_set_4addr_wk);
