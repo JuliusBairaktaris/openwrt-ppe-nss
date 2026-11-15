@@ -793,6 +793,7 @@ config KERNEL_PROVE_LOCKING
 config KERNEL_SOFTLOCKUP_DETECTOR
 	bool "Compile the kernel with detect Soft Lockups"
 	depends on KERNEL_DEBUG_KERNEL
+	default y if TARGET_qualcommax
 	help
 	  Say Y here to enable the kernel to act as a watchdog to detect
 	  soft lockups.
@@ -805,6 +806,7 @@ config KERNEL_SOFTLOCKUP_DETECTOR
 config KERNEL_HARDLOCKUP_DETECTOR
 	bool "Compile the kernel with detect Hard Lockups"
 	depends on KERNEL_DEBUG_KERNEL
+	default y if TARGET_qualcommax
 	help
 	  Say Y here to enable the kernel to act as a watchdog to detect
 	  hard lockups.
