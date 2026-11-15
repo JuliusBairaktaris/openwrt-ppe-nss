@@ -1,0 +1,250 @@
+wifi: ath11k: compare the RX packet header TLV with the MPDU start descriptor
+
+The 802.11 header of a received frame is read from the 128 byte packet
+header TLV of the RX descriptor for every frame that goes back to
+mac80211 as 802.11 (EAPOL, group-addressed frames, which also take the
+CCMP header from it for the replay check in mac80211, native Wi-Fi
+decapsulation, frames from another source than the peer). The MPDU start
+descriptor also holds the frame control, duration, addresses, sequence
+control, QoS control, HT control and the PN and key ID of the MPDU, so
+the TLV, which the firmware can leave out with the RX ring selection
+configuration, could be replaced by a header built from it.
+
+Whether the descriptor holds all of that for every MSDU of an A-MPDU and
+of an A-MSDU, and in the format the CCMP header needs, is not documented,
+so add a check that finds it out on a device: with the new
+ath11k.rx_hdr_check module parameter every received MSDU of an IPQ8074
+radio has its header TLV compared field by field with the descriptor, and
+the differences are counted per field, for the first MSDU of an MPDU and
+for the others, in the soc_dp_stats debugfs file. Nothing changes for
+the frame.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -940,6 +940,13 @@ struct ath11k_soc_dp_stats {
+ 	 */
+ 	u32 rx_hash_set;
+ 	u32 rx_hash_zero;
++	/* TEST-ONLY: packet header TLV against the MPDU start descriptor,
++	 * [0] for the first MSDU of an MPDU and [1] for the others, and per
++	 * field (see ath11k_hw_ipq8074_rx_desc_cmp_hdr())
++	 */
++	u32 rx_hdr_checked[2];
++	u32 rx_hdr_bad[2];
++	u32 rx_hdr_bad_field[2][11];
+ 	/* Ethernet frames converted back to 802.11 because their source is
+ 	 * not the peer's address, or because they are 802.3 frames with a
+ 	 * length field (or of the 802.3 decap type), and those received
+--- a/drivers/net/wireless/ath/ath11k/debugfs.c
++++ b/drivers/net/wireless/ath/ath11k/debugfs.c
+@@ -663,7 +663,7 @@ static ssize_t ath11k_debugfs_dump_soc_d
+ 	struct ath11k_base *ab = file->private_data;
+ 	struct ath11k_soc_dp_stats *soc_stats = &ab->soc_stats;
+ 	int len = 0, i, retval;
+-	const int size = 4096;
++	const int size = 8192;
+ 	static const char *rxdma_err[HAL_REO_ENTR_RING_RXDMA_ECODE_MAX] = {
+ 			"Overflow", "MPDU len", "FCS", "Decrypt", "TKIP MIC",
+ 			"Unencrypt", "MSDU len", "MSDU limit", "WiFi parse",
+@@ -724,6 +724,21 @@ static ssize_t ath11k_debugfs_dump_soc_d
+ 			 "\nRX flow hash set: %u, zero: %u\n",
+ 			 soc_stats->rx_hash_set, soc_stats->rx_hash_zero);
+ 
++	for (i = 0; i < 2; i++) {
++		int j;
++
++		len += scnprintf(buf + len, size - len,
++				 "\nPacket header TLV against MPDU start, %s MSDU: checked %u, differ %u\n",
++				 i ? "first" : "later", soc_stats->rx_hdr_checked[i],
++				 soc_stats->rx_hdr_bad[i]);
++		len += scnprintf(buf + len, size - len,
++				 "fields fc dur a1 a2 a3 seq a4 qos ht iv other:");
++		for (j = 0; j < 11; j++)
++			len += scnprintf(buf + len, size - len, " %u",
++					 soc_stats->rx_hdr_bad_field[i][j]);
++		len += scnprintf(buf + len, size - len, "\n");
++	}
++
+ 	len += scnprintf(buf + len, size - len,
+ 			 "\nEthernet frames converted back to 802.11 (source not the peer's): %u, (802.3 length or LLC frames): %u\n",
+ 			 soc_stats->eth_native_sa, soc_stats->eth_native_llc);
+--- a/drivers/net/wireless/ath/ath11k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
+@@ -2531,6 +2531,39 @@ static void ath11k_dp_rx_h_mesh_decap(st
+ 		       false);
+ }
+ 
++/* TEST-ONLY switch that compares the 802.11 header of the packet header TLV
++ * with the MPDU start descriptor, to settle on the device whether the TLV
++ * can be dropped; dropped before this is upstreamed.
++ */
++static bool ath11k_rx_hdr_check;
++module_param_named(rx_hdr_check, ath11k_rx_hdr_check, bool, 0644);
++MODULE_PARM_DESC(rx_hdr_check,
++		 "Count the differences between the packet header TLV and the MPDU start descriptor (default: off)");
++
++static void ath11k_dp_rx_h_hdr_check(struct ath11k *ar, struct sk_buff *msdu,
++				     struct hal_rx_desc *rx_desc,
++				     enum hal_encrypt_type enctype)
++{
++	struct ath11k_base *ab = ar->ab;
++	int first = ATH11K_SKB_RXCB(msdu)->is_first_msdu;
++	u32 bad;
++	int i;
++
++	if (!ab->hw_params.hw_ops->rx_desc_cmp_hdr)
++		return;
++
++	bad = ab->hw_params.hw_ops->rx_desc_cmp_hdr(rx_desc,
++						    enctype == HAL_ENCRYPT_TYPE_CCMP_128);
++	ab->soc_stats.rx_hdr_checked[first]++;
++	if (!bad)
++		return;
++
++	ab->soc_stats.rx_hdr_bad[first]++;
++	for (i = 0; i < 11; i++)
++		if (bad & BIT(i))
++			ab->soc_stats.rx_hdr_bad_field[first][i]++;
++}
++
+ static void ath11k_dp_rx_h_mpdu(struct ath11k *ar,
+ 				struct sk_buff *msdu,
+ 				struct hal_rx_desc *rx_desc,
+@@ -2611,6 +2644,9 @@ static void ath11k_dp_rx_h_mpdu(struct a
+ 	if (unlikely(mesh_decap))
+ 		ath11k_dp_rx_h_mesh_decap(ar, msdu, rx_desc);
+ 
++	if (unlikely(ath11k_rx_hdr_check))
++		ath11k_dp_rx_h_hdr_check(ar, msdu, rx_desc, enctype);
++
+ 	rx_attention = ath11k_dp_rx_get_attention(ar->ab, rx_desc);
+ 	err_bitmap = ath11k_dp_rx_h_attn_mpdu_err(rx_attention);
+ 	if (enctype != HAL_ENCRYPT_TYPE_OPEN && !err_bitmap)
+--- a/drivers/net/wireless/ath/ath11k/hw.c
++++ b/drivers/net/wireless/ath/ath11k/hw.c
+@@ -7,6 +7,9 @@
+ #include <linux/types.h>
+ #include <linux/bitops.h>
+ #include <linux/bitfield.h>
++#include <linux/etherdevice.h>
++#include <linux/ieee80211.h>
++#include <linux/unaligned.h>
+ 
+ #include "core.h"
+ #include "ce.h"
+@@ -283,6 +286,72 @@ static u8 ath11k_hw_ipq8074_rx_desc_get_
+ 			 __le32_to_cpu(desc->u.ipq8074.msdu_start.info2));
+ }
+ 
++/* Compare the 802.11 header and the CCMP header of the packet header TLV with
++ * what the MPDU start descriptor says: the bits of the result name the fields
++ * that differ. Bit 10: the descriptor holds no frame control.
++ */
++static u32 ath11k_hw_ipq8074_rx_desc_cmp_hdr(struct hal_rx_desc *desc, bool ccmp)
++{
++	const struct rx_mpdu_start_ipq8074 *ms = &desc->u.ipq8074.mpdu_start;
++	const struct ieee80211_hdr *h = (void *)desc->u.ipq8074.hdr_status;
++	u32 info1 = __le32_to_cpu(ms->info1);
++	u32 bad = 0;
++	size_t len;
++
++	if (!(info1 & RX_MPDU_START_INFO1_MPDU_FCTRL_VALID))
++		return BIT(10);
++
++	if (ms->frame_ctrl != h->frame_control)
++		bad |= BIT(0);
++	if ((info1 & RX_MPDU_START_INFO1_MPDU_DUR_VALID) &&
++	    ms->duration != h->duration_id)
++		bad |= BIT(1);
++	if ((info1 & RX_MPDU_START_INFO1_MAC_ADDR1_VALID) &&
++	    !ether_addr_equal(ms->addr1, h->addr1))
++		bad |= BIT(2);
++	if ((info1 & RX_MPDU_START_INFO1_MAC_ADDR2_VALID) &&
++	    !ether_addr_equal(ms->addr2, h->addr2))
++		bad |= BIT(3);
++	if ((info1 & RX_MPDU_START_INFO1_MAC_ADDR3_VALID) &&
++	    !ether_addr_equal(ms->addr3, h->addr3))
++		bad |= BIT(4);
++	if ((info1 & RX_MPDU_START_INFO1_MPDU_SEQ_CTRL_VALID) &&
++	    ms->seq_ctrl != h->seq_ctrl)
++		bad |= BIT(5);
++
++	len = ieee80211_hdrlen(h->frame_control);
++	if (len > HAL_RX_DESC_HDR_STATUS_LEN - 8)
++		return bad | BIT(10);
++
++	if (ieee80211_has_a4(h->frame_control) &&
++	    (!(info1 & RX_MPDU_START_INFO1_MAC_ADDR4_VALID) ||
++	     !ether_addr_equal(ms->addr4, h->addr4)))
++		bad |= BIT(6);
++	if (ieee80211_is_data_qos(h->frame_control) &&
++	    (!(info1 & RX_MPDU_START_INFO1_MPDU_QOS_CTRL_VALID) ||
++	     ms->qos_ctrl != *(__le16 *)ieee80211_get_qos_ctl((void *)h)))
++		bad |= BIT(7);
++	if (ieee80211_is_data_qos(h->frame_control) &&
++	    ieee80211_has_order(h->frame_control) &&
++	    (!(info1 & RX_MPDU_START_INFO1_MPDU_HT_CTRL_VALID) ||
++	     ms->ht_ctrl != get_unaligned((__le32 *)((u8 *)h + len - 4))))
++		bad |= BIT(8);
++
++	if (ccmp && ieee80211_has_protected(h->frame_control)) {
++		u32 pn0 = __le32_to_cpu(ms->pn[0]);
++		u32 pn1 = __le32_to_cpu(ms->pn[1]);
++		u8 iv[8] = { pn0, pn0 >> 8, 0,
++			     FIELD_GET(RX_MPDU_START_INFO5_KEY_ID,
++				       __le32_to_cpu(ms->info5)),
++			     pn0 >> 16, pn0 >> 24, pn1, pn1 >> 8 };
++
++		if (memcmp((u8 *)h + len, iv, sizeof(iv)))
++			bad |= BIT(9);
++	}
++
++	return bad;
++}
++
+ static u32 ath11k_hw_ipq8074_rx_desc_get_flow_id_toeplitz(struct hal_rx_desc *desc)
+ {
+ 	return __le32_to_cpu(desc->u.ipq8074.msdu_start.flow_id_toeplitz);
+@@ -943,6 +1012,7 @@ const struct ath11k_hw_ops ipq9574_ops =
+ 	.rx_desc_get_mesh_ctl = ath11k_hw_ipq8074_rx_desc_get_mesh_ctl,
+ 	.rx_desc_get_msdu_start_info2 = ath11k_hw_ipq8074_rx_desc_get_msdu_start_info2,
+ 	.rx_desc_get_flow_id_toeplitz = ath11k_hw_ipq8074_rx_desc_get_flow_id_toeplitz,
++	.rx_desc_cmp_hdr = ath11k_hw_ipq8074_rx_desc_cmp_hdr,
+ 	.rx_desc_get_ldpc_support = ath11k_hw_ipq8074_rx_desc_get_ldpc_support,
+ 	.rx_desc_get_mpdu_seq_ctl_vld = ath11k_hw_ipq8074_rx_desc_get_mpdu_seq_ctl_vld,
+ 	.rx_desc_get_mpdu_fc_valid = ath11k_hw_ipq8074_rx_desc_get_mpdu_fc_valid,
+@@ -985,6 +1055,7 @@ const struct ath11k_hw_ops ipq8074_ops =
+ 	.rx_desc_get_mesh_ctl = ath11k_hw_ipq8074_rx_desc_get_mesh_ctl,
+ 	.rx_desc_get_msdu_start_info2 = ath11k_hw_ipq8074_rx_desc_get_msdu_start_info2,
+ 	.rx_desc_get_flow_id_toeplitz = ath11k_hw_ipq8074_rx_desc_get_flow_id_toeplitz,
++	.rx_desc_cmp_hdr = ath11k_hw_ipq8074_rx_desc_cmp_hdr,
+ 	.rx_desc_get_ldpc_support = ath11k_hw_ipq8074_rx_desc_get_ldpc_support,
+ 	.rx_desc_get_mpdu_seq_ctl_vld = ath11k_hw_ipq8074_rx_desc_get_mpdu_seq_ctl_vld,
+ 	.rx_desc_get_mpdu_fc_valid = ath11k_hw_ipq8074_rx_desc_get_mpdu_fc_valid,
+@@ -1027,6 +1098,7 @@ const struct ath11k_hw_ops ipq6018_ops =
+ 	.rx_desc_get_mesh_ctl = ath11k_hw_ipq8074_rx_desc_get_mesh_ctl,
+ 	.rx_desc_get_msdu_start_info2 = ath11k_hw_ipq8074_rx_desc_get_msdu_start_info2,
+ 	.rx_desc_get_flow_id_toeplitz = ath11k_hw_ipq8074_rx_desc_get_flow_id_toeplitz,
++	.rx_desc_cmp_hdr = ath11k_hw_ipq8074_rx_desc_cmp_hdr,
+ 	.rx_desc_get_ldpc_support = ath11k_hw_ipq8074_rx_desc_get_ldpc_support,
+ 	.rx_desc_get_mpdu_seq_ctl_vld = ath11k_hw_ipq8074_rx_desc_get_mpdu_seq_ctl_vld,
+ 	.rx_desc_get_mpdu_fc_valid = ath11k_hw_ipq8074_rx_desc_get_mpdu_fc_valid,
+@@ -1069,6 +1141,7 @@ const struct ath11k_hw_ops qca6390_ops =
+ 	.rx_desc_get_mesh_ctl = ath11k_hw_ipq8074_rx_desc_get_mesh_ctl,
+ 	.rx_desc_get_msdu_start_info2 = ath11k_hw_ipq8074_rx_desc_get_msdu_start_info2,
+ 	.rx_desc_get_flow_id_toeplitz = ath11k_hw_ipq8074_rx_desc_get_flow_id_toeplitz,
++	.rx_desc_cmp_hdr = ath11k_hw_ipq8074_rx_desc_cmp_hdr,
+ 	.rx_desc_get_ldpc_support = ath11k_hw_ipq8074_rx_desc_get_ldpc_support,
+ 	.rx_desc_get_mpdu_seq_ctl_vld = ath11k_hw_ipq8074_rx_desc_get_mpdu_seq_ctl_vld,
+ 	.rx_desc_get_mpdu_fc_valid = ath11k_hw_ipq8074_rx_desc_get_mpdu_fc_valid,
+--- a/drivers/net/wireless/ath/ath11k/hw.h
++++ b/drivers/net/wireless/ath/ath11k/hw.h
+@@ -257,6 +257,7 @@ struct ath11k_hw_ops {
+ 	u8 (*rx_desc_get_mesh_ctl)(struct hal_rx_desc *desc);
+ 	u32 (*rx_desc_get_msdu_start_info2)(struct hal_rx_desc *desc);
+ 	u32 (*rx_desc_get_flow_id_toeplitz)(struct hal_rx_desc *desc);
++	u32 (*rx_desc_cmp_hdr)(struct hal_rx_desc *desc, bool ccmp);
+ 	bool (*rx_desc_get_ldpc_support)(struct hal_rx_desc *desc);
+ 	bool (*rx_desc_get_mpdu_seq_ctl_vld)(struct hal_rx_desc *desc);
+ 	bool (*rx_desc_get_mpdu_fc_valid)(struct hal_rx_desc *desc);
