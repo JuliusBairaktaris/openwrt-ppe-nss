@@ -1,0 +1,172 @@
+TEST: wifi: ath11k: send extension descriptor frames with index search
+
+Test only. A frame sent through an MSDU extension descriptor was handed to
+the firmware, which released it as a plain buffer. Send these frames with
+index search on the AST entry of the destination station, as the vendor host
+does for a unicast frame, instead of the address search of the vif.
+
+Record the AST index (hw_peer_id) and hash of the peer from the HTT peer map
+event in the station when the peer is created, and clear the record when the
+station is removed. The TCL command gets search type 1 (index based address
+search), address X search enabled, the search index and the low four bits of
+the hash as cache set number. A frame whose station has no known index is
+refused and sent linear. Module parameter ext_index_search (default on) is
+read per frame. The frames sent with index search and those refused are
+counted in the soc debugfs statistics, and the index of each station is
+logged once.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -609,6 +609,15 @@
+ 	bool ext_compl_seen;
+ 	atomic_t ext_logged;
+ 
++	/* TEST: the AST index and hash of the station's peer from the HTT
++	 * peer map event; ast_valid is set after them and cleared when the
++	 * station is removed
++	 */
++	u16 ast_idx;
++	u16 ast_hash;
++	bool ast_valid;
++	bool ast_logged;
++
+ #ifdef CPTCFG_ATH11K_CFR
+ 	struct ath11k_per_peer_cfr_capture cfr_capture;
+ #endif
+@@ -973,6 +982,11 @@
+ 	atomic_t tx_sg;
+ 	atomic_t tx_ext_mcast;
+ 	atomic_t tx_ext_nosta;
++	/* TEST: extension descriptor frames sent with index search, and
++	 * refused for lack of the station's AST index
++	 */
++	atomic_t tx_ext_idx;
++	atomic_t tx_ext_noidx;
+ 	/* TEST: non-TSO scatter-gather frames refused for the TCP-only guard,
+ 	 * and ext frames held back until the station's first normal completion
+ 	 */
+--- a/drivers/net/wireless/ath/ath11k/peer.c
++++ b/drivers/net/wireless/ath/ath11k/peer.c
+@@ -448,6 +448,10 @@
+ 
+ 	if (sta) {
+ 		arsta = ath11k_sta_to_arsta(sta);
++		/* TEST: kept for index search of extension descriptor frames */
++		arsta->ast_idx = peer->hw_peer_id;
++		arsta->ast_hash = peer->ast_hash;
++		smp_store_release(&arsta->ast_valid, true);
+ 		arsta->tcl_metadata |= FIELD_PREP(HTT_TCL_META_DATA_TYPE, 0) |
+ 				       FIELD_PREP(HTT_TCL_META_DATA_PEER_ID,
+ 						  peer->peer_id);
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -10036,6 +10036,7 @@
+ 	kfree(arsta->tx_stats);
+ 	arsta->tx_stats = NULL;
+ free_peer:
++	WRITE_ONCE(arsta->ast_valid, false);
+ 	ath11k_peer_delete(ar, arvif->vdev_id, sta->addr);
+ free_rx_stats:
+ 	kfree(arsta->rx_stats);
+@@ -10064,6 +10065,9 @@
+ 		}
+ 	}
+ 
++	/* TEST: no index search for a peer that is going away */
++	WRITE_ONCE(ath11k_sta_to_arsta(sta)->ast_valid, false);
++
+ 	ath11k_dp_peer_cleanup(ar, arvif->vdev_id, sta->addr);
+ 
+ 	ret = ath11k_peer_delete(ar, arvif->vdev_id, sta->addr);
+--- a/drivers/net/wireless/ath/ath11k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_tx.c
+@@ -97,6 +97,15 @@
+ MODULE_PARM_DESC(ext_log_first,
+ 		 "Log the first frames of a station sent through extension descriptors (default: on)");
+ 
++/* TEST-ONLY: an extension descriptor frame is sent with index search on the
++ * AST entry of its station, not the address search of the vif; a frame whose
++ * station has no known index is made linear. Read for each frame.
++ */
++static bool ath11k_ext_index_search = true;
++module_param_named(ext_index_search, ath11k_ext_index_search, bool, 0644);
++MODULE_PARM_DESC(ext_index_search,
++		 "Extension descriptor frames use index search on the station's AST entry (default: on)");
++
+ #define ATH11K_EXT_LOG_MAX	8
+ 
+ /* The ethertype, IP protocol and L4 ports of an Ethernet frame. Returns 0 for
+@@ -760,7 +769,8 @@
+ 	u16 lg_etype = 0, lg_sport = 0, lg_dport = 0;
+ 	u8 lg_proto = 0;
+ 	unsigned int lg_len = 0, lg_frags = 0, lg_segs = 0;
+-	bool dolog = false;
++	bool dolog = false, idx_search = false, idx_log = false;
++	u16 sta_ast_idx = 0, sta_ast_hash = 0;
+ 	int i, j, r;
+ 
+ 	if (!READ_ONCE(ath11k_tso) || !ab->hw_params.tx_tso ||
+@@ -820,6 +830,21 @@
+ 		return -EAGAIN;
+ 	}
+ 
++	/* TEST: index search on the station's AST entry */
++	if (READ_ONCE(ath11k_ext_index_search)) {
++		if (!arsta || !smp_load_acquire(&arsta->ast_valid)) {
++			atomic_inc(&ab->soc_stats.tx_ext_noidx);
++			return -EAGAIN;
++		}
++		sta_ast_idx = arsta->ast_idx;
++		sta_ast_hash = arsta->ast_hash;
++		idx_search = true;
++		if (!READ_ONCE(arsta->ast_logged)) {
++			WRITE_ONCE(arsta->ast_logged, true);
++			idx_log = true;
++		}
++	}
++
+ 	/* TEST: what the first frames of a station look like; read now, the
+ 	 * frame may be completed and freed once it is queued
+ 	 */
+@@ -948,6 +973,13 @@
+ 	ti.lmac_id = ar->lmac_id;
+ 	ti.bss_ast_hash = arvif->ast_hash;
+ 	ti.bss_ast_idx = arvif->ast_idx;
++	if (idx_search) {
++		ti.addr_search_flags = HAL_TX_ADDRX_EN;
++		ti.search_type = HAL_TX_ADDR_SEARCH_INDEX;
++		ti.bss_ast_idx = sta_ast_idx;
++		/* the cache set is the low four bits of the hash */
++		ti.bss_ast_hash = sta_ast_hash & 0xF;
++	}
+ 	ti.rbm_id = ab->hw_params.hal_params->tcl2wbm_rbm_map[ti.ring_id].rbm_id;
+ 	ti.tid = ath11k_dp_tx_get_tid(skb);
+ 	if (tso)
+@@ -988,6 +1020,12 @@
+ 	}
+ 
+ 	atomic_add(n, &ar->dp.num_tx_pending);
++	if (idx_search)
++		atomic_add(n, &ab->soc_stats.tx_ext_idx);
++	if (idx_log)
++		ath11k_info(ab, "ext desc index search sta %pM ast_idx %u ast_hash 0x%x cache_set %u\n",
++			    container_of((void *)arsta, struct ieee80211_sta, drv_priv)->addr,
++			    sta_ast_idx, sta_ast_hash, sta_ast_hash & 0xF);
+ 	if (tso) {
+ 		atomic_inc(&ab->soc_stats.tx_tso_batch);
+ 		atomic_add(n, &ab->soc_stats.tx_tso_seg);
+--- a/drivers/net/wireless/ath/ath11k/debugfs.c
++++ b/drivers/net/wireless/ath/ath11k/debugfs.c
+@@ -757,6 +757,10 @@
+ 			 atomic_read(&soc_stats->tx_ext_mcast),
+ 			 atomic_read(&soc_stats->tx_ext_nosta));
+ 	len += scnprintf(buf + len, size - len,
++			 "Extension descriptor frames sent with index search on the station's AST entry: %d, refused for lack of the index: %d\n",
++			 atomic_read(&soc_stats->tx_ext_idx),
++			 atomic_read(&soc_stats->tx_ext_noidx));
++	len += scnprintf(buf + len, size - len,
+ 			 "Scatter-gather frames refused for the TCP-only guard: not IP %d, not plain TCP %d; extension descriptor frames held until the station's first completion: %d\n",
+ 			 atomic_read(&soc_stats->tx_ext_sg_not_ip),
+ 			 atomic_read(&soc_stats->tx_ext_sg_not_tcp),
