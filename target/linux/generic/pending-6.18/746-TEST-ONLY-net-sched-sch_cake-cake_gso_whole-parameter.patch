@@ -1,0 +1,28 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] TEST-ONLY: net/sched: sch_cake: module parameter for whole GSO aggregates
+
+For A/B runs of the previous patch only. cake_gso_whole=0 splits every
+aggregate as before it. Not for submission and not for a release image.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -1620,12 +1620,16 @@
+  */
+ #define CAKE_GSO_WHOLE_SHIFT	3
+ 
++static bool cake_gso_whole = true;
++module_param(cake_gso_whole, bool, 0644);
++MODULE_PARM_DESC(cake_gso_whole, "TEST ONLY: keep short GSO aggregates whole (0 = always split)");
++
+ static bool cake_gso_keep_whole(const struct cake_sched_data *q,
+ 				const struct cake_tin_data *b, u32 adjlen)
+ {
+ 	u64 dur;
+ 
+-	if (!q->rate_ns)
++	if (!q->rate_ns || !READ_ONCE(cake_gso_whole))
+ 		return false;
+ 
+ 	dur = max((u64)adjlen * q->rate_ns >> q->rate_shft,
