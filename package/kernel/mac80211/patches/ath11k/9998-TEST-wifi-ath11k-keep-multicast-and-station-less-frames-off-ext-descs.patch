@@ -1,0 +1,59 @@
+TEST: wifi: ath11k: keep multicast and station-less frames off extension descriptors
+
+Hypothesis test for the firmware fault after a station (re)association on
+the scatter-gather path; counts each refusal in soc_dp_stats.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -963,6 +963,8 @@
+ 	atomic_t tx_tso_seg;
+ 	atomic_t tx_tso_sw;
+ 	atomic_t tx_sg;
++	atomic_t tx_ext_mcast;
++	atomic_t tx_ext_nosta;
+ 	/* GRO frame list batches, and their frames, split here */
+ 	atomic_t tx_fraglist;
+ 	atomic_t tx_fraglist_seg;
+--- a/drivers/net/wireless/ath/ath11k/debugfs.c
++++ b/drivers/net/wireless/ath/ath11k/debugfs.c
+@@ -753,6 +753,10 @@
+ 			 atomic_read(&soc_stats->tx_tso_sw),
+ 			 atomic_read(&soc_stats->tx_sg));
+ 	len += scnprintf(buf + len, size - len,
++			 "Frames with fragments kept off the extension descriptors: multicast %d, no station %d\n",
++			 atomic_read(&soc_stats->tx_ext_mcast),
++			 atomic_read(&soc_stats->tx_ext_nosta));
++	len += scnprintf(buf + len, size - len,
+ 			 "GRO frame list batches split in software: %d, their frames: %d\n",
+ 			 atomic_read(&soc_stats->tx_fraglist),
+ 			 atomic_read(&soc_stats->tx_fraglist_seg));
+--- a/drivers/net/wireless/ath/ath11k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_tx.c
+@@ -614,6 +614,12 @@
+ 	    n > ATH11K_DP_TX_TSO_MAX_SEGS)
+ 		return -EAGAIN;
+ 
++	/* TEST: frames the TCL may hand to the firmware stay in one buffer */
++	if (is_multicast_ether_addr(((struct ethhdr *)skb->data)->h_dest)) {
++		atomic_inc(&ab->soc_stats.tx_ext_mcast);
++		return -EAGAIN;
++	}
++
+ 	if (tso) {
+ 		if (!(shinfo->gso_type & (SKB_GSO_TCPV4 | SKB_GSO_TCPV6)) ||
+ 		    shinfo->gso_type & SKB_GSO_FRAGLIST ||
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -6636,7 +6636,9 @@
+ 		return ath11k_dp_tx_gso(ar, arvif, arsta, skb, held_ring);
+ 
+ 	if (unlikely(skb_is_nonlinear(skb))) {
+-		if (!ath11k_dp_tx_sg(ar, arvif, skb, held_ring))
++		if (!arsta)
++			atomic_inc(&ar->ab->soc_stats.tx_ext_nosta);
++		else if (!ath11k_dp_tx_sg(ar, arvif, skb, held_ring))
+ 			return 0;
+ 
+ 		if (skb_linearize(skb)) {
