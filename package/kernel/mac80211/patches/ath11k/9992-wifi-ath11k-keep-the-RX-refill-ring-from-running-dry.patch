@@ -23,6 +23,7 @@ hardware tail) in the soc_dp_stats debugfs file. The first is the fill at
 start. The ath11k.rx_refill_early module parameter restores the old order
 for an A/B.
 
+Fixes: d5c65159f289 ("ath11k: driver for Qualcomm IEEE 802.11ax devices")
 Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
 --- a/drivers/net/wireless/ath/ath11k/core.h
 +++ b/drivers/net/wireless/ath/ath11k/core.h
