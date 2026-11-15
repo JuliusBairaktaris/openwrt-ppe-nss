@@ -26,8 +26,17 @@ boot() {
 	rm -f /sys/fs/pstore/*
 	logger -t pstore-archive "crash dumps archived to $dir"
 
-	# keep the newest 20 archives - flash space over unbounded history
-	for d in $(ls -dt /root/pstore/*/ 2>/dev/null | tail -n +21); do
+	# Bound the history, but never by dropping a crash: an archive with a dmesg record
+	# (panic, Oops, lockup) is the evidence of a fault and is kept up to 50 of them; only
+	# console-only archives (clean reboots) rotate, the newest 20 kept. Mtime decides only
+	# among the same kind: before NTP the clock is a guess, and a mtime order once rotated a
+	# fresh crash record out behind older clean ones.
+	for d in $(ls -dt /root/pstore/*/ 2>/dev/null); do
+		ls "$d"dmesg-ramoops-* >/dev/null 2>&1 && echo "c $d" || echo "n $d"
+	done > /tmp/pstore.kinds
+	for d in $(grep '^n ' /tmp/pstore.kinds | cut -d' ' -f2 | tail -n +21) \
+		 $(grep '^c ' /tmp/pstore.kinds | cut -d' ' -f2 | tail -n +51); do
 		rm -rf "$d"
 	done
+	rm -f /tmp/pstore.kinds
 }
