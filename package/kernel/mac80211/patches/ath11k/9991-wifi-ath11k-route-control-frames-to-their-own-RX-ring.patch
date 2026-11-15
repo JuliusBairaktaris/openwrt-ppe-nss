@@ -2,9 +2,10 @@ wifi: ath11k: route control frames to their own RX ring
 
 The firmware has a packet routing command that ath11k never sends
 (WMI_PDEV_UPDATE_PKT_ROUTING_CMDID, advertised by
-WMI_TLV_SERVICE_PKT_ROUTING). It makes the classification engine push EAPOL, ARP, neighbour solicitation,
-DHCP, IGMP and MLD frames to a REO ring of the host's choice, instead of
-the ring the per-peer hash picks for the flow.
+WMI_TLV_SERVICE_PKT_ROUTING). It makes the classification engine push
+EAPOL, ARP, neighbour solicitation, DHCP, IGMP and MLD frames to a REO
+ring of the host's choice, instead of the ring the per-peer hash picks
+for the flow.
 
 Send it for each pdev when the radio starts, before any vdev is up (the
 firmware ignores it afterwards), with REO2SW1 as the destination. Every
