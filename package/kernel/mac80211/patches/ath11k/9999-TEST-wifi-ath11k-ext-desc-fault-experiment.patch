@@ -1,0 +1,463 @@
+TEST: wifi: ath11k: experiment on the extension descriptor completion fault
+
+Three switches for the bench, each with its own module parameter:
+
+ext_slot_wide gives the extension descriptor slots the vendor's 136 byte
+stride and clears the whole slot, the bytes past the descriptor too, each
+time one is built. The TCL data length stays that of the descriptor. It is
+read when the rings are allocated, so it takes effect with the next load of
+the module.
+
+tx_id_gen puts a generation in the two spare bits of the buffer id in the
+TCL cookie, counted up each time the id is issued. A completion that returns
+another generation is counted in tx_stale_compl and dropped without
+releasing the frame the id holds now. The generation is always sent; the
+switch decides whether it is checked, and can be changed at run time.
+
+tx_compl_log keeps the last completion of each id, and prints it next to the
+current one when a completion is stale, for an id that holds no frame, or
+returns another address than the one queued for the id, which is counted in
+tx_addr_mismatch.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -965,6 +965,11 @@
+ 	atomic_t tx_sg;
+ 	atomic_t tx_ext_mcast;
+ 	atomic_t tx_ext_nosta;
++	/* TEST: completions of a buffer id whose generation is not the
++	 * one issued, and whose returned address is not the queued one
++	 */
++	atomic_t tx_stale_compl;
++	atomic_t tx_addr_mismatch;
+ 	/* GRO frame list batches, and their frames, split here */
+ 	atomic_t tx_fraglist;
+ 	atomic_t tx_fraglist_seg;
+--- a/drivers/net/wireless/ath/ath11k/debugfs.c
++++ b/drivers/net/wireless/ath/ath11k/debugfs.c
+@@ -757,6 +757,10 @@
+ 			 atomic_read(&soc_stats->tx_ext_mcast),
+ 			 atomic_read(&soc_stats->tx_ext_nosta));
+ 	len += scnprintf(buf + len, size - len,
++			 "TX completions of a stale buffer id generation: %d, with an address other than the queued one: %d\n",
++			 atomic_read(&soc_stats->tx_stale_compl),
++			 atomic_read(&soc_stats->tx_addr_mismatch));
++	len += scnprintf(buf + len, size - len,
+ 			 "GRO frame list batches split in software: %d, their frames: %d\n",
+ 			 atomic_read(&soc_stats->tx_fraglist),
+ 			 atomic_read(&soc_stats->tx_fraglist_seg));
+--- a/drivers/net/wireless/ath/ath11k/dp.h
++++ b/drivers/net/wireless/ath/ath11k/dp.h
+@@ -111,6 +111,17 @@
+ 	u16 len;
+ };
+ 
++/* TEST: the last completion of a buffer id */
++struct ath11k_dp_tx_compl_rec {
++	unsigned long jiffies;
++	u64 addr;
++	u32 status;
++	/* 0: none, 1: WBM, 2: HTT */
++	u8 src;
++	u8 type;
++	u8 gen;
++};
++
+ struct dp_tx_ring {
+ 	u8 tcl_data_ring_id;
+ 	struct dp_srng tcl_data_ring;
+@@ -119,11 +130,19 @@
+ 	struct sk_buff **bufs;
+ 	u32 *free_ids;
+ 	u32 num_free;
++	/* TEST: the generation of each id, the address queued for it and its
++	 * last completion
++	 */
++	u8 *id_gen;
++	u64 *id_addr;
++	struct ath11k_dp_tx_compl_rec *id_last;
+ 	/* MSDU extension descriptors for TSO segments, the payload mappings
+ 	 * of each, the descriptor each buffer id uses, and the ones not in use
+ 	 */
+ 	struct hal_tx_msdu_ext *ext;
+ 	dma_addr_t ext_paddr;
++	/* bytes between two descriptors of @ext */
++	size_t ext_stride;
+ 	struct ath11k_dp_tx_ext_map *ext_map;
+ 	u16 *ext_slot;
+ 	u16 *ext_free;
+--- a/drivers/net/wireless/ath/ath11k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_tx.c
+@@ -35,6 +35,60 @@
+ MODULE_PARM_DESC(gso_fraglist,
+ 		 "Take GRO frame list aggregates as one frame (default: on)");
+ 
++/* TEST-ONLY: extension descriptor slots of the vendor's size, with the bytes
++ * past the descriptor cleared whenever a slot is built, instead of the
++ * descriptors back to back. Read when the rings are allocated, so a change
++ * takes effect with the next load of the module.
++ */
++static bool ath11k_ext_slot_wide = true;
++module_param_named(ext_slot_wide, ath11k_ext_slot_wide, bool, 0644);
++MODULE_PARM_DESC(ext_slot_wide,
++		 "136 byte extension descriptor slots, zero tailed; read at module load (default: on)");
++
++/* TEST-ONLY: the spare bits of the buffer id in the TCL cookie carry a
++ * generation, kept for each id and counted up each time the id is issued. A
++ * completion that returns another generation than the id's is counted and
++ * dropped without touching the frame the id holds now. The generation is
++ * always sent; the switch only decides whether it is checked.
++ */
++static bool ath11k_tx_id_gen = true;
++module_param_named(tx_id_gen, ath11k_tx_id_gen, bool, 0644);
++MODULE_PARM_DESC(tx_id_gen,
++		 "Check the generation of a TX completion's buffer id (default: on)");
++
++/* TEST-ONLY: keep the last completion of each id, and print it next to the
++ * current one when a completion is stale, unknown or returns another address.
++ */
++static bool ath11k_tx_compl_log = true;
++module_param_named(tx_compl_log, ath11k_tx_compl_log, bool, 0644);
++MODULE_PARM_DESC(tx_compl_log,
++		 "Keep the last completion of each TX buffer id (default: on)");
++
++/* The buffer ids are below DP_TX_IDR_SIZE, 15 bits, of the 17 the cookie has
++ * for them: the generation takes the two above.
++ */
++#define ATH11K_TX_ID_MASK	GENMASK(14, 0)
++#define ATH11K_TX_ID_GEN	GENMASK(16, 15)
++#define ATH11K_TX_COOKIE_ID(c)	(FIELD_GET(DP_TX_DESC_ID_MSDU_ID, c) & ATH11K_TX_ID_MASK)
++#define ATH11K_TX_EXT_SLOT_WIDE	136
++
++static_assert(DP_TX_IDR_SIZE <= ATH11K_TX_ID_MASK + 1);
++
++static inline struct hal_tx_msdu_ext *
++ath11k_dp_tx_ext_slot(struct dp_tx_ring *tx_ring, unsigned int slot)
++{
++	return (void *)((u8 *)tx_ring->ext + slot * tx_ring->ext_stride);
++}
++
++/* The id and its generation, as they go in the cookie. Under the id lock, or
++ * for an id the caller holds.
++ */
++static inline u32 ath11k_dp_tx_id_cookie(struct dp_tx_ring *tx_ring, u32 id)
++{
++	return FIELD_PREP(ATH11K_TX_ID_MASK, id) |
++	       FIELD_PREP(ATH11K_TX_ID_GEN, tx_ring->id_gen[id]);
++}
++
+ bool ath11k_dp_tx_fraglist_wanted(struct ath11k_base *ab)
+ {
+ 	return ath11k_dp_tx_tso_wanted(ab) && ath11k_gso_fraglist;
+@@ -127,9 +181,18 @@
+ 	tx_ring->ext_slot = kvmalloc_array(DP_TX_IDR_SIZE - 1,
+ 					   sizeof(*tx_ring->ext_slot),
+ 					   GFP_KERNEL);
++	tx_ring->id_gen = kvcalloc(DP_TX_IDR_SIZE - 1,
++				   sizeof(*tx_ring->id_gen), GFP_KERNEL);
++	tx_ring->id_addr = kvcalloc(DP_TX_IDR_SIZE - 1,
++				    sizeof(*tx_ring->id_addr), GFP_KERNEL);
++	tx_ring->id_last = kvcalloc(DP_TX_IDR_SIZE - 1,
++				    sizeof(*tx_ring->id_last), GFP_KERNEL);
++	tx_ring->ext_stride = READ_ONCE(ath11k_ext_slot_wide) ?
++			      ATH11K_TX_EXT_SLOT_WIDE :
++			      sizeof(struct hal_tx_msdu_ext);
+ 	if (ab->hw_params.tx_tso) {
+ 		tx_ring->ext = dma_alloc_coherent(ab->dev, DP_TX_EXT_DESC_NUM *
+-						  sizeof(*tx_ring->ext),
++						  tx_ring->ext_stride,
+ 						  &tx_ring->ext_paddr,
+ 						  GFP_KERNEL);
+ 		tx_ring->ext_map = kvcalloc(DP_TX_EXT_DESC_NUM,
+@@ -140,6 +203,7 @@
+ 					     GFP_KERNEL);
+ 	}
+ 	if (!tx_ring->bufs || !tx_ring->free_ids || !tx_ring->ext_slot ||
++	    !tx_ring->id_gen || !tx_ring->id_addr || !tx_ring->id_last ||
+ 	    (ab->hw_params.tx_tso &&
+ 	     (!tx_ring->ext || !tx_ring->ext_map || !tx_ring->ext_free))) {
+ 		ath11k_dp_tx_bufs_free(ab, tx_ring);
+@@ -166,15 +230,21 @@
+ 	kvfree(tx_ring->bufs);
+ 	kvfree(tx_ring->free_ids);
+ 	kvfree(tx_ring->ext_slot);
++	kvfree(tx_ring->id_gen);
++	kvfree(tx_ring->id_addr);
++	kvfree(tx_ring->id_last);
+ 	if (tx_ring->ext)
+ 		dma_free_coherent(ab->dev,
+-				  DP_TX_EXT_DESC_NUM * sizeof(*tx_ring->ext),
++				  DP_TX_EXT_DESC_NUM * tx_ring->ext_stride,
+ 				  tx_ring->ext, tx_ring->ext_paddr);
+ 	kvfree(tx_ring->ext_map);
+ 	kvfree(tx_ring->ext_free);
+ 	tx_ring->bufs = NULL;
+ 	tx_ring->free_ids = NULL;
+ 	tx_ring->ext_slot = NULL;
++	tx_ring->id_gen = NULL;
++	tx_ring->id_addr = NULL;
++	tx_ring->id_last = NULL;
+ 	tx_ring->ext = NULL;
+ 	tx_ring->ext_map = NULL;
+ 	tx_ring->ext_free = NULL;
+@@ -192,6 +262,7 @@
+ 
+ 	id = tx_ring->free_ids[--tx_ring->num_free];
+ 	tx_ring->bufs[id] = skb;
++	tx_ring->id_gen[id] = (tx_ring->id_gen[id] + 1) & 3;
+ 
+ 	return id;
+ }
+@@ -320,7 +391,8 @@
+ 	}
+ 
+ 	ti.desc_id = FIELD_PREP(DP_TX_DESC_ID_MAC_ID, ar->pdev_idx) |
+-		     FIELD_PREP(DP_TX_DESC_ID_MSDU_ID, ret) |
++		     FIELD_PREP(DP_TX_DESC_ID_MSDU_ID,
++				ath11k_dp_tx_id_cookie(tx_ring, ret)) |
+ 		     FIELD_PREP(DP_TX_DESC_ID_POOL_ID, pool_id);
+ 	ti.encap_type = ath11k_dp_tx_get_encap_type(arvif, skb);
+ 
+@@ -401,6 +473,7 @@
+ 	}
+ 
+ 	ti.data_len = skb->len;
++	tx_ring->id_addr[ret] = ti.paddr;
+ 	skb_cb->paddr = ti.paddr;
+ 	skb_cb->vif = arvif->vif;
+ 	skb_cb->ar = ar;
+@@ -465,7 +538,7 @@
+ fail_remove_idr:
+ 	spin_lock_bh(&tx_ring->tx_idr_lock);
+ 	ath11k_dp_tx_buf_put_id(ab, tx_ring,
+-				FIELD_GET(DP_TX_DESC_ID_MSDU_ID, ti.desc_id),
++				ATH11K_TX_COOKIE_ID(ti.desc_id),
+ 				&more, NULL);
+ 	spin_unlock_bh(&tx_ring->tx_idr_lock);
+ 
+@@ -681,7 +754,8 @@
+ 	off = hdr_len;
+ 	left = skb->len - hdr_len;
+ 	for (i = 0; i < n; i++) {
+-		struct hal_tx_msdu_ext *ext = &tx_ring->ext[slots[i]];
++		struct hal_tx_msdu_ext *ext =
++			ath11k_dp_tx_ext_slot(tx_ring, slots[i]);
+ 		struct ath11k_dp_tx_ext_map *map = &tx_ring->ext_map[slots[i]];
+ 		unsigned int len = tso ? min(left, mss) : left;
+ 		u32 seg_flags = flags;
+@@ -691,7 +765,8 @@
+ 		if (i < n - 1)
+ 			seg_flags &= ~(TCPHDR_FIN | TCPHDR_PSH);
+ 
+-		memset(ext, 0, sizeof(*ext));
++		/* the whole slot: the bytes past the descriptor too */
++		memset(ext, 0, tx_ring->ext_stride);
+ 		if (ath11k_dp_tx_tso_map(ab->dev, skb, map, ext, &piece, &off,
+ 					 len)) {
+ 			ath11k_dp_tx_tso_unmap(ab->dev, map);
+@@ -770,15 +845,17 @@
+ 		ti.enable_mesh = true;
+ 	ti.flags1 = FIELD_PREP(HAL_TCL_DATA_CMD_INFO2_TID_OVERWRITE, 1);
+ 	/* the TCL reads this much of the extension descriptor */
+-	ti.data_len = sizeof(*tx_ring->ext);
++	ti.data_len = sizeof(struct hal_tx_msdu_ext);
+ 
+ 	for (i = 0; i < n; i++) {
+ 		ti.desc_id = FIELD_PREP(DP_TX_DESC_ID_MAC_ID, ar->pdev_idx) |
+-			     FIELD_PREP(DP_TX_DESC_ID_MSDU_ID, ids[i]) |
++			     FIELD_PREP(DP_TX_DESC_ID_MSDU_ID,
++					ath11k_dp_tx_id_cookie(tx_ring, ids[i])) |
+ 			     FIELD_PREP(DP_TX_DESC_ID_POOL_ID,
+ 					skb_get_queue_mapping(skb) &
+ 					(ATH11K_HW_MAX_QUEUES - 1));
+-		ti.paddr = tx_ring->ext_paddr + slots[i] * sizeof(*tx_ring->ext);
++		ti.paddr = tx_ring->ext_paddr + slots[i] * tx_ring->ext_stride;
++		tx_ring->id_addr[ids[i]] = ti.paddr;
+ 		ath11k_hal_tx_cmd_desc_setup(ab,
+ 					     ath11k_hal_srng_src_get_next_entry(ab, tcl_ring) +
+ 					     sizeof(struct hal_tlv_hdr), &ti);
+@@ -903,8 +980,80 @@
+ 		skb_cb->tso_try = try_cnt;
+ }
+ 
++/* TEST: checks a completion's id against what the id holds, under the id
++ * lock and before the id is released. Returns false for a completion of an
++ * older issue of the id, which must not touch the frame the id holds now.
++ */
++static bool ath11k_dp_tx_compl_check(struct ath11k_base *ab,
++				     struct dp_tx_ring *tx_ring,
++				     const struct hal_wbm_release_ring *d,
++				     u8 src, u32 status)
++{
++	static const char * const path[] = { "none", "wbm", "htt" };
++	u32 cookie = FIELD_GET(BUFFER_ADDR_INFO1_SW_COOKIE,
++			       d->buf_addr_info.info1);
++	u32 raw = FIELD_GET(DP_TX_DESC_ID_MSDU_ID, cookie);
++	u32 id = raw & ATH11K_TX_ID_MASK;
++	u8 gen = FIELD_GET(ATH11K_TX_ID_GEN, raw);
++	u8 type = FIELD_GET(HAL_WBM_RELEASE_INFO0_DESC_TYPE, d->info0);
++	u8 rel_src = FIELD_GET(HAL_WBM_RELEASE_INFO0_REL_SRC_MODULE, d->info0);
++	u64 addr = ((u64)FIELD_GET(BUFFER_ADDR_INFO1_ADDR,
++				   d->buf_addr_info.info1) << 32) |
++		   d->buf_addr_info.info0;
++	bool log = READ_ONCE(ath11k_tx_compl_log);
++	struct ath11k_dp_tx_compl_rec *last, prev;
++	const char *what = NULL;
++	bool ok = true;
++
++	if (unlikely(id >= DP_TX_IDR_SIZE - 1))
++		return true;
++
++	last = &tx_ring->id_last[id];
++	prev = *last;
++
++	if (unlikely(!tx_ring->bufs[id])) {
++		what = "unknown msdu_id";
++	} else if (unlikely(READ_ONCE(ath11k_tx_id_gen) &&
++			    gen != tx_ring->id_gen[id])) {
++		what = "stale generation";
++		atomic_inc(&ab->soc_stats.tx_stale_compl);
++		ok = false;
++	} else if (unlikely(addr != tx_ring->id_addr[id])) {
++		what = "address mismatch";
++		atomic_inc(&ab->soc_stats.tx_addr_mismatch);
++	}
++
++	if (unlikely(what)) {
++		ath11k_warn(ab,
++			    "tx completion %s: path %s id %u gen expected %u got %u rel_src %u %s %u buf_type %u addr returned 0x%llx queued 0x%llx\n",
++			    what, path[src], id, tx_ring->id_gen[id], gen,
++			    rel_src, src == 2 ? "htt_status" : "tqm_reason",
++			    status, type, addr, tx_ring->id_addr[id]);
++		if (log && prev.src)
++			ath11k_warn(ab,
++				    "tx completion id %u previous: path %s %s %u buf_type %u gen %u addr 0x%llx %ums ago\n",
++				    id, path[prev.src],
++				    prev.src == 2 ? "htt_status" : "tqm_reason",
++				    prev.status, prev.type, prev.gen, prev.addr,
++				    jiffies_to_msecs(jiffies - prev.jiffies));
++	}
++
++	if (log && ok) {
++		last->jiffies = jiffies;
++		last->addr = addr;
++		last->status = status;
++		last->src = src;
++		last->type = type;
++		last->gen = gen;
++	}
++
++	return ok;
++}
++
+ static void ath11k_dp_tx_free_txbuf(struct ath11k_base *ab, u8 mac_id,
+ 				    int msdu_id,
++				    const struct hal_wbm_release_ring *desc,
++				    u32 wbm_status,
+ 				    struct dp_tx_ring *tx_ring,
+ 				    unsigned long *push)
+ {
+@@ -915,6 +1064,11 @@
+ 	bool more;
+ 
+ 	spin_lock(&tx_ring->tx_idr_lock);
++	if (unlikely(!ath11k_dp_tx_compl_check(ab, tx_ring, desc, 2,
++					       wbm_status))) {
++		spin_unlock(&tx_ring->tx_idr_lock);
++		return;
++	}
+ 	msdu = ath11k_dp_tx_buf_put_id(ab, tx_ring, msdu_id, &more, &seg);
+ 	spin_unlock(&tx_ring->tx_idr_lock);
+ 
+@@ -986,6 +1140,8 @@
+ 
+ static void
+ ath11k_dp_tx_htt_tx_complete_buf(struct ath11k_base *ab, u8 mac_id,
++				 const struct hal_wbm_release_ring *desc,
++				 u32 wbm_status,
+ 				 struct dp_tx_ring *tx_ring,
+ 				 struct ath11k_dp_htt_wbm_tx_status *ts,
+ 				 unsigned long *push)
+@@ -1001,6 +1157,11 @@
+ 	bool batch_ok;
+ 
+ 	spin_lock(&tx_ring->tx_idr_lock);
++	if (unlikely(!ath11k_dp_tx_compl_check(ab, tx_ring, desc, 2,
++					       wbm_status))) {
++		spin_unlock(&tx_ring->tx_idr_lock);
++		return;
++	}
+ 	msdu = ath11k_dp_tx_buf_put_id(ab, tx_ring, ts->msdu_id, &more, &seg);
+ 	spin_unlock(&tx_ring->tx_idr_lock);
+ 
+@@ -1104,13 +1265,14 @@
+ 		else
+ 			ts.peer_id = HTT_INVALID_PEER_ID;
+ 
+-		ath11k_dp_tx_htt_tx_complete_buf(ab, mac_id, tx_ring, &ts,
+-						 push);
++		ath11k_dp_tx_htt_tx_complete_buf(ab, mac_id, desc, wbm_status,
++						 tx_ring, &ts, push);
+ 
+ 		break;
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_REINJ:
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_INSPECT:
+-		ath11k_dp_tx_free_txbuf(ab, mac_id, msdu_id, tx_ring, push);
++		ath11k_dp_tx_free_txbuf(ab, mac_id, msdu_id, desc, wbm_status,
++					tx_ring, push);
+ 		break;
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_MEC_NOTIFY:
+ 		/* This event is to be handled only when the driver decides to
+@@ -1455,6 +1617,7 @@
+ 	u32 msdu_id;
+ 	u8 mac_id;
+ 	bool more;
++	bool stale;
+ };
+ 
+ /* A frame, or a segment of a batch, is done: counted at the end of the run,
+@@ -1537,9 +1700,10 @@
+ 			desc_id = FIELD_GET(BUFFER_ADDR_INFO1_SW_COOKIE,
+ 					    it->tx_status->buf_addr_info.info1);
+ 			it->mac_id = FIELD_GET(DP_TX_DESC_ID_MAC_ID, desc_id);
+-			it->msdu_id = FIELD_GET(DP_TX_DESC_ID_MSDU_ID, desc_id);
++			it->msdu_id = ATH11K_TX_COOKIE_ID(desc_id);
+ 			it->msdu = NULL;
+ 			it->more = false;
++			it->stale = false;
+ 			it->seg.skb = NULL;
+ 			it->seg.len = 0;
+ 		}
+@@ -1549,11 +1713,19 @@
+ 			struct ath11k_dp_tx_compl_item *it = &items[k];
+ 
+ 			if (likely(it->ts.buf_rel_source !=
+-				   HAL_WBM_REL_SRC_MODULE_FW))
++				   HAL_WBM_REL_SRC_MODULE_FW)) {
++				if (unlikely(!ath11k_dp_tx_compl_check(ab, tx_ring,
++								       it->tx_status,
++								       1,
++								       it->ts.status))) {
++					it->stale = true;
++					continue;
++				}
+ 				it->msdu = ath11k_dp_tx_buf_put_id(ab, tx_ring,
+ 								   it->msdu_id,
+ 								   &it->more,
+ 								   &it->seg);
++			}
+ 		}
+ 		spin_unlock(&tx_ring->tx_idr_lock);
+ 
+@@ -1573,6 +1745,10 @@
+ 					prefetch(skb_shinfo(items[k + 1].msdu));
+ 			}
+ 
++			/* an older issue of the id: its frame is not this one */
++			if (unlikely(it->stale))
++				continue;
++
+ 			if (unlikely(it->ts.buf_rel_source ==
+ 				     HAL_WBM_REL_SRC_MODULE_FW)) {
+ 				ath11k_dp_tx_process_htt_tx_complete(ab,
