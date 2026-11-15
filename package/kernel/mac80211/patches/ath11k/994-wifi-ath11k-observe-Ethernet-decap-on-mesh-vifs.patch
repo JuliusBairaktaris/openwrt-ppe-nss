@@ -1,0 +1,156 @@
+wifi: ath11k: observe Ethernet decap on mesh vifs
+
+TEST-ONLY observer for the mesh decap experiment: mark mesh peers, count
+frames delivered through Ethernet decap and log the first 32 with a
+hexdump. Count the frames converted back to 802.11 because they carry a
+length field or are of the 802.3 decap type. Dropped before upstream.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -924,6 +924,15 @@ struct ath11k_soc_dp_stats {
+ 	u32 rxdma_error[HAL_REO_ENTR_RING_RXDMA_ECODE_MAX];
+ 	u32 reo_error[HAL_REO_DEST_RING_ERROR_CODE_MAX];
+ 	u32 hal_reo_error[DP_REO_DST_RING_MAX];
++	/* Ethernet frames converted back to 802.11 because their source is
++	 * not the peer's address, or because they are 802.3 frames with a
++	 * length field (or of the 802.3 decap type), and those received
++	 * from a mesh peer
++	 */
++	u32 eth_native_sa;
++	u32 eth_native_llc;
++	u32 mesh_decap;
++	u32 mesh_decap_ctl;
+ 	struct ath11k_soc_dp_tx_err_stats tx_err;
+ 	struct ath11k_dp_ring_bp_stats bp_stats;
+ };
+--- a/drivers/net/wireless/ath/ath11k/debugfs.c
++++ b/drivers/net/wireless/ath/ath11k/debugfs.c
+@@ -703,6 +703,13 @@ static ssize_t ath11k_debugfs_dump_soc_d
+ 			 soc_stats->hal_reo_error[2],
+ 			 soc_stats->hal_reo_error[3]);
+ 
++	len += scnprintf(buf + len, size - len,
++			 "\nEthernet frames converted back to 802.11 (source not the peer's): %u, (802.3 length or LLC frames): %u\n",
++			 soc_stats->eth_native_sa, soc_stats->eth_native_llc);
++	len += scnprintf(buf + len, size - len,
++			 "Mesh peer frames decapsulated to Ethernet: %u, with a mesh header flagged: %u\n",
++			 soc_stats->mesh_decap, soc_stats->mesh_decap_ctl);
++
+ 	len += scnprintf(buf + len, size - len, "\nSOC TX STATS:\n");
+ 	len += scnprintf(buf + len, size - len, "\nTCL Ring Full Failures:\n");
+ 
+--- a/drivers/net/wireless/ath/ath11k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
+@@ -2429,6 +2429,28 @@ ath11k_dp_rx_h_find_peer(struct ath11k_b
+ 	return peer;
+ }
+ 
++/* TEST-ONLY: record what an Ethernet-decapsulated mesh frame looks like */
++static void ath11k_dp_rx_h_mesh_decap(struct ath11k *ar, struct sk_buff *msdu,
++				      struct hal_rx_desc *rx_desc)
++{
++	struct ath11k_base *ab = ar->ab;
++	bool ctl = ath11k_dp_rx_h_msdu_start_mesh_ctl_present(ab, rx_desc);
++	u32 n = ab->soc_stats.mesh_decap++;
++
++	if (ctl)
++		ab->soc_stats.mesh_decap_ctl++;
++
++	if (n >= 32)
++		return;
++
++	ath11k_info(ab, "mesh decap %u: msdu_len %u skb %u mesh_ctl %u, first bytes:\n",
++		    n, ath11k_dp_rx_h_msdu_start_msdu_len(ab, rx_desc),
++		    msdu->len, ctl);
++	print_hex_dump(KERN_INFO, "ath11k mesh decap: ", DUMP_PREFIX_OFFSET,
++		       16, 1, msdu->data, min_t(unsigned int, msdu->len, 48),
++		       false);
++}
++
+ static void ath11k_dp_rx_h_mpdu(struct ath11k *ar,
+ 				struct sk_buff *msdu,
+ 				struct hal_rx_desc *rx_desc,
+@@ -2442,6 +2464,7 @@ static void ath11k_dp_rx_h_mpdu(struct a
+ 	struct ieee80211_hdr *hdr;
+ 	struct ath11k_peer *peer;
+ 	struct rx_attention *rx_attention;
++	bool mesh_decap = false;
+ 	u32 err_bitmap;
+ 
+ 	/* PN for multicast packets will be checked in mac80211 */
+@@ -2475,22 +2498,39 @@ static void ath11k_dp_rx_h_mpdu(struct a
+ 	 * frames of a WDS station.
+ 	 */
+ 	decap = ath11k_dp_rx_h_msdu_start_decap_type(ar->ab, rx_desc);
+-	if ((decap == DP_RX_DECAP_TYPE_ETHERNET2_DIX ||
+-	     decap == DP_RX_DECAP_TYPE_8023) &&
+-	    (!peer || !ether_addr_equal(((struct ethhdr *)msdu->data)->h_source,
+-					peer->addr)))
+-		rxcb->eth_native = true;
+-	/* A frame of the 802.3 decap type, and one with a length field in
+-	 * place of the type, is not the DIX frame mac80211's 802.3 path
+-	 * takes: convert it back to an 802.11 frame, as a native frame
+-	 * would have arrived, so that it reaches the stack the same way.
+-	 */
+-	if (decap == DP_RX_DECAP_TYPE_8023 ||
+-	    (decap == DP_RX_DECAP_TYPE_ETHERNET2_DIX &&
+-	     ntohs(((struct ethhdr *)msdu->data)->h_proto) < ETH_P_802_3_MIN))
+-		rxcb->eth_native = true;
++	if (decap == DP_RX_DECAP_TYPE_ETHERNET2_DIX ||
++	    decap == DP_RX_DECAP_TYPE_8023) {
++		/* A mesh point also needs the mesh header, which mac80211
++		 * gets only from a native frame. Whether the hardware leaves
++		 * it in place is what the counters and the dump answer.
++		 */
++		if (peer && peer->mesh) {
++			rxcb->eth_native = true;
++			mesh_decap = true;
++		} else if (!peer ||
++			   !ether_addr_equal(((struct ethhdr *)msdu->data)->h_source,
++					     peer->addr)) {
++			rxcb->eth_native = true;
++			ar->ab->soc_stats.eth_native_sa++;
++		}
++		/* A frame of the 802.3 decap type, and one with a length
++		 * field in place of the type, is not the DIX frame mac80211's
++		 * 802.3 path takes: convert it back to an 802.11 frame, as a
++		 * native frame would have arrived, so that it reaches the
++		 * stack the same way.
++		 */
++		if (decap == DP_RX_DECAP_TYPE_8023 ||
++		    ntohs(((struct ethhdr *)msdu->data)->h_proto) <
++		    ETH_P_802_3_MIN) {
++			rxcb->eth_native = true;
++			ar->ab->soc_stats.eth_native_llc++;
++		}
++	}
+ 	spin_unlock_bh(&ar->ab->base_lock);
+ 
++	if (unlikely(mesh_decap))
++		ath11k_dp_rx_h_mesh_decap(ar, msdu, rx_desc);
++
+ 	rx_attention = ath11k_dp_rx_get_attention(ar->ab, rx_desc);
+ 	err_bitmap = ath11k_dp_rx_h_attn_mpdu_err(rx_attention);
+ 	if (enctype != HAL_ENCRYPT_TYPE_OPEN && !err_bitmap)
+--- a/drivers/net/wireless/ath/ath11k/peer.c
++++ b/drivers/net/wireless/ath/ath11k/peer.c
+@@ -436,6 +436,7 @@ int ath11k_peer_create(struct ath11k *ar
+ 
+ 	peer->pdev_idx = ar->pdev_idx;
+ 	peer->sta = sta;
++	peer->mesh = arvif->vif->type == NL80211_IFTYPE_MESH_POINT;
+ 
+ 	if (arvif->vif->type == NL80211_IFTYPE_STATION) {
+ 		arvif->ast_hash = peer->ast_hash;
+--- a/drivers/net/wireless/ath/ath11k/peer.h
++++ b/drivers/net/wireless/ath/ath11k/peer.h
+@@ -35,6 +35,7 @@ struct ath11k_peer {
+ 	u16 sec_type_grp;
+ 	bool is_authorized;
+ 	bool dp_setup_done;
++	bool mesh;
+ };
+ 
+ void ath11k_peer_unmap_event(struct ath11k_base *ab, u16 peer_id);
