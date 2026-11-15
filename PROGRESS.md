@@ -14,3 +14,13 @@ Image c: subsys 494 (rx_status->tid, mac80211 side) and 495 (frames with h_proto
 offload) split out; 993 only fills status->tid. checkpatch --strict clean (only the missing-author
 artifact of patch files). Image scratchpad/m3m4/wifi-8023-c.bin sha256 676d5cae...05c0. Not run: flash, bench,
 tools/refreshcheck.sh (needs openwrt-ppe host zstd, missing).
+
+## wifi-hw2 (from wifi-8023)
+Patches (package/kernel/mac80211/patches/ath11k, copies+scripts in patches/wip/host-wifi-fastpath/hw2):
+ 999 PPDU stats trim (param ppdu_stats_trim); 9991 pkt routing to REO2SW1 (pkt_routing) + per-ring MSDU count;
+ 9992 refill served first + deficit carry + empty counter (rx_refill_early); 9993 csum fix (Fixes d5c65159f289);
+ 9994 skb hash from flow_id_toeplitz (rx_hash); 9995 header TLV vs MPDU_START comparison (rx_hdr_check, off).
+ E1-b: TLV NOT dropped (see report). Lockup detectors: cherry-pick 74e6217d365 + .config lines.
+Per-patch compile: make package/kernel/mac80211/{clean,compile} clean (logs scratchpad/hw2/build-*.log).
+Full build: make target/linux/clean; PATH=clean make -j16 > scratchpad/hw2/build-full.log
+Not run: flash, bench.
