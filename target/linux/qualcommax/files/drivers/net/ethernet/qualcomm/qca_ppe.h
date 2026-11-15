@@ -1690,6 +1690,12 @@ struct qca_ppe_priv {
 	unsigned int vp_gen;
 	struct ppe_vp_cache __percpu *vp_cache;
 	bool vp_stopped;
+	/* TEST-ONLY */
+	bool vp_ingress;
+	bool vp_gso;
+	bool vp_last;
+	bool xdev_cache;
+	bool wifi_prio;
 	struct notifier_block vp_nb;
 	u16 port_pvid[QCA_PPE_MAX_PORTS];
 	struct clk *ppe_clk;
