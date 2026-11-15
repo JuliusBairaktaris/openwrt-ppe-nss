@@ -1,0 +1,266 @@
+TEST: wifi: ath11k: build extension descriptor frames as the Android host does
+
+Test only. A batch sent through MSDU extension descriptors makes the
+firmware fail, and so does a scatter-gather frame. The host driver that
+Android builds for the same TCL (qca-wifi-host-cmn, used with TSO on
+QCA6390 and QCA6490 radios) differs from ours in ways that did not matter
+to the hardware headers, and one of them it carries under a build option
+named for a Wi-Fi TX DMA limitation, which it enables on its QCA6490 and
+QCA6750 configurations.
+
+With module parameter tso_android (default on, read for each frame except
+where stated):
+
+- The buffer that ends the headers ends on an 8 byte boundary. For a TCP
+  batch that is the headers, for a scatter-gather frame the linear part. The
+  host driver slides the headers down by the excess in the head room of the
+  frame, moving the header offsets with them, and maps the payload where it
+  was. The frame needs 8 bytes of head room and an unshared head
+  (skb_cow_head()); the slide is undone if the frame is not queued.
+- A descriptor never straddles a 4096 byte boundary of the descriptor memory,
+  as the descriptor pool of the vendor driver, which is made of pages. The
+  slots are placed per block; read when the rings are allocated.
+- The IP, UDP and TCP checksum enables of the TCL command are all set for a
+  batch, as the vendor driver sets them, and the TCP NS flag of its segments
+  is cleared, which that driver never sends.
+
+With the parameter off the frames are built as before.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/drivers/net/wireless/ath/ath11k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_tx.c
+@@ -45,6 +45,23 @@
+ MODULE_PARM_DESC(ext_slot_wide,
+ 		 "136 byte extension descriptor slots, zero tailed; read at module load (default: on)");
+ 
++/* TEST-ONLY: send the extension descriptor frames as the Android host driver
++ * of the same TCL does: the buffer that ends the headers (the headers of a
++ * TCP batch, the linear part of a scatter-gather frame) ends on an 8 byte
++ * boundary, which that driver builds for the Wi-Fi TX DMA limitation by
++ * sliding the headers down by the excess; a descriptor never straddles a 4096
++ * byte boundary of the descriptor memory (read when the rings are allocated);
++ * the IP, UDP and TCP checksums of a batch are all enabled in the TCL command
++ * and the TCP NS flag of its segments is cleared. Read for each frame.
++ */
++static bool ath11k_tso_android = true;
++module_param_named(tso_android, ath11k_tso_android, bool, 0644);
++MODULE_PARM_DESC(tso_android,
++		 "Build extension descriptor frames as the Android host driver does (default: on)");
++
++#define ATH11K_TX_EXT_ALIGN	8
++#define ATH11K_TX_EXT_BOUNDARY	4096
++
+ /* TEST-ONLY: the spare bits of the buffer id in the TCL cookie carry a
+  * generation, kept for each id and counted up each time the id is issued. A
+  * completion that returns another generation than the id's is counted and
+@@ -161,10 +178,33 @@
+ 
+ static_assert(DP_TX_IDR_SIZE <= ATH11K_TX_ID_MASK + 1);
+ 
++/* The byte offset of a descriptor slot in the descriptor memory: back to back,
++ * or, with ext_per_page set, as many to a 4096 byte block as fit and none
++ * across a block.
++ */
++static inline size_t ath11k_dp_tx_ext_off(struct dp_tx_ring *tx_ring,
++					  unsigned int slot)
++{
++	if (tx_ring->ext_per_page)
++		return (slot / tx_ring->ext_per_page) * ATH11K_TX_EXT_BOUNDARY +
++		       (slot % tx_ring->ext_per_page) * tx_ring->ext_stride;
++
++	return slot * tx_ring->ext_stride;
++}
++
++static inline size_t ath11k_dp_tx_ext_size(struct dp_tx_ring *tx_ring)
++{
++	if (tx_ring->ext_per_page)
++		return DIV_ROUND_UP(DP_TX_EXT_DESC_NUM, tx_ring->ext_per_page) *
++		       ATH11K_TX_EXT_BOUNDARY;
++
++	return DP_TX_EXT_DESC_NUM * tx_ring->ext_stride;
++}
++
+ static inline struct hal_tx_msdu_ext *
+ ath11k_dp_tx_ext_slot(struct dp_tx_ring *tx_ring, unsigned int slot)
+ {
+-	return (void *)((u8 *)tx_ring->ext + slot * tx_ring->ext_stride);
++	return (void *)((u8 *)tx_ring->ext + ath11k_dp_tx_ext_off(tx_ring, slot));
+ }
+ 
+ /* The id and its generation, as they go in the cookie. Under the id lock, or
+@@ -277,9 +317,11 @@
+ 	tx_ring->ext_stride = READ_ONCE(ath11k_ext_slot_wide) ?
+ 			      ATH11K_TX_EXT_SLOT_WIDE :
+ 			      sizeof(struct hal_tx_msdu_ext);
++	tx_ring->ext_per_page = ath11k_tso_android ?
++				ATH11K_TX_EXT_BOUNDARY / tx_ring->ext_stride : 0;
+ 	if (ab->hw_params.tx_tso) {
+-		tx_ring->ext = dma_alloc_coherent(ab->dev, DP_TX_EXT_DESC_NUM *
+-						  tx_ring->ext_stride,
++		tx_ring->ext = dma_alloc_coherent(ab->dev,
++						  ath11k_dp_tx_ext_size(tx_ring),
+ 						  &tx_ring->ext_paddr,
+ 						  GFP_KERNEL);
+ 		tx_ring->ext_map = kvcalloc(DP_TX_EXT_DESC_NUM,
+@@ -321,8 +363,7 @@
+ 	kvfree(tx_ring->id_addr);
+ 	kvfree(tx_ring->id_last);
+ 	if (tx_ring->ext)
+-		dma_free_coherent(ab->dev,
+-				  DP_TX_EXT_DESC_NUM * tx_ring->ext_stride,
++		dma_free_coherent(ab->dev, ath11k_dp_tx_ext_size(tx_ring),
+ 				  tx_ring->ext, tx_ring->ext_paddr);
+ 	kvfree(tx_ring->ext_map);
+ 	kvfree(tx_ring->ext_free);
+@@ -734,6 +775,40 @@
+ 		dport == htons(546) || dport == htons(547));
+ }
+ 
++/* Slides the first @len bytes of the frame down by @pad bytes, so that they end
++ * @pad bytes lower, and the bytes @pad past them stay where they were: the
++ * Android host driver does this to the headers of a batch to end the buffer of
++ * the headers on an 8 byte boundary, with the offsets of the headers. The
++ * frame is longer by @pad, the bytes between the slid part and the rest being
++ * the ones the slide left. Undone by ath11k_dp_tx_ext_unpad(). The head room
++ * and an unshared head are the caller's.
++ */
++static void ath11k_dp_tx_ext_pad(struct sk_buff *skb, unsigned int len,
++				 unsigned int pad)
++{
++	skb_push(skb, pad);
++	memmove(skb->data, skb->data + pad, len);
++	if (skb_mac_header_was_set(skb))
++		skb->mac_header -= pad;
++	if (skb->network_header != (typeof(skb->network_header))~0U)
++		skb->network_header -= pad;
++	if (skb->transport_header != (typeof(skb->transport_header))~0U)
++		skb->transport_header -= pad;
++}
++
++static void ath11k_dp_tx_ext_unpad(struct sk_buff *skb, unsigned int len,
++				   unsigned int pad)
++{
++	memmove(skb->data + pad, skb->data, len);
++	skb_pull(skb, pad);
++	if (skb_mac_header_was_set(skb))
++		skb->mac_header += pad;
++	if (skb->network_header != (typeof(skb->network_header))~0U)
++		skb->network_header += pad;
++	if (skb->transport_header != (typeof(skb->transport_header))~0U)
++		skb->transport_header += pad;
++}
++
+ /* A TCP batch, or a frame with fragments, that the TCL takes from MSDU
+  * extension descriptors. Each descriptor lists the buffers of one frame: the
+  * linear part of the skb, which for a batch holds the headers shared by all
+@@ -770,7 +845,9 @@
+ 	u8 lg_proto = 0;
+ 	unsigned int lg_len = 0, lg_frags = 0, lg_segs = 0;
+ 	bool dolog = false, idx_search = false, idx_log = false;
++	bool android = READ_ONCE(ath11k_tso_android);
+ 	u16 sta_ast_idx = 0, sta_ast_hash = 0;
++	unsigned int pad = 0, alen, plen;
+ 	int i, j, r;
+ 
+ 	if (!READ_ONCE(ath11k_tso) || !ab->hw_params.tx_tso ||
+@@ -821,6 +898,17 @@
+ 		}
+ 	}
+ 
++	/* The head of the frame is written when its first buffer is made to end
++	 * on an 8 byte boundary: it has the room, and is not shared
++	 */
++	if (android) {
++		if (skb_cow_head(skb, ATH11K_TX_EXT_ALIGN))
++			return -EAGAIN;
++		shinfo = skb_shinfo(skb);
++	}
++	alen = tso ? hdr_len : skb_headlen(skb);
++	plen = skb->len - hdr_len;
++
+ 	/* TEST: no extension descriptor frame before the hardware has
+ 	 * completed one frame of the station on the normal path
+ 	 */
+@@ -879,6 +967,13 @@
+ 	}
+ 	spin_unlock_bh(&tx_ring->tx_idr_lock);
+ 
++	if (android) {
++		pad = ((unsigned long)skb->data + alen) &
++		      (ATH11K_TX_EXT_ALIGN - 1);
++		if (pad)
++			ath11k_dp_tx_ext_pad(skb, alen, pad);
++	}
++
+ 	hdr_dma = dma_map_single(ab->dev, skb->data, skb_headlen(skb),
+ 				 DMA_TO_DEVICE);
+ 	if (dma_mapping_error(ab->dev, hdr_dma)) {
+@@ -890,12 +985,16 @@
+ 		th = tcp_hdr(skb);
+ 		seq = ntohl(th->seq);
+ 		flags = (ntohl(tcp_flag_word(th)) >> 16) & 0x1ff;
++		/* the Android host never sends NS */
++		if (android)
++			flags &= ~BIT(8);
+ 		if (shinfo->gso_type & SKB_GSO_TCPV4)
+ 			ip_id = ntohs(ip_hdr(skb)->id);
+ 	}
+ 
+-	off = hdr_len;
+-	left = skb->len - hdr_len;
++	/* the payload starts @pad bytes later in the linear part */
++	off = hdr_len + pad;
++	left = plen;
+ 	for (i = 0; i < n; i++) {
+ 		struct hal_tx_msdu_ext *ext =
+ 			ath11k_dp_tx_ext_slot(tx_ring, slots[i]);
+@@ -982,11 +1081,14 @@
+ 	}
+ 	ti.rbm_id = ab->hw_params.hal_params->tcl2wbm_rbm_map[ti.ring_id].rbm_id;
+ 	ti.tid = ath11k_dp_tx_get_tid(skb);
+-	if (tso)
++	if (tso) {
+ 		ti.flags0 = FIELD_PREP(HAL_TCL_DATA_CMD_INFO1_IP4_CKSUM_EN, 1) |
+ 			    FIELD_PREP(HAL_TCL_DATA_CMD_INFO1_TCP4_CKSUM_EN, 1) |
+ 			    FIELD_PREP(HAL_TCL_DATA_CMD_INFO1_TCP6_CKSUM_EN, 1);
+-	else if (skb->ip_summed == CHECKSUM_PARTIAL)
++		if (android)
++			ti.flags0 |= FIELD_PREP(HAL_TCL_DATA_CMD_INFO1_UDP4_CKSUM_EN, 1) |
++				     FIELD_PREP(HAL_TCL_DATA_CMD_INFO1_UDP6_CKSUM_EN, 1);
++	} else if (skb->ip_summed == CHECKSUM_PARTIAL)
+ 		ti.flags0 = FIELD_PREP(HAL_TCL_DATA_CMD_INFO1_IP4_CKSUM_EN, 1) |
+ 			    FIELD_PREP(HAL_TCL_DATA_CMD_INFO1_UDP4_CKSUM_EN, 1) |
+ 			    FIELD_PREP(HAL_TCL_DATA_CMD_INFO1_UDP6_CKSUM_EN, 1) |
+@@ -1005,7 +1107,8 @@
+ 			     FIELD_PREP(DP_TX_DESC_ID_POOL_ID,
+ 					skb_get_queue_mapping(skb) &
+ 					(ATH11K_HW_MAX_QUEUES - 1));
+-		ti.paddr = tx_ring->ext_paddr + slots[i] * tx_ring->ext_stride;
++		ti.paddr = tx_ring->ext_paddr +
++			   ath11k_dp_tx_ext_off(tx_ring, slots[i]);
+ 		tx_ring->id_addr[ids[i]] = ti.paddr;
+ 		ath11k_hal_tx_cmd_desc_setup(ab,
+ 					     ath11k_hal_srng_src_get_next_entry(ab, tcl_ring) +
+@@ -1052,6 +1155,8 @@
+ 		ath11k_dp_tx_tso_unmap(ab->dev, &tx_ring->ext_map[slots[j]]);
+ 	dma_unmap_single(ab->dev, hdr_dma, skb_headlen(skb), DMA_TO_DEVICE);
+ fail_put:
++	if (pad)
++		ath11k_dp_tx_ext_unpad(skb, alen, pad);
+ 	spin_lock_bh(&tx_ring->tx_idr_lock);
+ 	for (j = n; j--;) {
+ 		/* no reference was taken yet: release the id and slot only */
+--- a/drivers/net/wireless/ath/ath11k/dp.h
++++ b/drivers/net/wireless/ath/ath11k/dp.h
+@@ -143,6 +143,10 @@
+ 	dma_addr_t ext_paddr;
+ 	/* bytes between two descriptors of @ext */
+ 	size_t ext_stride;
++	/* descriptors to each 4096 byte block of @ext, none across a block; 0
++	 * for descriptors back to back
++	 */
++	unsigned int ext_per_page;
+ 	struct ath11k_dp_tx_ext_map *ext_map;
+ 	u16 *ext_slot;
+ 	u16 *ext_free;
