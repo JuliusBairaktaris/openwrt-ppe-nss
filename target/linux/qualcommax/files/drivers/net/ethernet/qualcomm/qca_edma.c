@@ -341,6 +341,12 @@ static bool edma_rx_fill_sw = true;
  */
 static bool edma_ring_cached = true;
 static bool edma_rx_frag = true;
+/* TEST-ONLY: flow_gro (default on) merges the consecutive segments of a
+ * routed flow in the receive poll, off sends every frame alone; flow_gro_segs
+ * (default 8, 2 to 16) is the most segments of an aggregate.
+ */
+static bool edma_flow_gro = true;
+static u32 edma_flow_gro_segs = 8;
 static struct dentry *edma_dbg;
 
 /* Fills the ring with every buffer the ring has room for. The buffers the
@@ -892,8 +898,6 @@ static void edma_rx_peek(struct edma_queue *q, u16 idx, u16 slot,
 		  SKB_DATA_ALIGN(sizeof(struct skb_shared_info)));
 }
 
-#define EDMA_GRO_SEGS	8
-
 static void edma_rx_netstats(struct net_device *netdev, u32 packets, u32 bytes)
 {
 	struct pcpu_sw_netstats *tstats = this_cpu_ptr(netdev->tstats);
@@ -1217,7 +1221,8 @@ static bool edma_gro_open(struct edma_queue *q, struct sk_buff *skb,
 	g->last_id = t->v6 ? 0 : ntohs(t->ip4->id);
 	g->segs = 1;
 	g->fixedid = false;
-	g->max_segs = min_t(u32, EDMA_GRO_SEGS, g->gso.max_segs);
+	g->max_segs = min(clamp(READ_ONCE(edma_flow_gro_segs), 2U, 16U),
+			  g->gso.max_segs);
 
 	return true;
 }
@@ -1240,7 +1245,7 @@ static bool edma_gro_rx(struct edma_queue *q, struct sk_buff *skb,
 	struct edma_tcp t;
 	bool fixed = false, ok;
 
-	ok = src_port < EDMA_PORTS &&
+	ok = READ_ONCE(edma_flow_gro) && src_port < EDMA_PORTS &&
 	     !(rxph->rx_pre2 & cpu_to_le32(EDMA_RXPH_CTAG_FLAG)) &&
 	     edma_gro_parse(netdev, skb, status, &t);
 
@@ -3671,6 +3676,8 @@ static int edma_probe(struct platform_device *pdev)
 	debugfs_create_bool("rx_fill_sw", 0600, edma_dbg, &edma_rx_fill_sw);
 	debugfs_create_bool("ring_cached", 0600, edma_dbg, &edma_ring_cached);
 	debugfs_create_bool("rx_frag", 0600, edma_dbg, &edma_rx_frag);
+	debugfs_create_bool("flow_gro", 0600, edma_dbg, &edma_flow_gro);
+	debugfs_create_u32("flow_gro_segs", 0600, edma_dbg, &edma_flow_gro_segs);
 
 	return 0;
 
