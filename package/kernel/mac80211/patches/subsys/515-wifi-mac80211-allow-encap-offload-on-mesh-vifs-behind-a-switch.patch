@@ -1,0 +1,45 @@
+wifi: mac80211: allow encap offload on mesh vifs behind a switch
+
+Add a read-only module parameter mesh_hdr_offload (default 0) that lets
+a driver offload decap on an 11s mesh point vif. TEST-ONLY: used for the
+A/B experiment and dropped before upstream.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+
+--- a/net/mac80211/iface.c
++++ b/net/mac80211/iface.c
+@@ -1086,6 +1086,15 @@ static const struct net_device_ops ieee8
+ 	.ndo_setup_tc		= ieee80211_netdev_setup_tc,
+ };
+ 
++/* TEST-ONLY: the Ethernet receive offload of a mesh point has not been shown
++ * to leave the mesh header intact on any hardware, so it is offered only on
++ * request.
++ */
++static bool mesh_hdr_offload;
++module_param(mesh_hdr_offload, bool, 0444);
++MODULE_PARM_DESC(mesh_hdr_offload,
++		 "Offer the 802.3 receive offload to mesh points (test only)");
++
+ static bool ieee80211_iftype_supports_hdr_offload(enum nl80211_iftype iftype)
+ {
+ 	switch (iftype) {
+@@ -1093,6 +1102,8 @@ static bool ieee80211_iftype_supports_hd
+ 	case NL80211_IFTYPE_AP:
+ 	case NL80211_IFTYPE_STATION:
+ 		return true;
++	case NL80211_IFTYPE_MESH_POINT:
++		return mesh_hdr_offload;
+ 	default:
+ 		return false;
+ 	}
+@@ -1106,7 +1117,8 @@ static bool ieee80211_set_sdata_offload_
+ 	flags = sdata->vif.offload_flags;
+ 
+ 	if (ieee80211_hw_check(&local->hw, SUPPORTS_TX_ENCAP_OFFLOAD) &&
+-	    ieee80211_iftype_supports_hdr_offload(sdata->vif.type)) {
++	    ieee80211_iftype_supports_hdr_offload(sdata->vif.type) &&
++	    sdata->vif.type != NL80211_IFTYPE_MESH_POINT) {
+ 		flags |= IEEE80211_OFFLOAD_ENCAP_ENABLED;
+ 
+ 		if (!ieee80211_hw_check(&local->hw, SUPPORTS_TX_FRAG) &&
