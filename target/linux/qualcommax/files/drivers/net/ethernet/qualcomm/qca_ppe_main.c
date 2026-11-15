@@ -966,15 +966,19 @@ static int qca_ppe_setup(struct dsa_switch *ds)
 		/* The state DSA gives a port no bridge has claimed: it floods,
 		 * and it does not learn, so two of them cannot reach each
 		 * other behind the CPU's back.
+		 *
+		 * The CPU port never learns either. Frames a virtual port
+		 * hands to the switch arrive as the CPU port's and are learned
+		 * through its bits, with the source address as the host, and
+		 * a 4addr station's source is any address of the bridge. Every
+		 * address the CPU port stands for is a static entry: DSA
+		 * installs the bridge's own and, with assisted learning, the
+		 * ones the software bridge learned on a foreign port.
 		 */
 		priv->port_brflags[i] = BR_FLOOD | BR_MCAST_FLOOD |
 					BR_BCAST_FLOOD;
 
 		val = FIELD_PREP(PPE_BRIDGE_PORT_ISOL, port_mask);
-		if (dsa_is_cpu_port(ds, i)) {
-			val |= PPE_BRIDGE_LRN_EN;
-			priv->port_brflags[i] |= BR_LEARNING;
-		}
 		regmap_update_bits(priv->regmap, PPE_PORT_BRIDGE_CTRL(i),
 				   PPE_BRIDGE_LRN_EN | PPE_BRIDGE_PORT_ISOL,
 				   val);
