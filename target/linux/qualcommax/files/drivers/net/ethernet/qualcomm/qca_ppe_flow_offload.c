@@ -3205,7 +3205,7 @@ static void ppe_sparse_work(struct work_struct *work)
 		 * demoted at the end of the one it burst in.
 		 */
 		if ((!shaped || !ppe_sparse_flows) && !entry->sparse &&
-		    (entry->index + tick) % PPE_SPARSE_SLICES)
+		    (entry->index + tick) % max(1U, READ_ONCE(priv->sparse_slices)))
 			continue;
 
 		regmap_read(priv->regmap, PPE_IN_FLOW_CNT_TBL(entry->index),
@@ -3322,6 +3322,7 @@ int ppe_flow_offload_init(struct qca_ppe_priv *priv)
 		return ret;
 	}
 
+	priv->sparse_slices = PPE_SPARSE_SLICES;
 	INIT_DELAYED_WORK(&priv->sparse_work, ppe_sparse_work);
 	schedule_delayed_work(&priv->sparse_work,
 			      msecs_to_jiffies(PPE_SPARSE_PERIOD_MS));
