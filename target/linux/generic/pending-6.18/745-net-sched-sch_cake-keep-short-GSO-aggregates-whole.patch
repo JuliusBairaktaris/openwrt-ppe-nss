@@ -1,0 +1,222 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] net/sched: sch_cake: keep short GSO aggregates whole
+
+With split_gso, CAKE segments every GSO aggregate at enqueue. That is
+one skb_gso_segment() per aggregate, then a queue operation, a COBALT
+pass and a shaper step per segment, and the device receives single
+frames. All segments of an aggregate share one flow and one tin, so
+what splitting buys is the grain at which the flow is served and
+signalled, not a different share.
+
+Queue an aggregate unsplit when the time its bytes need at the tin's
+or the global shaper rate is at most 1/8 of the tin's COBALT target.
+It is charged to the shaper and to the flow's deficit with the
+overhead of every segment, so the rate and the shares between flows
+stay those of the split packets. Where COBALT or the CE threshold could
+act, the head aggregate is segmented at dequeue first, with its enqueue
+time kept, and its segments are judged one at a time. That is the case
+with a BLUE probability set, in the dropping state, with a drop
+schedule still decaying, or with a sojourn above the target or the CE
+threshold. The memory limit does the same, so that one segment is
+dropped and not the aggregate. The ACK filter never saw the segments,
+so it does not run on a whole aggregate either.
+
+Known difference: a flow's bytes of up to one aggregate leave in one
+step, at most target/8 (625 us with the default target) ahead of where
+the shaper would have spread them, and a segment judged by COBALT after
+a whole aggregate has waited up to that much longer than the one before
+it. Aggregates that need longer, and everything on a qdisc with no rate
+set, are split as before. no-split-gso is unchanged.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -1608,6 +1608,115 @@
+ 	return len;
+ }
+ 
++/* A GSO aggregate may stay whole in a flow queue while the time its bytes
++ * need on the wire is small against the tin's target. Splitting it costs a
++ * segmentation, a queue operation and a shaper step per segment, and hands
++ * the device single frames. The aggregate is charged to the shaper and to the
++ * flow's deficit with the overhead of every segment it carries, so the rate
++ * and the shares between flows are those of the split packets. What changes
++ * is the grain: the flow's bytes leave in one step, at most 1/8 of the AQM
++ * target ahead of where the shaper would have spread them. Without a rate
++ * there is no wire time to bound, so those aggregates are split.
++ */
++#define CAKE_GSO_WHOLE_SHIFT	3
++
++static bool cake_gso_keep_whole(const struct cake_sched_data *q,
++				const struct cake_tin_data *b, u32 adjlen)
++{
++	u64 dur;
++
++	if (!q->rate_ns)
++		return false;
++
++	dur = max((u64)adjlen * q->rate_ns >> q->rate_shft,
++		  (u64)adjlen * b->tin_rate_ns >> b->tin_rate_shft);
++
++	return dur <= b->cparams.target >> CAKE_GSO_WHOLE_SHIFT;
++}
++
++/* True when COBALT and the CE threshold have nothing to signal for this
++ * packet, so that judging the aggregate once is the same as judging each of
++ * its segments: no BLUE probability, not dropping, no drop schedule still
++ * decaying, and a sojourn below the target and the CE threshold.
++ */
++static bool cake_aqm_quiet(const struct cake_sched_data *q,
++			   const struct cake_tin_data *b,
++			   const struct cake_flow *flow, ktime_t now,
++			   const struct sk_buff *skb)
++{
++	const struct cobalt_vars *vars = &flow->cvars;
++	u64 sojourn = ktime_to_ns(ktime_sub(now, cobalt_get_enqueue_time(skb)));
++	u64 ce_threshold = READ_ONCE(q->config->ce_threshold);
++
++	if (vars->p_drop || vars->dropping || vars->count)
++		return false;
++	if (sojourn > b->cparams.target)
++		return false;
++	if (ce_threshold &&
++	    sojourn > max_t(u64, ce_threshold, b->cparams.mtu_time * 3 / 2))
++		return false;
++	return true;
++}
++
++/* Replace the aggregate at the head of a flow by its segments, so that the
++ * queue is what splitting at enqueue would have left. The segments keep the
++ * enqueue time. Returns false and leaves the aggregate queued when it cannot
++ * be segmented. @notify tells the parents about the extra packets; cake_drop()
++ * passes false, because its caller reports the change of the queue length.
++ */
++static bool cake_split_head(struct cake_sched_data *q, struct Qdisc *sch,
++			    struct cake_tin_data *b, u32 idx, bool notify)
++{
++	struct cake_flow *flow = &b->flows[idx];
++	struct sk_buff *skb = flow->head, *segs, *nskb, *cur, *last = NULL;
++	netdev_features_t features = netif_skb_features(skb);
++	ktime_t enqueue_time = cobalt_get_enqueue_time(skb);
++	unsigned int len = qdisc_pkt_len(skb), slen = 0, numsegs = 0;
++	unsigned int truesize = skb->truesize, segsize = 0;
++
++	segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
++	if (IS_ERR_OR_NULL(segs))
++		return false;
++
++	flow->head = skb->next;
++	if (!flow->head)
++		flow->tail = NULL;
++
++	cur = segs;
++	skb_list_walk_safe(cur, cur, nskb) {
++		skb_mark_not_on_list(cur);
++		qdisc_skb_cb(cur)->pkt_len = cur->len;
++		cobalt_set_enqueue_time(cur, enqueue_time);
++		get_cobalt_cb(cur)->adjusted_len = cake_overhead(q, cur);
++		numsegs++;
++		slen += cur->len;
++		segsize += cur->truesize;
++		if (last)
++			last->next = cur;
++		last = cur;
++	}
++	last->next = flow->head;
++	if (!flow->head)
++		flow->tail = last;
++	flow->head = segs;
++
++	sch->q.qlen += numsegs - 1;
++	b->backlogs[idx] += slen - len;
++	b->tin_backlog += slen - len;
++	b->bytes += slen - len;
++	sch->qstats.backlog += slen - len;
++	q->avg_window_bytes += slen - len;
++	q->buffer_used += segsize - truesize;
++	if (q->overflow_timeout)
++		cake_heapify_up(q, b->overflow_idx[idx]);
++	if (notify)
++		qdisc_tree_reduce_backlog(sch, 1 - numsegs, len - slen);
++
++	skb_mark_not_on_list(skb);
++	consume_skb(skb);
++	return true;
++}
++
+ static unsigned int cake_drop(struct Qdisc *sch, struct sk_buff **to_free)
+ {
+ 	struct cake_sched_data *q = qdisc_priv(sch);
+@@ -1633,6 +1742,10 @@
+ 
+ 	b = &q->tins[tin];
+ 	flow = &b->flows[idx];
++	/* drop one segment, as with split packets, not the whole aggregate */
++	if (flow->head && skb_is_gso(flow->head) &&
++	    (q->config->rate_flags & CAKE_FLAG_SPLIT_GSO))
++		cake_split_head(q, sch, b, idx, false);
+ 	skb = dequeue_head(flow);
+ 	if (unlikely(!skb)) {
+ 		/* heap has gone wrong, rebuild it next time */
+@@ -1810,7 +1923,8 @@
+ 	ktime_t now = ktime_get();
+ 	struct cake_tin_data *b;
+ 	struct cake_flow *flow;
+-	bool same_flow = false;
++	bool same_flow = false, whole = false;
++	u32 adjlen = 0;
+ 
+ 	/* choose flow to insert into */
+ 	idx = cake_classify(sch, &b, skb, q->config->flow_mode, &ret);
+@@ -1850,6 +1964,12 @@
+ 		b->max_skblen = len;
+ 
+ 	if (skb_is_gso(skb) && q->config->rate_flags & CAKE_FLAG_SPLIT_GSO) {
++		adjlen = cake_overhead(q, skb);
++		whole = cake_gso_keep_whole(q, b, adjlen);
++	}
++
++	if (skb_is_gso(skb) && q->config->rate_flags & CAKE_FLAG_SPLIT_GSO &&
++	    !whole) {
+ 		struct sk_buff *segs, *nskb;
+ 		netdev_features_t features = netif_skb_features(skb);
+ 		unsigned int slen = 0, numsegs = 0;
+@@ -1887,10 +2007,12 @@
+ 		int ack_pkt_len = 0;
+ 
+ 		cobalt_set_enqueue_time(skb, now);
+-		get_cobalt_cb(skb)->adjusted_len = cake_overhead(q, skb);
++		get_cobalt_cb(skb)->adjusted_len = whole ? adjlen :
++						   cake_overhead(q, skb);
+ 		flow_queue_add(flow, skb);
+ 
+-		if (q->config->ack_filter)
++		/* a whole aggregate stands for packets that are never filtered */
++		if (q->config->ack_filter && !whole)
+ 			ack = cake_ack_filter(q, flow);
+ 
+ 		if (ack) {
+@@ -1910,7 +2032,8 @@
+ 		}
+ 
+ 		/* stats */
+-		WRITE_ONCE(b->packets, b->packets + 1);
++		WRITE_ONCE(b->packets, b->packets +
++				       (whole ? skb_shinfo(skb)->gso_segs : 1));
+ 		b->bytes	    += len - ack_pkt_len;
+ 		b->backlogs[idx]    += len - ack_pkt_len;
+ 		b->tin_backlog      += len - ack_pkt_len;
+@@ -2430,6 +2553,12 @@
+ 
+ 	/* Retrieve a packet via the AQM */
+ 	while (1) {
++		/* an aggregate that AQM may act on is judged per segment */
++		if (flow->head && skb_is_gso(flow->head) &&
++		    (q->config->rate_flags & CAKE_FLAG_SPLIT_GSO) &&
++		    !cake_aqm_quiet(q, b, flow, now, flow->head))
++			cake_split_head(q, sch, b, q->cur_flow, true);
++
+ 		skb = cake_dequeue_one(sch);
+ 		if (!skb) {
+ 			/* this queue was actually empty */
