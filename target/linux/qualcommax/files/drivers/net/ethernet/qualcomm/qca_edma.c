@@ -6,6 +6,7 @@
 
 #include <linux/bitfield.h>
 #include <linux/clk.h>
+#include <linux/debugfs.h>
 #include <linux/ethtool.h>
 #include <linux/hash.h>
 #include <linux/if_vlan.h>
@@ -267,6 +268,16 @@ static void edma_idx_write(struct edma_priv *priv, u32 reg, u32 val)
 	writel(val, priv->base + reg);
 }
 
+/* TEST-ONLY: rx_fifo (default on) takes buffers back in fill order; off, it is
+ * the slot written into every buffer, the struct page and the scan, as before.
+ * rx_fill_sw (default on) bounds the fill by the driver's own accounting; off,
+ * by the engine's consumer index. Flip them with the interface idle: a buffer
+ * filled under one setting is found by the scan under the other.
+ */
+static bool edma_rx_fifo = true;
+static bool edma_rx_fill_sw = true;
+static struct dentry *edma_dbg;
+
 /* Fills the ring with every buffer the ring has room for. The buffers the
  * engine holds are the ones the shadow array still has: a buffer comes back
  * only through a descriptor, which the engine writes after it read the fill
@@ -281,19 +292,23 @@ static int edma_rx_fill(struct edma_queue *q)
 	struct edma_ring *rxfill_ring = &q->rxfill_ring;
 	struct edma_priv *priv = q->priv;
 	struct edma_rxfill_desc *rxfill_desc;
-	u16 prod, next;
+	u16 prod, cons = 0, next;
 	struct page *page;
 	u16 filled = 0;
 	dma_addr_t dma;
+	bool sw = READ_ONCE(edma_rx_fill_sw);
 
 	prod = q->rxfill_prod;
+	if (!sw)
+		cons = edma_idx_read(priv, EDMA_REG_RXFILL_CONS_IDX(q->rxfill)) &
+		       EDMA_RXFILL_CONS_IDX_MASK & (rxfill_ring->count - 1);
 
 	while (1) {
 		next = prod + 1;
 		if (next == rxfill_ring->count)
 			next = 0;
 
-		if (rxfill_ring->rx_store[next].page)
+		if (sw ? !!rxfill_ring->rx_store[next].page : next == cons)
 			break;
 		/* The page may still be prefetched inside EDMA. */
 		if (unlikely(rxfill_ring->rx_store[prod].page))
@@ -306,6 +321,16 @@ static int edma_rx_fill(struct edma_queue *q)
 		rxfill_desc = EDMA_RXFILL_DESC(rxfill_ring, prod);
 
 		dma = page_pool_get_dma_addr(page);
+		if (!READ_ONCE(edma_rx_fifo)) {
+			struct edma_rx_preheader *rxph =
+				page_address(page) + NET_SKB_PAD;
+
+			rxph->opaque = cpu_to_le32(prod);
+			dma_sync_single_for_device(&priv->pdev->dev,
+						   dma + NET_SKB_PAD,
+						   sizeof(rxph->opaque),
+						   DMA_FROM_DEVICE);
+		}
 		rxfill_ring->rx_store[prod].page = page;
 		rxfill_ring->rx_store[prod].dma = dma;
 		rxfill_desc->buffer_addr = cpu_to_le32(dma + NET_SKB_PAD);
@@ -323,6 +348,27 @@ static int edma_rx_fill(struct edma_queue *q)
 	}
 
 	return filled;
+}
+
+/* TEST-ONLY: the buffer by the slot written into it, checked against its
+ * page, and by a scan of the ring when they differ.
+ */
+static struct edma_rx_buf *edma_rx_buf_legacy(struct edma_queue *q, u32 addr)
+{
+	struct edma_ring *ring = &q->rxfill_ring;
+	struct edma_rx_preheader *rxph = phys_to_virt(addr);
+	struct page *page = virt_to_head_page(rxph);
+	u32 idx = le32_to_cpu(rxph->opaque);
+	int i;
+
+	if (likely(idx < ring->count && ring->rx_store[idx].page == page))
+		return &ring->rx_store[idx];
+
+	for (i = 0; i < ring->count; i++)
+		if (ring->rx_store[i].page == page)
+			return &ring->rx_store[i];
+
+	return NULL;
 }
 
 /* The buffer the descriptor at @addr hands back. The engine returns the
@@ -731,6 +777,16 @@ static void edma_rx_peek(struct edma_queue *q, u16 idx, u16 slot,
 	pk->slot = slot;
 	pk->buf = NULL;
 
+	if (!READ_ONCE(edma_rx_fifo)) {
+		void *rxph = phys_to_virt(pk->addr);
+
+		page_pool_dma_sync_for_cpu(q->page_pool, virt_to_head_page(rxph),
+					   0, edma_rx_sync_len(q, pk->status));
+		prefetch(rxph);
+		prefetch(rxph + L1_CACHE_BYTES);
+		return;
+	}
+
 	if (unlikely(!buf->page ||
 		     lower_32_bits(buf->dma + NET_SKB_PAD) != pk->addr))
 		return;
@@ -787,7 +843,14 @@ static u32 edma_clean_rx(struct edma_queue *q, int budget)
 		 * the expectation from.
 		 */
 		buf = cur.buf;
-		if (likely(buf && cur.slot == q->rx_slot)) {
+		if (!READ_ONCE(edma_rx_fifo)) {
+			buf = edma_rx_buf_legacy(q, cur.addr);
+			if (unlikely(!buf)) {
+				q->stats.rx_untracked_page++;
+				DEV_STATS_INC(netdev, rx_errors);
+				goto next;
+			}
+		} else if (likely(buf && cur.slot == q->rx_slot)) {
 			q->rx_slot = (q->rx_slot + 1) &
 				     (q->rxfill_ring.count - 1);
 		} else {
@@ -2976,6 +3039,10 @@ static int edma_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, priv);
 
+	edma_dbg = debugfs_create_dir("qca_edma", NULL);
+	debugfs_create_bool("rx_fifo", 0600, edma_dbg, &edma_rx_fifo);
+	debugfs_create_bool("rx_fill_sw", 0600, edma_dbg, &edma_rx_fill_sw);
+
 	return 0;
 
 err_irq:
@@ -2998,6 +3065,8 @@ static void edma_remove(struct platform_device *pdev)
 	struct page_pool *pools[EDMA_MAX_QUEUES];
 	unsigned int i;
 
+	debugfs_remove(edma_dbg);
+	edma_dbg = NULL;
 	unregister_netdev(priv->netdev);
 	for (i = 0; i < priv->max_queues; i++) {
 		netif_napi_del(&priv->q[i].napi);
