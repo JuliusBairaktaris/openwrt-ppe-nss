@@ -747,6 +747,7 @@ void ppe_vp_debugfs_init(struct qca_ppe_priv *priv)
 	debugfs_create_bool("vp_last", 0600, priv->debugfs, &priv->vp_last);
 	debugfs_create_bool("xdev_cache", 0600, priv->debugfs, &priv->xdev_cache);
 	debugfs_create_bool("wifi_prio", 0600, priv->debugfs, &priv->wifi_prio);
+	debugfs_create_u32("sparse_slices", 0600, priv->debugfs, &priv->sparse_slices);
 }
 
 int ppe_vp_init(struct qca_ppe_priv *priv)
