@@ -24,3 +24,6 @@ Patches (package/kernel/mac80211/patches/ath11k, copies+scripts in patches/wip/h
 Per-patch compile: make package/kernel/mac80211/{clean,compile} clean (logs scratchpad/hw2/build-*.log).
 Full build: make target/linux/clean; PATH=clean make -j16 > scratchpad/hw2/build-full.log
 Not run: flash, bench.
+wifi-hw3 additions: subsys 496 aql_audit debugfs (sta + phy), 497 allow FRAGLIST features; ath11k 9996 fraglist
+ aggregates (gso_fraglist, sw split with one charge), 9997 TX completion batching (tx_compl_batch).
+ not done: in-place reap (T4a). Image: scratchpad/hw2/wifi-hw3.bin. Not run: flash, bench.
