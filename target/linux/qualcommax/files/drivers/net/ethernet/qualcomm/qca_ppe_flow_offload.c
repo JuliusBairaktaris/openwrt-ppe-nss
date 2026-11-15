@@ -1861,6 +1861,7 @@ bool ppe_flow_xmit(struct dsa_switch *ds, struct sk_buff *skb, u32 flow)
 	struct qca_ppe_priv *priv = ds_to_priv(ds);
 	struct net_device *dev, *shaper, *uplink;
 	const struct ppe_flow_entry *entry;
+	bool cache;
 	u64 xdev;
 	int up;
 	u8 xport;
@@ -1876,7 +1877,9 @@ bool ppe_flow_xmit(struct dsa_switch *ds, struct sk_buff *skb, u32 flow)
 	}
 	xdev = entry->xdev;
 
-	dev = rcu_dereference_bh(entry->xndev);
+	cache = READ_ONCE(priv->xdev_cache);
+	dev = cache ? rcu_dereference_bh(entry->xndev) :
+	      dev_get_by_index_rcu(dev_net(skb->dev), xdev & PPE_XDEV_IFINDEX);
 	if (unlikely(!dev || !netif_running(dev)))
 		goto drop;
 
@@ -1889,7 +1892,8 @@ bool ppe_flow_xmit(struct dsa_switch *ds, struct sk_buff *skb, u32 flow)
 	up = READ_ONCE(priv->uplink_dev);
 	if ((xdev & (PPE_XDEV_UL | PPE_XDEV_PUSH)) == PPE_XDEV_UL && up &&
 	    up != dev->ifindex) {
-		uplink = rcu_dereference_bh(priv->uplink_ndev);
+		uplink = cache ? rcu_dereference_bh(priv->uplink_ndev) :
+			 dev_get_by_index_rcu(dev_net(dev), up);
 		if (unlikely(!uplink || !netif_running(uplink)))
 			goto drop;
 	}
@@ -1920,7 +1924,7 @@ bool ppe_flow_xmit(struct dsa_switch *ds, struct sk_buff *skb, u32 flow)
 		ppe_flow_dscp_apply(skb, entry->dscp & 0x3f);
 
 #if IS_ENABLED(CONFIG_CFG80211_HEADERS)
-	if (dev->ieee80211_ptr)
+	if (dev->ieee80211_ptr && READ_ONCE(priv->wifi_prio))
 		ppe_flow_wifi_prio(skb);
 #endif
 
@@ -1933,7 +1937,9 @@ bool ppe_flow_xmit(struct dsa_switch *ds, struct sk_buff *skb, u32 flow)
 	 * unshaped, not lost.
 	 */
 	if (xdev & PPE_XDEV_DL) {
-		shaper = rcu_dereference_bh(priv->dl_ndev);
+		shaper = cache ? rcu_dereference_bh(priv->dl_ndev) :
+			 dev_get_by_index_rcu(dev_net(dev),
+					      READ_ONCE(priv->dl_shaper));
 		if (likely(shaper && netif_running(shaper))) {
 			if (entry->vid)
 				__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),

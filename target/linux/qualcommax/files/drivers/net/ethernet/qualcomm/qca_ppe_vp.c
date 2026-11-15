@@ -190,6 +190,9 @@ static struct ppe_vp_flow *ppe_vp_flow_lookup(struct qca_ppe_priv *priv,
 	unsigned int gen = smp_load_acquire(&priv->vp_gen);
 	struct ppe_vp_flow *f;
 
+	if (!READ_ONCE(priv->vp_last))
+		return ppe_vp_flow_find(priv, key);
+
 	if (likely(c->gen == gen && c->f && !memcmp(&c->key, key, sizeof(*key))))
 		return c->f;
 
@@ -269,6 +272,9 @@ static unsigned int ppe_vp_hook(void *data, struct sk_buff *skb,
 	u8 ttl, flags;
 	int rc;
 
+	if (!READ_ONCE(priv->vp_ingress))
+		return NF_ACCEPT;
+
 	if (skb->protocol != htons(ETH_P_IP) &&
 	    skb->protocol != htons(ETH_P_IPV6))
 		return NF_ACCEPT;
@@ -283,7 +289,8 @@ static unsigned int ppe_vp_hook(void *data, struct sk_buff *skb,
 	 * switch then sees as the frames it was built from.
 	 */
 	if (skb_is_gso(skb) &&
-	    !(skb_shinfo(skb)->gso_type & (SKB_GSO_TCPV4 | SKB_GSO_TCPV6)))
+	    (!READ_ONCE(priv->vp_gso) ||
+	     !(skb_shinfo(skb)->gso_type & (SKB_GSO_TCPV4 | SKB_GSO_TCPV6))))
 		return NF_ACCEPT;
 
 	if (!pskb_may_pull(skb, min_t(unsigned int, skb->len, PPE_VP_HDR_MAX)))
@@ -735,6 +742,11 @@ DEFINE_SHOW_ATTRIBUTE(ppe_vp);
 void ppe_vp_debugfs_init(struct qca_ppe_priv *priv)
 {
 	debugfs_create_file("vports", 0400, priv->debugfs, priv, &ppe_vp_fops);
+	debugfs_create_bool("vp_ingress", 0600, priv->debugfs, &priv->vp_ingress);
+	debugfs_create_bool("vp_gso", 0600, priv->debugfs, &priv->vp_gso);
+	debugfs_create_bool("vp_last", 0600, priv->debugfs, &priv->vp_last);
+	debugfs_create_bool("xdev_cache", 0600, priv->debugfs, &priv->xdev_cache);
+	debugfs_create_bool("wifi_prio", 0600, priv->debugfs, &priv->wifi_prio);
 }
 
 int ppe_vp_init(struct qca_ppe_priv *priv)
@@ -757,6 +769,11 @@ int ppe_vp_init(struct qca_ppe_priv *priv)
 		return -ENOMEM;
 	}
 
+	priv->vp_ingress = true;
+	priv->vp_gso = true;
+	priv->vp_last = true;
+	priv->xdev_cache = true;
+	priv->wifi_prio = true;
 	priv->vp_nb.notifier_call = ppe_vp_netdev_event;
 	ret = register_netdevice_notifier(&priv->vp_nb);
 	if (ret) {
