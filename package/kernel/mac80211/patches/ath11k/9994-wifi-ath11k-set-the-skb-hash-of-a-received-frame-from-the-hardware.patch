@@ -9,9 +9,9 @@ again, though the receive engine has already hashed its 5-tuple
 
 Use that hash, through skb_set_hash() as an L4 hash, for a frame whose
 descriptor says it is TCP or UDP, not an IP fragment and with the IP and
-the TCP/UDP header parsed. A zero hash is not used. Mix a boot random value into the hash, so that
-it is not a function of the packet alone and a station cannot choose the
-queue that a flow of another station shares.
+the TCP/UDP header parsed. A zero hash is not used. Mix a boot random
+value into the hash, so that it is not a function of the packet alone and
+a station cannot choose the queue that a flow of another station shares.
 
 The hash is the descriptor word of every chip family, read through a new
 hw_ops accessor. Count the frames that got a hash and the TCP and UDP
