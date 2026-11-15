@@ -331,6 +331,15 @@ static void edma_idx_write(struct edma_priv *priv, u32 reg, u32 val)
  */
 static bool edma_rx_fifo = true;
 static bool edma_rx_fill_sw = true;
+/* TEST-ONLY: ring_cached (default on) allocates the receive descriptor and
+ * completion rings as cached memory, off as uncached coherent memory; rx_frag
+ * (default on) takes receive buffers from 2 KB page fragments, off from whole
+ * pages. Both are read where the rings and the pools are created, so they
+ * take effect at the next ethtool -G with a size change or the next MTU
+ * change.
+ */
+static bool edma_ring_cached = true;
+static bool edma_rx_frag = true;
 static struct dentry *edma_dbg;
 
 /* Fills the ring with every buffer the ring has room for. The buffers the
@@ -1528,7 +1537,8 @@ static int edma_queue_rings_alloc(struct edma_queue *q)
 		return ret;
 
 	ret = edma_ring_alloc(priv, &q->txcmpl_ring, priv->tx_ring_size,
-			      sizeof(struct edma_txcmpl), true);
+			      sizeof(struct edma_txcmpl),
+			      READ_ONCE(edma_ring_cached));
 	if (ret)
 		goto err_txcmpl;
 
@@ -1538,7 +1548,8 @@ static int edma_queue_rings_alloc(struct edma_queue *q)
 		goto err_rxfill;
 
 	ret = edma_ring_alloc(priv, &q->rxdesc_ring, priv->rx_ring_size,
-			      sizeof(struct edma_rxdesc), true);
+			      sizeof(struct edma_rxdesc),
+			      READ_ONCE(edma_ring_cached));
 	if (ret)
 		goto err_rxdesc;
 
@@ -2883,7 +2894,7 @@ static u32 edma_rx_truesize(int mtu)
 	u32 need = NET_SKB_PAD + edma_rx_frame_len(mtu) +
 		   SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
 
-	if (need <= EDMA_RX_FRAG_SIZE)
+	if (need <= EDMA_RX_FRAG_SIZE && READ_ONCE(edma_rx_frag))
 		return EDMA_RX_FRAG_SIZE;
 
 	return PAGE_SIZE << get_order(need);
@@ -3301,6 +3312,8 @@ static int edma_probe(struct platform_device *pdev)
 	edma_dbg = debugfs_create_dir("qca_edma", NULL);
 	debugfs_create_bool("rx_fifo", 0600, edma_dbg, &edma_rx_fifo);
 	debugfs_create_bool("rx_fill_sw", 0600, edma_dbg, &edma_rx_fill_sw);
+	debugfs_create_bool("ring_cached", 0600, edma_dbg, &edma_ring_cached);
+	debugfs_create_bool("rx_frag", 0600, edma_dbg, &edma_rx_frag);
 
 	return 0;
 
