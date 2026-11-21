@@ -1,0 +1,27 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] TEST: wifi: ath11k: default the extension descriptor path to off
+
+The tso parameter is the one gate of every frame sent through MSDU
+extension descriptors: ath11k_dp_tx_ext() returns -EAGAIN without it, for
+the TCP batches and for the scatter-gather frames alike, and with it off
+at load ath11k_dp_tx_tso_wanted() keeps NETIF_F_SG, TSO, TSO6 and the
+frame list features off the encap netdevs. Default it to off, so an image
+that carries the extension descriptor patches sends none until tso=1 is
+set; the netdev features follow from the next module load.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/drivers/net/wireless/ath/ath11k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_tx.c
+@@ -18,9 +18,9 @@
+ /* TEST-ONLY switch for the A/B of the TCL segmentation against software
+  * segmentation of the same batches; dropped before this is upstreamed.
+  */
+-static bool ath11k_tso = true;
++static bool ath11k_tso;
+ module_param_named(tso, ath11k_tso, bool, 0644);
+-MODULE_PARM_DESC(tso, "Let the TCL segment TCP batches (default: on)");
++MODULE_PARM_DESC(tso, "Let the TCL segment TCP batches (default: off)");
+ 
+ /* Whether the netdevs of this device offer TSO and scatter-gather: the choice
+  * is made when they are created, so the switch turns the TCL segmentation off
