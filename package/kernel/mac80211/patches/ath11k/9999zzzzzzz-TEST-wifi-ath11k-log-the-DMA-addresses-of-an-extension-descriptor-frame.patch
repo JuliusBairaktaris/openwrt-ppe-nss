@@ -1,0 +1,72 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] TEST: wifi: ath11k: log the DMA addresses of an extension descriptor frame
+
+For each segment of an extension descriptor frame that ext_log_first
+logs (the first 8 of a station), also log the cookie of its TCL data
+command, the DMA address of its extension slot, the header buffer and
+each payload buffer with its length, so that they can be compared with an
+entry the TCL writes to the TCL to firmware ring. The line is written
+before the segment is queued, while its map is still the driver's.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/drivers/net/wireless/ath/ath11k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_tx.c
+@@ -809,6 +809,33 @@ static void ath11k_dp_tx_ext_unpad(struc
+ 		skb->transport_header += pad;
+ }
+ 
++/* TEST: one line per segment of a logged extension descriptor frame: its
++ * cookie (the TCL data command's buffer id word), the address of its
++ * extension slot, the header buffer and each payload buffer with its length.
++ */
++static void ath11k_dp_tx_ext_log_map(struct ath11k_base *ab,
++				     struct ath11k_sta *arsta, int seg, int n,
++				     bool tso, u32 cookie, dma_addr_t slot,
++				     dma_addr_t hdr_dma, unsigned int hdr_len,
++				     const struct ath11k_dp_tx_ext_map *map)
++{
++	char frags[HAL_TX_MSDU_EXT_NUM_BUFS * 24];
++	int p = 0, k;
++
++	if (atomic_read(&arsta->ext_logged) >= ATH11K_EXT_LOG_MAX)
++		return;
++
++	frags[0] = '\0';
++	for (k = 0; k < map->num; k++)
++		p += scnprintf(frags + p, sizeof(frags) - p, " 0x%08x/%u",
++			       map->dma[k], map->len[k]);
++
++	ath11k_info(ab, "ext desc map sta %pM %s seg %d/%d cookie 0x%08x slot %pad hdr %pad/%u frags%s\n",
++		    container_of((void *)arsta, struct ieee80211_sta, drv_priv)->addr,
++		    tso ? "tso" : "sg", seg, n, cookie, &slot, &hdr_dma, hdr_len,
++		    frags);
++}
++
+ /* A TCP batch, or a frame with fragments, that the TCL takes from MSDU
+  * extension descriptors. Each descriptor lists the buffers of one frame: the
+  * linear part of the skb, which for a batch holds the headers shared by all
+@@ -1037,6 +1064,23 @@ static int ath11k_dp_tx_ext(struct ath11
+ 				   upper_32_bits(hdr_dma)) |
+ 			FIELD_PREP(HAL_TX_MSDU_EXT_BUF_INFO_LEN, hdr_len);
+ 
++		/* TEST: the addresses the TCL is given for this segment, to
++		 * compare with what lands on the TCL to firmware ring; logged
++		 * before the segment is queued, so map is not yet released
++		 */
++		if (dolog)
++			ath11k_dp_tx_ext_log_map(ab, arsta, i, n, tso,
++						 FIELD_PREP(DP_TX_DESC_ID_MAC_ID,
++							    ar->pdev_idx) |
++						 FIELD_PREP(DP_TX_DESC_ID_MSDU_ID,
++							    ath11k_dp_tx_id_cookie(tx_ring, ids[i])) |
++						 FIELD_PREP(DP_TX_DESC_ID_POOL_ID,
++							    skb_get_queue_mapping(skb) &
++							    (ATH11K_HW_MAX_QUEUES - 1)),
++						 tx_ring->ext_paddr +
++						 ath11k_dp_tx_ext_off(tx_ring, slots[i]),
++						 hdr_dma, hdr_len, map);
++
+ 		seq += len;
+ 		left -= len;
+ 		if (!(shinfo->gso_type & SKB_GSO_TCP_FIXEDID))
