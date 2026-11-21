@@ -1,0 +1,54 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] TEST: wifi: ath11k: ask the firmware to disable the TCL classification engine
+
+The resource config of the WMI init command has a flag that asks the
+firmware to disable the TCL classification engine (CCE):
+WMI_RSRC_CFG_FLAG_TCL_CCE_DISABLE, bit 12 of flag1 (fw-api
+fw/wmi_unified.h:3177-3178, set by wifi-host-cmn for cce_disable in
+wmi/src/wmi_unified_tlv.c:10458-10459). ath11k never sets it.
+
+Add the tcl_cce_disable module parameter, off by default, that sets the
+bit in flag1 when the resource config is copied for the init command. It
+is read at firmware start, so it is given as a module option. For tests
+of the extension descriptor path only.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/drivers/net/wireless/ath/ath11k/wmi.c
++++ b/drivers/net/wireless/ath/ath11k/wmi.c
+@@ -4188,6 +4188,15 @@ ath11k_fill_band_to_mac_param(struct ath
+ 	}
+ }
+ 
++/* TEST-ONLY: ask the firmware to disable the TCL classification engine,
++ * WMI_RSRC_CFG_FLAG_TCL_CCE_DISABLE in flag1 of the resource config. Sent
++ * with the init command, so it takes effect at the next firmware start.
++ */
++static bool ath11k_tcl_cce_disable;
++module_param_named(tcl_cce_disable, ath11k_tcl_cce_disable, bool, 0444);
++MODULE_PARM_DESC(tcl_cce_disable,
++		 "Ask the firmware to disable the TCL classification engine (default: off)");
++
+ static void
+ ath11k_wmi_copy_resource_config(struct wmi_resource_config *wmi_cfg,
+ 				struct target_resource_config *tg_cfg)
+@@ -4257,6 +4266,9 @@ ath11k_wmi_copy_resource_config(struct w
+ 	wmi_cfg->flags2 = WMI_RSRC_CFG_FLAG2_CALC_NEXT_DTIM_COUNT_SET;
+ 	wmi_cfg->ema_max_vap_cnt = tg_cfg->ema_max_vap_cnt;
+ 	wmi_cfg->ema_max_profile_period = tg_cfg->ema_max_profile_period;
++
++	if (ath11k_tcl_cce_disable)
++		wmi_cfg->flag1 |= WMI_RSRC_CFG_FLAG1_TCL_CCE_DISABLE;
+ }
+ 
+ static int ath11k_init_cmd_send(struct ath11k_pdev_wmi *wmi,
+--- a/drivers/net/wireless/ath/ath11k/wmi.h
++++ b/drivers/net/wireless/ath/ath11k/wmi.h
+@@ -2355,6 +2355,7 @@ struct wmi_init_cmd {
+ #define WMI_RSRC_CFG_FLAG1_BSS_CHANNEL_INFO_64 BIT(5)
+ #define WMI_RSRC_CFG_FLAG2_CALC_NEXT_DTIM_COUNT_SET BIT(9)
+ #define WMI_RSRC_CFG_FLAG1_ACK_RSSI BIT(18)
++#define WMI_RSRC_CFG_FLAG1_TCL_CCE_DISABLE BIT(12)
+ 
+ #define WMI_CFG_HOST_SERVICE_FLAG_REG_CC_EXT 4
+ 
