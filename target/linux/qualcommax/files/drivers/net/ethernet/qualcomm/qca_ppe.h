@@ -289,6 +289,8 @@
 #define   PPE_XLT_PORT_BMP		GENMASK(8, 1)
 #define   PPE_XLT_SKEY_FMT		GENMASK(11, 9)
 #define   PPE_XLT_SKEY_UNTAGGED		1
+#define   PPE_XLT_SKEY_VID_INCL		BIT(12)
+#define   PPE_XLT_SKEY_VID		GENMASK(24, 13)
 #define   PPE_XLT_CKEY_FMT_0		BIT(31)
 
 #define PPE_XLT_RULE_W1(idx)		(PPE_IVLAN_BASE + 0x2000 + (idx) * 0x10 + 0x4)
@@ -297,6 +299,7 @@
 #define   PPE_XLT_CKEY_VID		GENMASK(14, 3)
 
 #define PPE_XLT_ACTION_TBL(idx)		(PPE_IVLAN_BASE + 0x4000 + (idx) * 0x10)
+#define   PPE_XLT_SVID_CMD		GENMASK(2, 1)
 #define   PPE_XLT_CVID_CMD		GENMASK(16, 15)
 #define   PPE_XLT_CVID			GENMASK(28, 17)
 
@@ -317,16 +320,25 @@
 #define   PPE_EG_XLT_VSI		GENMASK(14, 10)
 #define   PPE_EG_XLT_VSI_VALID		BIT(15)
 #define   PPE_EG_XLT_SKEY_FMT		GENMASK(18, 16)
+#define   PPE_EG_XLT_SKEY_VID_INCL	BIT(19)
+#define   PPE_EG_XLT_SKEY_VID		GENMASK(31, 20)
 
 #define PPE_EG_XLT_RULE_W1(idx)		(PPE_PTX_BASE + 0x200 + (idx) * 0x8 + 0x4)
 #define   PPE_EG_XLT_CKEY_FMT		GENMASK(8, 6)
 
 #define PPE_EG_XLT_ACTION(idx)		(PPE_PTX_BASE + 0xd000 + (idx) * 0x8)
+#define   PPE_EG_XLT_SVID_CMD		GENMASK(2, 1)
+#define   PPE_EG_XLT_SVID		GENMASK(14, 3)
 #define   PPE_EG_XLT_CVID_CMD		GENMASK(16, 15)
 #define   PPE_EG_XLT_CVID		GENMASK(28, 17)
 #define   PPE_EG_XLT_CVID_ADD		1
 
+#define   PPE_EG_XLT_SPCP_CMD		BIT(30)
+#define   PPE_EG_XLT_SPCP_0		BIT(31)
+
 #define PPE_EG_XLT_ACTION_W1(idx)	(PPE_PTX_BASE + 0xd000 + (idx) * 0x8 + 0x4)
+#define   PPE_EG_XLT_SPCP_1		GENMASK(1, 0)
+#define   PPE_EG_XLT_SDEI_CMD		BIT(7)
 
 /* What left the egress editor, per VSI, per physical port and per virtual
  * port, and what the whole stage took in and put out.
@@ -842,6 +854,10 @@
 #define   PPE_NEXTHOP_PORT_LEN		8
 #define   PPE_NEXTHOP_POST_L3_IF_OFF	9
 #define   PPE_NEXTHOP_POST_L3_IF_LEN	8
+#define   PPE_NEXTHOP_STAG_FMT_OFF	18
+#define   PPE_NEXTHOP_STAG_FMT_LEN	1
+#define   PPE_NEXTHOP_SVID_OFF		19
+#define   PPE_NEXTHOP_SVID_LEN		12
 #define   PPE_NEXTHOP_CTAG_FMT_OFF	31
 #define   PPE_NEXTHOP_CTAG_FMT_LEN	1
 #define   PPE_NEXTHOP_CVID_OFF		32
@@ -1241,6 +1257,7 @@
 #define PPE_XLT_CVID_DEL		2
 #define PPE_XLT_CKEY_PRIO_TAGGED	2
 #define PPE_XLT_CKEY_TAGGED		4
+#define PPE_XLT_KEY_ANY			7
 
 #define PPE_EG_UNTAGGED			0
 #define PPE_EG_TAGGED			1
@@ -1320,6 +1337,13 @@ struct ppe_res {
  */
 #define PPE_PPPOE_SESSIONS		16
 
+/* An uplink's vid with this bit set is not an 802.1Q VLAN: the low bits are
+ * the port of a switch behind the uplink's port, which tags its frames with
+ * the QCA header behind the 802.1ad ethertype. The PPE reads that tag as an
+ * S-tag whose VID is the switch port, so the uplink classifies by it.
+ */
+#define PPE_VID_SW			0x8000
+
 struct ppe_uplink {
 	u16 ref;
 	u16 vid;
@@ -1327,6 +1351,18 @@ struct ppe_uplink {
 	s8 vsi;
 	s8 mymac;
 	int xlt;
+	int eg_xlt;
+};
+
+/* A user port of another switch, and the port of this switch its conduit is,
+ * or -1 while it is none.
+ */
+#define PPE_SW_PORTS			16
+
+struct ppe_sw_port {
+	struct net_device *dev;
+	s8 port;
+	u8 index;
 };
 
 struct ppe_pppoe_session {
@@ -1546,6 +1582,7 @@ struct qca_ppe_priv {
 	u64 ul_h_source;
 	u16 l3_if_ref[PPE_VSI_MAX];
 	struct ppe_uplink uplink[PPE_PPPOE_SESSIONS];
+	struct ppe_sw_port sw_port[PPE_SW_PORTS];
 	struct ppe_pppoe_session pppoe[PPE_PPPOE_SESSIONS];
 	u32 flow_reject[PPE_REJECT_MAX];
 	/* Which devices the NSS firmware forwards to, while it runs. */

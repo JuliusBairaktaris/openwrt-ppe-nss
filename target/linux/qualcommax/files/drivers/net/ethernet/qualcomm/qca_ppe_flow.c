@@ -329,8 +329,9 @@ static int ppe_offload_show(struct seq_file *s, void *data)
 
 		if (!up->ref)
 			continue;
-		snprintf(name, sizeof(name), "uplink_port%u_vid%u", up->port,
-			 up->vid);
+		snprintf(name, sizeof(name), "uplink_port%u_%s%u", up->port,
+			 up->vid & PPE_VID_SW ? "sw" : "vid",
+			 up->vid & ~PPE_VID_SW);
 		seq_printf(s, "%-24s %u\n", name, up->ref);
 	}
 
