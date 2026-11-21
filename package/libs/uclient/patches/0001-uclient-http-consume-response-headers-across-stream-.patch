@@ -1,0 +1,258 @@
+From a78817c2d20b4b93f0edb05bd647a54978bae6c4 Mon Sep 17 00:00:00 2001
+From: Filip Michalski <filip.michalski92@gmail.com>
+Date: Thu, 12 Nov 2026 22:17:31 +0100
+Subject: [PATCH 1/2] uclient-http: consume response headers across stream
+ buffers
+
+A header line at least as large as the default 4096-byte read buffer
+cannot be parsed or consumed. The full buffer disables socket reads,
+leaving uclient-fetch waiting until the connection timeout. GitHub's
+4175-byte Content-Security-Policy header triggers this on release URLs.
+
+Accumulate and consume header fragments separately from the stream,
+retaining folded-header and LF handling and leaving response body bytes
+in the stream. Reset the partial line between requests and free its
+buffer with the client.
+
+Add local HTTP regression coverage for the buffer boundary, long and
+folded headers, a long redirect target, and LF-only responses. The
+original release download also succeeds with the patched client.
+
+Assisted-by: OpenAI Codex
+Signed-off-by: Filip Michalski <filip.michalski92@gmail.com>
+---
+ tests/cram/http_headers.py     |  55 +++++++++++++++++
+ tests/cram/test_http_headers.t |   9 +++
+ uclient-http.c                 | 105 +++++++++++++++++++--------------
+ 3 files changed, 126 insertions(+), 43 deletions(-)
+ create mode 100644 tests/cram/http_headers.py
+ create mode 100644 tests/cram/test_http_headers.t
+
+diff --git a/tests/cram/http_headers.py b/tests/cram/http_headers.py
+new file mode 100644
+index 0000000..354a7fe
+--- /dev/null
++++ b/tests/cram/http_headers.py
+@@ -0,0 +1,55 @@
++#!/usr/bin/env python3
++import http.server
++import os
++import subprocess
++import sys
++import threading
++
++
++class Handler(http.server.BaseHTTPRequestHandler):
++    def do_GET(self):
++        target = '/body?' + 'q' * 4175
++        if self.path.startswith('/body') and self.path != target:
++            self.send_error(404)
++            return
++        if self.path == '/lf':
++            self.connection.sendall(
++                b'HTTP/1.1 200 OK\nContent-Security-Policy: ' + b'x' * 4175 +
++                b'\nContent-Length: 3\n\nOK\n')
++            return
++        redirect = self.path == '/redirect'
++        self.send_response(302 if redirect else 200)
++        if not self.path.startswith('/body'):
++            length = 4096 if self.path == '/boundary' else 4175
++            value = 'x' * (length - len('Content-Security-Policy: \r\n'))
++            if self.path == '/folded':
++                value += '\r\n ' + 'y' * 4175
++            self.send_header('Content-Security-Policy', value)
++        if redirect:
++            self.send_header('Location', target)
++        body = b'' if redirect else b'OK\n'
++        self.send_header('Content-Length', str(len(body)))
++        self.end_headers()
++        self.wfile.write(body)
++
++    def log_message(self, *args):
++        pass
++
++
++with http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler) as server:
++    thread = threading.Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    binary = sys.argv[1:] or [os.path.join(os.environ['BUILD_BIN_DIR'], 'uclient-fetch')]
++    try:
++        for path in ('/boundary', '/long', '/folded', '/redirect', '/lf'):
++            result = subprocess.run(
++                binary + ['-q', '-T', '2', '-O', '-',
++                 f'http://127.0.0.1:{server.server_port}{path}'],
++                capture_output=True, timeout=5)
++            if result.returncode != 0 or result.stdout != b'OK\n':
++                raise SystemExit(f'{path}: exit {result.returncode}, '
++                                 f'body {result.stdout!r}, error {result.stderr!r}')
++            print(f'{path}: OK')
++    finally:
++        server.shutdown()
++        thread.join()
+diff --git a/tests/cram/test_http_headers.t b/tests/cram/test_http_headers.t
+new file mode 100644
+index 0000000..a3188d9
+--- /dev/null
++++ b/tests/cram/test_http_headers.t
+@@ -0,0 +1,9 @@
++Response header lines may span the default stream buffer, including a folded
++header or a redirect followed by a response body:
++
++  $ python3 "$TESTDIR/http_headers.py"
++  /boundary: OK
++  /long: OK
++  /folded: OK
++  /redirect: OK
++  /lf: OK
+diff --git a/uclient-http.c b/uclient-http.c
+index 04ddcb9..4302d5b 100644
+--- a/uclient-http.c
++++ b/uclient-http.c
+@@ -121,6 +121,8 @@ struct uclient_http {
+ 
+ 	struct blob_buf headers;
+ 	struct blob_buf meta;
++	char *header_buf;
++	size_t header_len;
+ };
+ 
+ enum {
+@@ -254,6 +256,7 @@ static void uclient_http_reset_state(struct uclient_http *uh)
+ 	uh->disconnect = false;
+ 	uh->connection_close = false;
+ 	uh->state = HTTP_STATE_INIT;
++	uh->header_len = 0;
+ 
+ 	if (uh->auth_type == AUTH_TYPE_UNKNOWN && !uh->uc.url->auth)
+ 		uh->auth_type = AUTH_TYPE_NONE;
+@@ -818,6 +821,57 @@ static void uclient_parse_http_line(struct uclient_http *uh, char *data)
+ 	uclient_notify_eof(uh);
+ }
+ 
++static char *uclient_http_read_header_line(struct uclient_http *uh)
++{
++	char *data, *sep, *buf;
++	int len;
++	size_t end;
++
++	while ((data = ustream_get_read_buf(uh->us, &len)) && len) {
++		if (uh->header_len && uh->header_buf[uh->header_len - 1] == '\n') {
++			end = uh->header_len - 1;
++			if (end && uh->header_buf[end - 1] == '\r')
++				end--;
++
++			/* A following whitespace character continues the previous header. */
++			if (isspace((unsigned char)*data) && *data != '\r' && *data != '\n') {
++				memset(uh->header_buf + end, ' ', uh->header_len - end);
++			} else {
++				uh->header_buf[end] = 0;
++				uh->header_len = 0;
++				return uh->header_buf;
++			}
++		}
++
++		sep = memchr(data, '\n', len);
++		if (sep)
++			len = sep + 1 - data;
++
++		/* Consume fragments so a long line cannot fill and block the stream. */
++		buf = realloc(uh->header_buf, uh->header_len + len + 1);
++		if (!buf) {
++			uclient_http_error(uh, UCLIENT_ERROR_UNKNOWN);
++			return NULL;
++		}
++
++		uh->header_buf = buf;
++		memcpy(buf + uh->header_len, data, len);
++		uh->header_len += len;
++		buf[uh->header_len] = 0;
++		ustream_consume(uh->us, len);
++
++		/* The empty line ends the headers without looking into the body. */
++		if (sep && (uh->header_len == 1 ||
++			    (uh->header_len == 2 && buf[0] == '\r'))) {
++			buf[0] = 0;
++			uh->header_len = 0;
++			return buf;
++		}
++	}
++
++	return NULL;
++}
++
+ static void __uclient_notify_read(struct uclient_http *uh)
+ {
+ 	struct uclient *uc = &uh->uc;
+@@ -831,56 +885,20 @@ static void __uclient_notify_read(struct uclient_http *uh)
+ 	if (uh->state == HTTP_STATE_PROCESS_HEADERS)
+ 		return;
+ 
+-	data = ustream_get_read_buf(uh->us, &len);
+-	if (!data || !len)
+-		return;
+-
+ 	if (uh->state < HTTP_STATE_RECV_DATA) {
+-		char *sep, *next;
+-		int cur_len;
+-
+ 		do {
+-			sep = strchr(data, '\n');
+-			if (!sep)
+-				break;
+-
+-			next = sep + 1;
+-			if (sep > data && sep[-1] == '\r')
+-				sep--;
+-
+-			/* Check for multi-line HTTP headers */
+-			if (sep > data) {
+-				if (!*next)
+-					return;
+-
+-				if (isspace((unsigned char)*next) && *next != '\r' && *next != '\n') {
+-					sep[0] = ' ';
+-					if (sep + 1 < next)
+-						sep[1] = ' ';
+-					continue;
+-				}
+-			}
+-
+-			*sep = 0;
+-			cur_len = next - data;
+-			uclient_parse_http_line(uh, data);
+-			if (seq != uh->seq)
++			data = uclient_http_read_header_line(uh);
++			if (!data)
+ 				return;
+ 
+-			ustream_consume(uh->us, cur_len);
+-			len -= cur_len;
+-
+-			if (uh->eof)
++			uclient_parse_http_line(uh, data);
++			if (seq != uh->seq || uh->eof)
+ 				return;
+-
+-			data = ustream_get_read_buf(uh->us, &len);
+-		} while (data && uh->state == HTTP_STATE_RECV_HEADERS);
+-
+-		if (!len)
+-			return;
++		} while (uh->state == HTTP_STATE_RECV_HEADERS);
+ 	}
+ 
+-	if (uh->eof)
++	data = ustream_get_read_buf(uh->us, &len);
++	if (!data || !len || uh->eof)
+ 		return;
+ 
+ 	if (uh->state == HTTP_STATE_RECV_DATA) {
+@@ -1092,6 +1110,7 @@ static void uclient_http_free(struct uclient *cl)
+ 	uclient_http_free_ssl_ctx(uh);
+ 	blob_buf_free(&uh->headers);
+ 	blob_buf_free(&uh->meta);
++	free(uh->header_buf);
+ 	free(uh);
+ }
+ 
+
