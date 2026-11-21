@@ -1,0 +1,159 @@
+From a991e52ac981c9b60c48a38806d1e9717dab78e8 Mon Sep 17 00:00:00 2001
+From: Filip Michalski <filip.michalski92@gmail.com>
+Date: Sun, 15 Nov 2026 18:47:23 +0100
+Subject: [PATCH 2/2] uclient-http: bound header lines and report invalid
+ responses
+
+Limit accumulated logical header lines to 64 KiB, using Python
+http.client's line limit as the reference, and report oversized lines
+and allocation failure with a nonzero invalid-response error.
+
+Use the same error for malformed chunk lengths so the request terminates
+instead of cancelling its timeout without reporting an error. Cover the
+limit boundary, oversized continuations, and invalid chunk lengths.
+
+Assisted-by: OpenAI Codex
+Signed-off-by: Filip Michalski <filip.michalski92@gmail.com>
+---
+ tests/cram/http_headers.py     | 15 ++++++++++++---
+ tests/cram/test_http_headers.t |  4 ++++
+ uclient-fetch.c                |  4 ++++
+ uclient-http.c                 | 12 ++++++++++--
+ uclient.c                      |  2 ++
+ uclient.h                      |  1 +
+ 6 files changed, 33 insertions(+), 5 deletions(-)
+
+diff --git a/tests/cram/http_headers.py b/tests/cram/http_headers.py
+index 354a7fe..de17e97 100644
+--- a/tests/cram/http_headers.py
++++ b/tests/cram/http_headers.py
+@@ -17,12 +17,18 @@ def do_GET(self):
+                 b'HTTP/1.1 200 OK\nContent-Security-Policy: ' + b'x' * 4175 +
+                 b'\nContent-Length: 3\n\nOK\n')
+             return
++        if self.path == '/invalid-chunk':
++            self.connection.sendall(
++                b'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\ninvalid\r\n')
++            return
+         redirect = self.path == '/redirect'
+         self.send_response(302 if redirect else 200)
+         if not self.path.startswith('/body'):
+             length = 4096 if self.path == '/boundary' else 4175
++            if self.path in ('/limit', '/oversized', '/folded-oversized'):
++                length = 65536 + (self.path == '/oversized')
+             value = 'x' * (length - len('Content-Security-Policy: \r\n'))
+-            if self.path == '/folded':
++            if self.path in ('/folded', '/folded-oversized'):
+                 value += '\r\n ' + 'y' * 4175
+             self.send_header('Content-Security-Policy', value)
+         if redirect:
+@@ -41,12 +47,15 @@ def log_message(self, *args):
+     thread.start()
+     binary = sys.argv[1:] or [os.path.join(os.environ['BUILD_BIN_DIR'], 'uclient-fetch')]
+     try:
+-        for path in ('/boundary', '/long', '/folded', '/redirect', '/lf'):
++        for path in ('/boundary', '/long', '/folded', '/redirect', '/lf', '/limit',
++                     '/oversized', '/folded-oversized', '/invalid-chunk'):
+             result = subprocess.run(
+                 binary + ['-q', '-T', '2', '-O', '-',
+                  f'http://127.0.0.1:{server.server_port}{path}'],
+                 capture_output=True, timeout=5)
+-            if result.returncode != 0 or result.stdout != b'OK\n':
++            failed = path in ('/oversized', '/folded-oversized', '/invalid-chunk')
++            expected_code, expected_body = (7, b'') if failed else (0, b'OK\n')
++            if result.returncode != expected_code or result.stdout != expected_body:
+                 raise SystemExit(f'{path}: exit {result.returncode}, '
+                                  f'body {result.stdout!r}, error {result.stderr!r}')
+             print(f'{path}: OK')
+diff --git a/tests/cram/test_http_headers.t b/tests/cram/test_http_headers.t
+index a3188d9..7de73bc 100644
+--- a/tests/cram/test_http_headers.t
++++ b/tests/cram/test_http_headers.t
+@@ -7,3 +7,7 @@ header or a redirect followed by a response body:
+   /folded: OK
+   /redirect: OK
+   /lf: OK
++  /limit: OK
++  /oversized: OK
++  /folded-oversized: OK
++  /invalid-chunk: OK
+diff --git a/uclient-fetch.c b/uclient-fetch.c
+index c214b0b..1866862 100644
+--- a/uclient-fetch.c
++++ b/uclient-fetch.c
+@@ -532,6 +532,10 @@ static void handle_uclient_error(struct uclient *cl, int code)
+ 		ignore = !verify;
+ 		error_ret = 5;
+ 		break;
++	case UCLIENT_ERROR_INVALID_RESPONSE:
++		type = "Invalid response";
++		error_ret = 7;
++		break;
+ 	default:
+ 		error_ret = 1;
+ 		break;
+diff --git a/uclient-http.c b/uclient-http.c
+index 4302d5b..4e683d9 100644
+--- a/uclient-http.c
++++ b/uclient-http.c
+@@ -34,6 +34,9 @@
+ #include "uclient-utils.h"
+ #include "uclient-backend.h"
+ 
++/* Use Python http.client's 64 KiB limit for each logical header line. */
++#define HTTP_MAX_HEADER_LINE (64 * 1024)
++
+ enum auth_type {
+ 	AUTH_TYPE_UNKNOWN,
+ 	AUTH_TYPE_NONE,
+@@ -847,10 +850,15 @@ static char *uclient_http_read_header_line(struct uclient_http *uh)
+ 		if (sep)
+ 			len = sep + 1 - data;
+ 
++		if ((size_t)len > HTTP_MAX_HEADER_LINE - uh->header_len) {
++			uclient_http_error(uh, UCLIENT_ERROR_INVALID_RESPONSE);
++			return NULL;
++		}
++
+ 		/* Consume fragments so a long line cannot fill and block the stream. */
+ 		buf = realloc(uh->header_buf, uh->header_len + len + 1);
+ 		if (!buf) {
+-			uclient_http_error(uh, UCLIENT_ERROR_UNKNOWN);
++			uclient_http_error(uh, UCLIENT_ERROR_INVALID_RESPONSE);
+ 			return NULL;
+ 		}
+ 
+@@ -1242,7 +1250,7 @@ uclient_http_read(struct uclient *cl, char *buf, unsigned int len)
+ 		errno = 0;
+ 		chunk_len = strtoll(data, &end, 16);
+ 		if (end == data || chunk_len < 0 || chunk_len > LONG_MAX || errno) {
+-			uclient_http_error(uh, UCLIENT_ERROR_UNKNOWN);
++			uclient_http_error(uh, UCLIENT_ERROR_INVALID_RESPONSE);
+ 			return 0;
+ 		}
+ 		uh->read_chunked = chunk_len;
+diff --git a/uclient.c b/uclient.c
+index 9678915..558a215 100644
+--- a/uclient.c
++++ b/uclient.c
+@@ -498,6 +498,8 @@ const char * uclient_strerror(unsigned err)
+ 		return "ssl cn mismatch";
+ 	case UCLIENT_ERROR_MISSING_SSL_CONTEXT:
+ 		return "missing ssl context";
++	case UCLIENT_ERROR_INVALID_RESPONSE:
++		return "invalid response";
+ 	default:
+ 		return "invalid error code";
+ 	}
+diff --git a/uclient.h b/uclient.h
+index a4b7a39..b1423fa 100644
+--- a/uclient.h
++++ b/uclient.h
+@@ -36,6 +36,7 @@ enum uclient_error_code {
+ 	UCLIENT_ERROR_SSL_INVALID_CERT,
+ 	UCLIENT_ERROR_SSL_CN_MISMATCH,
+ 	UCLIENT_ERROR_MISSING_SSL_CONTEXT,
++	UCLIENT_ERROR_INVALID_RESPONSE,
+ 	__UCLIENT_ERROR_MAX
+ };
+ 
