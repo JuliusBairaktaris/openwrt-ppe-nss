@@ -1,0 +1,85 @@
+wifi: ath11k: count the segments of a TX batch without an atomic
+
+A batch the TCL segments from extension descriptors holds one reference of
+its skb per segment, taken with refcount_add() when it is sent, and each
+segment's completion drops one with skb_unref() in
+ath11k_dp_tx_buf_put_id(). That is an atomic on the skb's reference count
+line, which nothing else of the completion reads: in a profile of routed
+downlink at 900 Mbit/s (cand18, one run) the instruction after it takes
+0.44 % of all samples.
+
+Count the outstanding segments in the frame's control block instead, whose
+line the completion of the segment reads anyway. The send sets the count
+before the first descriptor is on the ring, with the frame held only by
+the driver (its reference count is 1 there), and every release of an id
+of the batch decrements it: the completion handler and the firmware
+release paths under the id lock, and the teardown, which runs alone. The
+send's failure path gives its ids back before any count exists, as it gave
+them back before any reference was taken. The release that takes the count to zero returns the frame, as
+skb_unref() did for the last reference, so the frames of a batch complete
+and are freed in the same order as before.
+
+The module parameter tx_seg_count (default on), read per batch and kept
+with it, is a test switch for the A/B and is removed before this goes
+upstream.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -130,6 +130,11 @@ struct ath11k_skb_cb {
+ 	 */
+ 	u8 tso_try;
+ 	u8 tso_bad;
++	/* Of a batch whose segments are counted here instead of in the skb's
++	 * reference count: the segments whose completion is still to come
++	 */
++	u8 tso_left;
++	u8 tso_counted:1;
+ } __packed;
+ 
+ struct ath11k_skb_rxcb {
+--- a/drivers/net/wireless/ath/ath11k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_tx.c
+@@ -216,6 +216,15 @@ static void ath11k_dp_tx_tso_unmap(struc
+ 	map->len[0] = 0;
+ }
+ 
++/* TEST-ONLY switch for the A/B of the count of a batch's outstanding segments
++ * in its control block against references; read per batch. Dropped before this
++ * is upstreamed.
++ */
++static bool ath11k_tx_seg_count = true;
++module_param_named(tx_seg_count, ath11k_tx_seg_count, bool, 0644);
++MODULE_PARM_DESC(tx_seg_count,
++		 "Count the outstanding segments of a TX batch in its control block instead of its reference count (default: on)");
++
+ /* Releases the buffer of an id. A TSO segment shares its batch with the other
+  * segments of it: this returns the batch with the completion of its last
+  * segment only, and NULL with *@more set before that. @seg, if given, gets
+@@ -256,7 +265,8 @@ struct sk_buff *ath11k_dp_tx_buf_put_id(
+ 		ath11k_dp_tx_tso_unmap(ab->dev, map);
+ 		tx_ring->ext_free[tx_ring->ext_num_free++] = id;
+ 
+-		if (!skb_unref(skb)) {
++		if (ATH11K_SKB_CB(skb)->tso_counted ?
++		    --ATH11K_SKB_CB(skb)->tso_left : !skb_unref(skb)) {
+ 			*more = true;
+ 			return NULL;
+ 		}
+@@ -870,7 +880,15 @@ static int ath11k_dp_tx_ext(struct ath11
+ 	skb_cb->ar = ar;
+ 	skb_cb->tso_try = 0;
+ 	skb_cb->tso_bad = 0;
+-	refcount_add(n - 1, &skb->users);
++	/* Each segment's completion gives back one share of the frame: counted
++	 * in the control block, under the id lock every release of an id
++	 * holds, or as references.
++	 */
++	skb_cb->tso_counted = READ_ONCE(ath11k_tx_seg_count);
++	if (skb_cb->tso_counted)
++		skb_cb->tso_left = n;
++	else
++		refcount_add(n - 1, &skb->users);
+ 
+ 	ti.encap_type = HAL_TCL_ENCAP_TYPE_ETHERNET;
+ 	ti.meta_data_flags = arvif->tcl_metadata;
