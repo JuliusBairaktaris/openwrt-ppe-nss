@@ -1,0 +1,810 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] TEST: wifi: ath11k: experiments on scatter-gather extension descriptor frames
+
+Add module parameters, 0644 and off by default, read for each frame,
+that change how a frame goes out through an MSDU extension descriptor.
+They apply, with tso set, to plain IPv4 or IPv6 TCP frames to a station;
+with several set the first in this list wins, and a frame the chosen one
+cannot take is sent the normal way:
+
+ext_sg_swcsum: a frame with fragments gets its CHECKSUM_PARTIAL resolved
+by skb_checksum_help() and goes out with no checksum enable in the TCL
+data command; the vendor enables the L3 and L4 checksums only for a
+frame that asks for checksum offload or is TSO (wifi-host-cmn
+dp/wifi3.0/li/dp_li_tx.c:577-582).
+
+ext_sg_as_tso: a CHECKSUM_PARTIAL frame with fragments goes out as a TSO
+batch of one segment: the headers in buffer 0, the rest of the linear
+part and the fragments after them, tso_enable 1, the TCP flags of the
+header under the mask 0x1ff, the L2 length, the IP length, the TCP
+sequence number and the IPv4 ID, and the checksum enables of a batch.
+The TCP checksum field keeps what the stack wrote for CHECKSUM_PARTIAL,
+the pseudo-header sum with the length, where a GSO batch has it without.
+
+ext_sg_split_da: a frame with fragments goes out in the layout of the
+vendor's multicast enhancement (wifi-host-cmn dp/wifi3.0/dp_txrx_me.c:
+562-615): buffer 0 the 6 byte destination address, copied to a buffer of
+its own (one L1_CACHE_BYTES buffer for each descriptor, allocated with
+the descriptors) and mapped by itself, buffer 1 the rest of the linear
+part, then the fragments, so at most four of them; checksum in software,
+no enables. The address buffer is unmapped with the fragments wherever
+the descriptor is released: completion, the crash flush and the cleanup.
+
+ext_one_buf: a linear frame goes out through an extension descriptor
+with one buffer, the whole frame; checksum in software, no enables.
+
+ext_log_first is now the number of the next extension descriptor frames
+to log, of any station; writing it arms that many again (default 8). A
+logged frame gets, per segment, the existing map line and a line with
+the 18 words of its descriptor as written, then a line with the 8 words
+of the TCL ring entry of its first segment (TLV header and command) as
+written, and the frame line, which names the layout; a logged frame that
+falls back gets a line with the reason.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/core.h
+===================================================================
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/core.h
++++ backports-7.2/drivers/net/wireless/ath/ath11k/core.h
+@@ -601,13 +601,11 @@ struct ath11k_sta {
+ 
+ 	u32 bw_prev;
+ 
+-	/* TEST: jiffies at station add, whether the hardware has completed a
+-	 * frame of the station on the normal path, and how many frames sent
+-	 * through extension descriptors were logged
++	/* TEST: jiffies at station add, and whether the hardware has completed
++	 * a frame of the station on the normal path
+ 	 */
+ 	unsigned long add_jiffies;
+ 	bool ext_compl_seen;
+-	atomic_t ext_logged;
+ 
+ 	/* TEST: the AST index and hash of the station's peer from the HTT
+ 	 * peer map event; ast_valid is set after them and cleared when the
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp.h
+===================================================================
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/dp.h
++++ backports-7.2/drivers/net/wireless/ath/ath11k/dp.h
+@@ -151,6 +151,11 @@ struct dp_tx_ring {
+ 	u16 *ext_slot;
+ 	u16 *ext_free;
+ 	u32 ext_num_free;
++	/* TEST: an L1_CACHE_BYTES buffer for each descriptor, for the
++	 * destination address of an ext_sg_split_da frame; NULL if it could
++	 * not be allocated
++	 */
++	u8 *ext_da;
+ 	/* Protects bufs, free_ids, ext_slot and ext_free */
+ 	spinlock_t tx_idr_lock;
+ 	/* Serializes wake_tx_queue operations for this ring */
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp_tx.c
+===================================================================
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/dp_tx.c
++++ backports-7.2/drivers/net/wireless/ath/ath11k/dp_tx.c
+@@ -106,14 +106,6 @@ module_param_named(ext_after_compl, ath1
+ MODULE_PARM_DESC(ext_after_compl,
+ 		 "No extension descriptor frames to a station before its first normal completion (default: on)");
+ 
+-/* TEST-ONLY: log the first frames of each station sent through extension
+- * descriptors. Read for each frame.
+- */
+-static bool ath11k_ext_log_first = true;
+-module_param_named(ext_log_first, ath11k_ext_log_first, bool, 0644);
+-MODULE_PARM_DESC(ext_log_first,
+-		 "Log the first frames of a station sent through extension descriptors (default: on)");
+-
+ /* TEST-ONLY: an extension descriptor frame is sent with index search on the
+  * AST entry of its station, not the address search of the vif; a frame whose
+  * station has no known index is made linear. Read for each frame.
+@@ -125,12 +117,144 @@ MODULE_PARM_DESC(ext_index_search,
+ 
+ #define ATH11K_EXT_LOG_MAX	8
+ 
++/* TEST-ONLY: how many of the next frames sent through extension descriptors,
++ * of any station, are logged. Writing it arms that many again, so that each
++ * run of a test logs its own frames; reading it gives how many are left.
++ */
++static atomic_t ath11k_ext_log_left = ATOMIC_INIT(ATH11K_EXT_LOG_MAX);
++static atomic_t ath11k_ext_log_seq;
++
++static int ath11k_ext_log_first_set(const char *val,
++				    const struct kernel_param *kp)
++{
++	unsigned int n;
++	int ret;
++
++	ret = kstrtouint(val, 0, &n);
++	if (ret)
++		return ret;
++	if (n > INT_MAX)
++		return -EINVAL;
++
++	atomic_set(&ath11k_ext_log_left, n);
++	return 0;
++}
++
++static int ath11k_ext_log_first_get(char *buf, const struct kernel_param *kp)
++{
++	return sysfs_emit(buf, "%d\n", atomic_read(&ath11k_ext_log_left));
++}
++
++static const struct kernel_param_ops ath11k_ext_log_first_ops = {
++	.set = ath11k_ext_log_first_set,
++	.get = ath11k_ext_log_first_get,
++};
++
++module_param_cb(ext_log_first, &ath11k_ext_log_first_ops, NULL, 0644);
++__MODULE_PARM_TYPE(ext_log_first, "uint");
++MODULE_PARM_DESC(ext_log_first,
++		 "Log the next N frames sent through extension descriptors; a write arms N again (default: 8)");
++
++/* TEST-ONLY: other layouts of a frame sent through an extension descriptor,
++ * for the experiments on the frames the TCL takes and never transmits. They
++ * apply to frames with fragments, ext_one_buf to linear frames; all to plain
++ * IPv4 or IPv6 TCP frames to a station, with tso set. With several set, the
++ * first here wins; a frame the chosen one cannot take is sent the normal
++ * way. Read for each frame.
++ */
++static bool ath11k_ext_sg_swcsum;
++module_param_named(ext_sg_swcsum, ath11k_ext_sg_swcsum, bool, 0644);
++MODULE_PARM_DESC(ext_sg_swcsum,
++		 "Frames with fragments: checksum in software, no TCL checksum enables (default: off)");
++
++static bool ath11k_ext_sg_as_tso;
++module_param_named(ext_sg_as_tso, ath11k_ext_sg_as_tso, bool, 0644);
++MODULE_PARM_DESC(ext_sg_as_tso,
++		 "Frames with fragments: sent as a TSO batch of one segment (default: off)");
++
++static bool ath11k_ext_sg_split_da;
++module_param_named(ext_sg_split_da, ath11k_ext_sg_split_da, bool, 0644);
++MODULE_PARM_DESC(ext_sg_split_da,
++		 "Frames with fragments: destination address in a buffer of its own, checksum in software, no TCL checksum enables (default: off)");
++
++static bool ath11k_ext_one_buf;
++module_param_named(ext_one_buf, ath11k_ext_one_buf, bool, 0644);
++MODULE_PARM_DESC(ext_one_buf,
++		 "Linear frames: sent through an extension descriptor of one buffer, checksum in software, no TCL checksum enables (default: off)");
++
++enum ath11k_ext_kind {
++	/* a TCP batch */
++	ATH11K_EXT_TSO,
++	/* a frame with fragments: the linear part, then the fragments */
++	ATH11K_EXT_SG,
++	/* as ATH11K_EXT_SG, checksum in software */
++	ATH11K_EXT_SG_SWCSUM,
++	/* the headers, the rest of the linear part and the fragments, with
++	 * the TSO fields of a batch of one segment
++	 */
++	ATH11K_EXT_SG_AS_TSO,
++	/* the destination address, the rest of the linear part and the
++	 * fragments, checksum in software
++	 */
++	ATH11K_EXT_SG_SPLIT_DA,
++	/* a linear frame in one buffer, checksum in software */
++	ATH11K_EXT_ONE_BUF,
++};
++
++static const char * const ath11k_ext_kind_name[] = {
++	[ATH11K_EXT_TSO] = "tso",
++	[ATH11K_EXT_SG] = "sg",
++	[ATH11K_EXT_SG_SWCSUM] = "sg_swcsum",
++	[ATH11K_EXT_SG_AS_TSO] = "sg_as_tso",
++	[ATH11K_EXT_SG_SPLIT_DA] = "sg_split_da",
++	[ATH11K_EXT_ONE_BUF] = "one_buf",
++};
++
++/* The kind of a frame that is not a batch, by its fragments, or -1 for one
++ * that does not take an extension descriptor: one buffer for the linear part
++ * (two for ATH11K_EXT_SG_SPLIT_DA) and one for each fragment.
++ */
++static int ath11k_dp_tx_ext_kind(unsigned int nr_frags)
++{
++	enum ath11k_ext_kind kind;
++
++	if (!nr_frags)
++		return READ_ONCE(ath11k_ext_one_buf) ? ATH11K_EXT_ONE_BUF : -1;
++
++	if (READ_ONCE(ath11k_ext_sg_swcsum))
++		kind = ATH11K_EXT_SG_SWCSUM;
++	else if (READ_ONCE(ath11k_ext_sg_as_tso))
++		kind = ATH11K_EXT_SG_AS_TSO;
++	else if (READ_ONCE(ath11k_ext_sg_split_da))
++		kind = ATH11K_EXT_SG_SPLIT_DA;
++	else
++		kind = ATH11K_EXT_SG;
++
++	if (nr_frags > HAL_TX_MSDU_EXT_NUM_BUFS -
++		       (kind == ATH11K_EXT_SG_SPLIT_DA ? 2 : 1))
++		return -1;
++
++	return kind;
++}
++
++static bool ath11k_dp_tx_ext_kind_swcsum(enum ath11k_ext_kind kind)
++{
++	return kind == ATH11K_EXT_SG_SWCSUM || kind == ATH11K_EXT_SG_SPLIT_DA ||
++	       kind == ATH11K_EXT_ONE_BUF;
++}
++
++/* The words of a TCL data ring entry: the TLV header and the command */
++#define ATH11K_EXT_TCL_WORDS	((sizeof(struct hal_tlv_hdr) + \
++				  sizeof(struct hal_tcl_data_cmd)) / sizeof(u32))
++#define ATH11K_EXT_DESC_WORDS	(sizeof(struct hal_tx_msdu_ext) / sizeof(u32))
++
+ /* The ethertype, IP protocol and L4 ports of an Ethernet frame. Returns 0 for
+  * plain IPv4 or IPv6 TCP, 1 for a frame that is not IP, 2 for another IP
+  * protocol, a fragment, IP options past the header or an IPv6 extension header.
++ * @l4_off, if given, gets the offset of the TCP or UDP header.
+  */
+ static int ath11k_dp_tx_ext_l4(struct sk_buff *skb, u16 *etype, u8 *proto,
+-			       u16 *sport, u16 *dport)
++			       u16 *sport, u16 *dport, unsigned int *l4_off)
+ {
+ 	struct ethhdr *eth = (struct ethhdr *)skb->data;
+ 	__be16 _ports[2], *ports;
+@@ -168,6 +292,8 @@ static int ath11k_dp_tx_ext_l4(struct sk
+ 	*proto = p;
+ 	if (p != IPPROTO_TCP && p != IPPROTO_UDP)
+ 		return 2;
++	if (l4_off)
++		*l4_off = off;
+ 	ports = skb_header_pointer(skb, off, sizeof(_ports), _ports);
+ 	if (ports) {
+ 		*sport = ntohs(ports[0]);
+@@ -330,6 +456,9 @@ int ath11k_dp_tx_bufs_init(struct ath11k
+ 		tx_ring->ext_free = kvcalloc(DP_TX_EXT_DESC_NUM,
+ 					     sizeof(*tx_ring->ext_free),
+ 					     GFP_KERNEL);
++		/* TEST: without it, ext_sg_split_da sends the normal way */
++		tx_ring->ext_da = kcalloc(DP_TX_EXT_DESC_NUM, L1_CACHE_BYTES,
++					  GFP_KERNEL | __GFP_NOWARN);
+ 	}
+ 	if (!tx_ring->bufs || !tx_ring->free_ids || !tx_ring->ext_slot ||
+ 	    !tx_ring->id_gen || !tx_ring->id_addr || !tx_ring->id_last ||
+@@ -367,6 +496,7 @@ void ath11k_dp_tx_bufs_free(struct ath11
+ 				  tx_ring->ext, tx_ring->ext_paddr);
+ 	kvfree(tx_ring->ext_map);
+ 	kvfree(tx_ring->ext_free);
++	kfree(tx_ring->ext_da);
+ 	tx_ring->bufs = NULL;
+ 	tx_ring->free_ids = NULL;
+ 	tx_ring->ext_slot = NULL;
+@@ -376,6 +506,7 @@ void ath11k_dp_tx_bufs_free(struct ath11
+ 	tx_ring->ext = NULL;
+ 	tx_ring->ext_map = NULL;
+ 	tx_ring->ext_free = NULL;
++	tx_ring->ext_da = NULL;
+ 	tx_ring->num_free = 0;
+ 	tx_ring->ext_num_free = 0;
+ }
+@@ -813,18 +944,36 @@ static void ath11k_dp_tx_ext_unpad(struc
+  * cookie (the TCL data command's buffer id word), the address of its
+  * extension slot, the header buffer and each payload buffer with its length.
+  */
++static void ath11k_dp_tx_ext_log_words(struct ath11k_base *ab,
++				       struct ath11k_sta *arsta,
++				       const char *what, int seg, int n,
++				       const char *kind, const u32 *w,
++				       unsigned int nw)
++{
++	char words[ATH11K_EXT_DESC_WORDS * 9 + 1];
++	unsigned int k;
++	int p = 0;
++
++	words[0] = '\0';
++	for (k = 0; k < nw && k < ATH11K_EXT_DESC_WORDS; k++)
++		p += scnprintf(words + p, sizeof(words) - p, " %08x", w[k]);
++
++	ath11k_info(ab, "ext desc %s sta %pM %s seg %d/%d words%s\n", what,
++		    container_of((void *)arsta, struct ieee80211_sta, drv_priv)->addr,
++		    kind, seg, n, words);
++}
++
+ static void ath11k_dp_tx_ext_log_map(struct ath11k_base *ab,
+ 				     struct ath11k_sta *arsta, int seg, int n,
+-				     bool tso, u32 cookie, dma_addr_t slot,
+-				     dma_addr_t hdr_dma, unsigned int hdr_len,
+-				     const struct ath11k_dp_tx_ext_map *map)
++				     const char *kind, u32 cookie,
++				     dma_addr_t slot, dma_addr_t hdr_dma,
++				     unsigned int hdr_len,
++				     const struct ath11k_dp_tx_ext_map *map,
++				     const struct hal_tx_msdu_ext *ext)
+ {
+ 	char frags[HAL_TX_MSDU_EXT_NUM_BUFS * 24];
+ 	int p = 0, k;
+ 
+-	if (atomic_read(&arsta->ext_logged) >= ATH11K_EXT_LOG_MAX)
+-		return;
+-
+ 	frags[0] = '\0';
+ 	for (k = 0; k < map->num; k++)
+ 		p += scnprintf(frags + p, sizeof(frags) - p, " 0x%08x/%u",
+@@ -832,8 +981,69 @@ static void ath11k_dp_tx_ext_log_map(str
+ 
+ 	ath11k_info(ab, "ext desc map sta %pM %s seg %d/%d cookie 0x%08x slot %pad hdr %pad/%u frags%s\n",
+ 		    container_of((void *)arsta, struct ieee80211_sta, drv_priv)->addr,
+-		    tso ? "tso" : "sg", seg, n, cookie, &slot, &hdr_dma, hdr_len,
+-		    frags);
++		    kind, seg, n, cookie, &slot, &hdr_dma, hdr_len, frags);
++	/* the descriptor as the TCL reads it */
++	ath11k_dp_tx_ext_log_words(ab, arsta, "ext", seg, n, kind,
++				   (const u32 *)ext, ATH11K_EXT_DESC_WORDS);
++}
++
++static void ath11k_dp_tx_ext_buf(struct hal_tx_msdu_ext *ext, unsigned int k,
++				 dma_addr_t dma, unsigned int len)
++{
++	ext->buf[k].addr_lo = lower_32_bits(dma);
++	ext->buf[k].info = FIELD_PREP(HAL_TX_MSDU_EXT_BUF_INFO_ADDR_HI,
++				      upper_32_bits(dma)) |
++			   FIELD_PREP(HAL_TX_MSDU_EXT_BUF_INFO_LEN, len);
++}
++
++/* TEST: the buffers of a frame with fragments as the vendor's multicast
++ * enhancement lays out a frame it converts to unicast (wifi-host-cmn
++ * dp/wifi3.0/dp_txrx_me.c:562-615): the destination address copied to a
++ * buffer of its own, mapped by itself, then the rest of the linear part
++ * from the mapping of the linear part, then the fragments. @da is the
++ * address buffer of the descriptor; the map lists the address and the
++ * fragments, which are unmapped with it.
++ */
++static int ath11k_dp_tx_ext_map_split_da(struct device *dev,
++					 struct sk_buff *skb,
++					 struct ath11k_dp_tx_ext_map *map,
++					 struct hal_tx_msdu_ext *ext, u8 *da,
++					 dma_addr_t hdr_dma,
++					 unsigned int hdr_len)
++{
++	struct skb_shared_info *shinfo = skb_shinfo(skb);
++	dma_addr_t dma;
++	unsigned int k;
++
++	map->num = 0;
++	memcpy(da, skb->data, ETH_ALEN);
++	/* as a page, as ath11k_dp_tx_tso_unmap() unmaps it */
++	dma = dma_map_page(dev, virt_to_page(da), offset_in_page(da), ETH_ALEN,
++			   DMA_TO_DEVICE);
++	if (dma_mapping_error(dev, dma))
++		return -ENOMEM;
++	map->dma[0] = dma;
++	map->len[0] = ETH_ALEN;
++	map->num = 1;
++	ath11k_dp_tx_ext_buf(ext, 0, dma, ETH_ALEN);
++	ath11k_dp_tx_ext_buf(ext, 1, hdr_dma + ETH_ALEN, hdr_len - ETH_ALEN);
++
++	for (k = 0; k < shinfo->nr_frags; k++) {
++		skb_frag_t *frag = &shinfo->frags[k];
++
++		if (map->num == HAL_TX_MSDU_EXT_NUM_BUFS - 1)
++			return -E2BIG;
++		dma = skb_frag_dma_map(dev, frag, 0, skb_frag_size(frag),
++				       DMA_TO_DEVICE);
++		if (dma_mapping_error(dev, dma))
++			return -ENOMEM;
++		map->dma[map->num] = dma;
++		map->len[map->num] = skb_frag_size(frag);
++		map->num++;
++		ath11k_dp_tx_ext_buf(ext, k + 2, dma, skb_frag_size(frag));
++	}
++
++	return 0;
+ }
+ 
+ /* A TCP batch, or a frame with fragments, that the TCL takes from MSDU
+@@ -846,9 +1056,12 @@ static void ath11k_dp_tx_ext_log_map(str
+  * of the last one reports the batch to mac80211. A frame with fragments has
+  * one descriptor, and is a batch of one segment.
+  *
+- * Returns -EAGAIN, with the frame untouched, for one the TCL cannot take
+- * whole. The ids, extension descriptors and ring entries of all segments are
+- * taken before the first is queued.
++ * TEST: ath11k_dp_tx_ext_kind() picks how a frame with fragments, or with
++ * ext_one_buf a linear TCP frame, is laid out.
++ *
++ * Returns -EAGAIN, with the frame still fit to be sent another way, for one
++ * the TCL cannot take whole. The ids, extension descriptors and ring entries
++ * of all segments are taken before the first is queued.
+  */
+ static int ath11k_dp_tx_ext(struct ath11k *ar, struct ath11k_vif *arvif,
+ 			    struct ath11k_sta *arsta, struct sk_buff *skb,
+@@ -874,7 +1087,11 @@ static int ath11k_dp_tx_ext(struct ath11
+ 	bool dolog = false, idx_search = false, idx_log = false;
+ 	bool android = READ_ONCE(ath11k_tso_android);
+ 	u16 sta_ast_idx = 0, sta_ast_hash = 0;
+-	unsigned int pad = 0, alen, plen;
++	unsigned int pad = 0, alen, plen, l4_off = 0;
++	u32 tcl_words[ATH11K_EXT_TCL_WORDS] = {};
++	enum ath11k_ext_kind kind;
++	const char *why = NULL;
++	bool seg_tso, ipv4 = false;
+ 	int i, j, r;
+ 
+ 	if (!READ_ONCE(ath11k_tso) || !ab->hw_params.tx_tso ||
+@@ -898,43 +1115,59 @@ static int ath11k_dp_tx_ext(struct ath11
+ 
+ 		hdr_len = skb_tcp_all_headers(skb);
+ 		l2_len = skb_network_offset(skb);
++		l4_off = skb_transport_offset(skb);
++		ipv4 = shinfo->gso_type & SKB_GSO_TCPV4;
+ 		/* the IP length counts the IPv4 header, but not the IPv6 one */
+-		ip_off = shinfo->gso_type & SKB_GSO_TCPV6 ?
+-			 skb_transport_offset(skb) : l2_len;
++		ip_off = ipv4 ? l2_len : l4_off;
+ 		if (hdr_len > skb_headlen(skb) || l2_len > hdr_len)
+ 			return -EAGAIN;
++		kind = ATH11K_EXT_TSO;
+ 	} else {
+ 		/* the linear part is the first buffer, then the fragments */
+ 		hdr_len = skb_headlen(skb);
+-		if (!shinfo->nr_frags ||
+-		    shinfo->nr_frags > HAL_TX_MSDU_EXT_NUM_BUFS - 1 ||
+-		    hdr_len < ETH_HLEN || ath11k_dp_tx_ctl_frame(skb))
++		if (hdr_len < ETH_HLEN || ath11k_dp_tx_ctl_frame(skb))
+ 			return -EAGAIN;
+ 
++		r = ath11k_dp_tx_ext_kind(shinfo->nr_frags);
++		if (r < 0)
++			return -EAGAIN;
++		kind = r;
++
+ 		/* TEST: only a plain TCP frame takes the extension descriptor */
+-		if (READ_ONCE(ath11k_ext_sg_tcp_only)) {
++		if (kind != ATH11K_EXT_SG || READ_ONCE(ath11k_ext_sg_tcp_only)) {
+ 			u16 et, sp, dp;
+ 			u8 pr;
+ 
+-			r = ath11k_dp_tx_ext_l4(skb, &et, &pr, &sp, &dp);
++			r = ath11k_dp_tx_ext_l4(skb, &et, &pr, &sp, &dp, &l4_off);
+ 			if (r) {
+ 				atomic_inc(r == 1 ? &ab->soc_stats.tx_ext_sg_not_ip :
+ 					   &ab->soc_stats.tx_ext_sg_not_tcp);
+ 				return -EAGAIN;
+ 			}
++			ipv4 = et == ETH_P_IP;
+ 		}
+-	}
+ 
+-	/* The head of the frame is written when its first buffer is made to end
+-	 * on an 8 byte boundary: it has the room, and is not shared
+-	 */
+-	if (android) {
+-		if (skb_cow_head(skb, ATH11K_TX_EXT_ALIGN))
+-			return -EAGAIN;
+-		shinfo = skb_shinfo(skb);
++		/* TEST: the headers in the first buffer, as the TCL takes a
++		 * TCP batch, then the rest of the linear part and the fragments
++		 */
++		if (kind == ATH11K_EXT_SG_AS_TSO) {
++			struct tcphdr _th, *t;
++
++			if (skb->ip_summed != CHECKSUM_PARTIAL)
++				return -EAGAIN;
++			t = skb_header_pointer(skb, l4_off, sizeof(_th), &_th);
++			if (!t || t->doff < 5)
++				return -EAGAIN;
++			hdr_len = l4_off + t->doff * 4;
++			l2_len = ETH_HLEN;
++			ip_off = ipv4 ? l2_len : l4_off;
++			if (hdr_len > skb_headlen(skb) ||
++			    (skb_headlen(skb) > hdr_len) + shinfo->nr_frags >
++			    HAL_TX_MSDU_EXT_NUM_BUFS - 1)
++				return -EAGAIN;
++		}
+ 	}
+-	alen = tso ? hdr_len : skb_headlen(skb);
+-	plen = skb->len - hdr_len;
++	seg_tso = kind == ATH11K_EXT_TSO || kind == ATH11K_EXT_SG_AS_TSO;
+ 
+ 	/* TEST: no extension descriptor frame before the hardware has
+ 	 * completed one frame of the station on the normal path
+@@ -960,19 +1193,53 @@ static int ath11k_dp_tx_ext(struct ath11
+ 		}
+ 	}
+ 
+-	/* TEST: what the first frames of a station look like; read now, the
+-	 * frame may be completed and freed once it is queued
++	/* TEST: what the logged frames look like; read now, the frame may be
++	 * completed and freed once it is queued. A logged frame that is not
++	 * sent after all gets a line that says why.
+ 	 */
+-	if (arsta && READ_ONCE(ath11k_ext_log_first) &&
+-	    atomic_read(&arsta->ext_logged) < ATH11K_EXT_LOG_MAX) {
++	if (arsta && atomic_dec_if_positive(&ath11k_ext_log_left) >= 0) {
+ 		ath11k_dp_tx_ext_l4(skb, &lg_etype, &lg_proto, &lg_sport,
+-				    &lg_dport);
++				    &lg_dport, NULL);
+ 		lg_len = skb->len;
+ 		lg_frags = shinfo->nr_frags;
+ 		lg_segs = tso ? shinfo->gso_segs : 0;
+ 		dolog = true;
+ 	}
+ 
++	/* TEST: the checksum done here, so that the TCL is asked for none */
++	if (ath11k_dp_tx_ext_kind_swcsum(kind) &&
++	    skb->ip_summed == CHECKSUM_PARTIAL) {
++		if (skb_checksum_start_offset(skb) + skb->csum_offset +
++		    sizeof(__sum16) > skb_headlen(skb)) {
++			why = "checksum field past the linear part";
++			goto fail_log;
++		}
++		if (skb_checksum_help(skb)) {
++			why = "software checksum failed";
++			goto fail_log;
++		}
++		/* it makes a frame with shared fragments linear */
++		shinfo = skb_shinfo(skb);
++		if (kind != ATH11K_EXT_ONE_BUF && !shinfo->nr_frags) {
++			why = "made linear by the software checksum";
++			goto fail_log;
++		}
++		hdr_len = skb_headlen(skb);
++	}
++
++	/* The head of the frame is written when its first buffer is made to end
++	 * on an 8 byte boundary: it has the room, and is not shared
++	 */
++	if (android) {
++		if (skb_cow_head(skb, ATH11K_TX_EXT_ALIGN)) {
++			why = "no head room";
++			goto fail_log;
++		}
++		shinfo = skb_shinfo(skb);
++	}
++	alen = seg_tso ? hdr_len : skb_headlen(skb);
++	plen = skb->len - hdr_len;
++
+ 	if (held_ring >= 0)
+ 		ti.ring_id = held_ring;
+ 	else
+@@ -981,10 +1248,16 @@ static int ath11k_dp_tx_ext(struct ath11
+ 	tx_ring = &ab->dp.tx_ring[ti.ring_id];
+ 	tcl_ring = &ab->hal.srng_list[tx_ring->tcl_data_ring.ring_id];
+ 
++	if (kind == ATH11K_EXT_SG_SPLIT_DA && !tx_ring->ext_da) {
++		why = "no address buffers";
++		goto fail_log;
++	}
++
+ 	spin_lock_bh(&tx_ring->tx_idr_lock);
+ 	if (tx_ring->num_free < n || tx_ring->ext_num_free < n) {
+ 		spin_unlock_bh(&tx_ring->tx_idr_lock);
+-		return -EAGAIN;
++		why = "no free ids or descriptors";
++		goto fail_log;
+ 	}
+ 	for (i = 0; i < n; i++) {
+ 		slots[i] = tx_ring->ext_free[--tx_ring->ext_num_free];
+@@ -1004,19 +1277,21 @@ static int ath11k_dp_tx_ext(struct ath11
+ 	hdr_dma = dma_map_single(ab->dev, skb->data, skb_headlen(skb),
+ 				 DMA_TO_DEVICE);
+ 	if (dma_mapping_error(ab->dev, hdr_dma)) {
++		why = "the linear part did not map";
+ 		i = 0;
+ 		goto fail_put;
+ 	}
+ 
+-	if (tso) {
+-		th = tcp_hdr(skb);
++	/* the headers are at the same offsets past the pad */
++	if (seg_tso) {
++		th = (struct tcphdr *)(skb->data + l4_off);
+ 		seq = ntohl(th->seq);
+ 		flags = (ntohl(tcp_flag_word(th)) >> 16) & 0x1ff;
+ 		/* the Android host never sends NS */
+ 		if (android)
+ 			flags &= ~BIT(8);
+-		if (shinfo->gso_type & SKB_GSO_TCPV4)
+-			ip_id = ntohs(ip_hdr(skb)->id);
++		if (ipv4)
++			ip_id = ntohs(((struct iphdr *)(skb->data + l2_len))->id);
+ 	}
+ 
+ 	/* the payload starts @pad bytes later in the linear part */
+@@ -1036,15 +1311,23 @@ static int ath11k_dp_tx_ext(struct ath11
+ 
+ 		/* the whole slot: the bytes past the descriptor too */
+ 		memset(ext, 0, tx_ring->ext_stride);
+-		if (ath11k_dp_tx_tso_map(ab->dev, skb, map, ext, &piece, &off,
+-					 len)) {
++		if (kind == ATH11K_EXT_SG_SPLIT_DA)
++			r = ath11k_dp_tx_ext_map_split_da(ab->dev, skb, map, ext,
++							  tx_ring->ext_da +
++							  slots[i] * L1_CACHE_BYTES,
++							  hdr_dma, hdr_len);
++		else
++			r = ath11k_dp_tx_tso_map(ab->dev, skb, map, ext, &piece,
++						 &off, len);
++		if (r) {
+ 			ath11k_dp_tx_tso_unmap(ab->dev, map);
++			why = "the buffers did not fit or did not map";
+ 			goto fail_unmap;
+ 		}
+ 
+ 		map->seg_len = hdr_len + len;
+ 
+-		if (tso) {
++		if (seg_tso) {
+ 			ext->info0 = FIELD_PREP(HAL_TX_MSDU_EXT_INFO0_TSO_ENABLE, 1) |
+ 				     FIELD_PREP(HAL_TX_MSDU_EXT_INFO0_TCP_FLAG,
+ 						seg_flags) |
+@@ -1058,18 +1341,16 @@ static int ath11k_dp_tx_ext(struct ath11
+ 			ext->info3 = FIELD_PREP(HAL_TX_MSDU_EXT_INFO3_IP_ID,
+ 						ip_id);
+ 		}
+-		ext->buf[0].addr_lo = lower_32_bits(hdr_dma);
+-		ext->buf[0].info =
+-			FIELD_PREP(HAL_TX_MSDU_EXT_BUF_INFO_ADDR_HI,
+-				   upper_32_bits(hdr_dma)) |
+-			FIELD_PREP(HAL_TX_MSDU_EXT_BUF_INFO_LEN, hdr_len);
++		if (kind != ATH11K_EXT_SG_SPLIT_DA)
++			ath11k_dp_tx_ext_buf(ext, 0, hdr_dma, hdr_len);
+ 
+ 		/* TEST: the addresses the TCL is given for this segment, to
+ 		 * compare with what lands on the TCL to firmware ring; logged
+ 		 * before the segment is queued, so map is not yet released
+ 		 */
+ 		if (dolog)
+-			ath11k_dp_tx_ext_log_map(ab, arsta, i, n, tso,
++			ath11k_dp_tx_ext_log_map(ab, arsta, i, n,
++						 ath11k_ext_kind_name[kind],
+ 						 FIELD_PREP(DP_TX_DESC_ID_MAC_ID,
+ 							    ar->pdev_idx) |
+ 						 FIELD_PREP(DP_TX_DESC_ID_MSDU_ID,
+@@ -1079,7 +1360,7 @@ static int ath11k_dp_tx_ext(struct ath11
+ 							    (ATH11K_HW_MAX_QUEUES - 1)),
+ 						 tx_ring->ext_paddr +
+ 						 ath11k_dp_tx_ext_off(tx_ring, slots[i]),
+-						 hdr_dma, hdr_len, map);
++						 hdr_dma, hdr_len, map, ext);
+ 
+ 		seq += len;
+ 		left -= len;
+@@ -1098,6 +1379,7 @@ static int ath11k_dp_tx_ext(struct ath11
+ 			spin_unlock_bh(&tcl_ring->lock);
+ 		}
+ 		ab->soc_stats.tx_err.desc_na[ti.ring_id]++;
++		why = "no TCL ring entries";
+ 		goto fail_unmap;
+ 	}
+ 
+@@ -1125,19 +1407,26 @@ static int ath11k_dp_tx_ext(struct ath11
+ 	}
+ 	ti.rbm_id = ab->hw_params.hal_params->tcl2wbm_rbm_map[ti.ring_id].rbm_id;
+ 	ti.tid = ath11k_dp_tx_get_tid(skb);
+-	if (tso) {
++	/* TEST: the kinds with the checksum done in software enable none, as
++	 * the vendor enables the L3 and L4 checksums only for a frame that
++	 * asks for checksum offload or is TSO (wifi-host-cmn
++	 * dp/wifi3.0/li/dp_li_tx.c:577-582)
++	 */
++	if (seg_tso) {
+ 		ti.flags0 = FIELD_PREP(HAL_TCL_DATA_CMD_INFO1_IP4_CKSUM_EN, 1) |
+ 			    FIELD_PREP(HAL_TCL_DATA_CMD_INFO1_TCP4_CKSUM_EN, 1) |
+ 			    FIELD_PREP(HAL_TCL_DATA_CMD_INFO1_TCP6_CKSUM_EN, 1);
+ 		if (android)
+ 			ti.flags0 |= FIELD_PREP(HAL_TCL_DATA_CMD_INFO1_UDP4_CKSUM_EN, 1) |
+ 				     FIELD_PREP(HAL_TCL_DATA_CMD_INFO1_UDP6_CKSUM_EN, 1);
+-	} else if (skb->ip_summed == CHECKSUM_PARTIAL)
++	} else if (kind == ATH11K_EXT_SG &&
++		   skb->ip_summed == CHECKSUM_PARTIAL) {
+ 		ti.flags0 = FIELD_PREP(HAL_TCL_DATA_CMD_INFO1_IP4_CKSUM_EN, 1) |
+ 			    FIELD_PREP(HAL_TCL_DATA_CMD_INFO1_UDP4_CKSUM_EN, 1) |
+ 			    FIELD_PREP(HAL_TCL_DATA_CMD_INFO1_UDP6_CKSUM_EN, 1) |
+ 			    FIELD_PREP(HAL_TCL_DATA_CMD_INFO1_TCP4_CKSUM_EN, 1) |
+ 			    FIELD_PREP(HAL_TCL_DATA_CMD_INFO1_TCP6_CKSUM_EN, 1);
++	}
+ 	if (ieee80211_vif_is_mesh(arvif->vif))
+ 		ti.enable_mesh = true;
+ 	ti.flags1 = FIELD_PREP(HAL_TCL_DATA_CMD_INFO2_TID_OVERWRITE, 1);
+@@ -1160,6 +1449,9 @@ static int ath11k_dp_tx_ext(struct ath11
+ 		desc = ath11k_hal_srng_src_get_next_entry(ab, tcl_ring);
+ 		ath11k_hal_tx_cmd_desc_setup(ab, desc + sizeof(struct hal_tlv_hdr),
+ 					     &ti);
++		/* TEST: the ring entry as the TCL reads it */
++		if (dolog && !i)
++			memcpy(tcl_words, desc, sizeof(tcl_words));
+ 	}
+ 
+ 	if (held_ring < 0) {
+@@ -1184,15 +1476,17 @@ static int ath11k_dp_tx_ext(struct ath11
+ 	}
+ 
+ 	if (dolog) {
+-		int k = atomic_fetch_add(1, &arsta->ext_logged);
+-
+-		if (k < ATH11K_EXT_LOG_MAX)
+-			ath11k_info(ab, "ext desc frame %d sta %pM +%u ms: %s etype 0x%04x proto %u ports %u>%u len %u frags %u gso_segs %u compl_seen %d\n",
+-				    k, container_of((void *)arsta, struct ieee80211_sta, drv_priv)->addr,
+-				    jiffies_to_msecs(jiffies - arsta->add_jiffies),
+-				    tso ? "tso" : "sg", lg_etype, lg_proto,
+-				    lg_sport, lg_dport, lg_len, lg_frags,
+-				    lg_segs, READ_ONCE(arsta->ext_compl_seen));
++		ath11k_dp_tx_ext_log_words(ab, arsta, "tcl", 0, n,
++					   ath11k_ext_kind_name[kind],
++					   tcl_words, ARRAY_SIZE(tcl_words));
++		ath11k_info(ab, "ext desc frame %d sta %pM +%u ms: %s etype 0x%04x proto %u ports %u>%u len %u frags %u gso_segs %u hdr %u pad %u compl_seen %d\n",
++			    atomic_inc_return(&ath11k_ext_log_seq) - 1,
++			    container_of((void *)arsta, struct ieee80211_sta, drv_priv)->addr,
++			    jiffies_to_msecs(jiffies - arsta->add_jiffies),
++			    ath11k_ext_kind_name[kind], lg_etype, lg_proto,
++			    lg_sport, lg_dport, lg_len, lg_frags,
++			    lg_segs, hdr_len, pad,
++			    READ_ONCE(arsta->ext_compl_seen));
+ 	}
+ 
+ 	return 0;
+@@ -1213,6 +1507,11 @@ fail_put:
+ 		tx_ring->ext_free[tx_ring->ext_num_free++] = slots[j];
+ 	}
+ 	spin_unlock_bh(&tx_ring->tx_idr_lock);
++fail_log:
++	if (dolog)
++		ath11k_info(ab, "ext desc frame sta %pM %s not sent (%s): sent the normal way\n",
++			    container_of((void *)arsta, struct ieee80211_sta, drv_priv)->addr,
++			    ath11k_ext_kind_name[kind], why);
+ 
+ 	return -EAGAIN;
+ }
+@@ -1226,6 +1525,30 @@ int ath11k_dp_tx_sg(struct ath11k *ar, s
+ 	return ath11k_dp_tx_ext(ar, arvif, arsta, skb, held_ring);
+ }
+ 
++/**
++ * ath11k_dp_tx_one_buf() - TEST: send a linear frame through an extension
++ * descriptor of one buffer
++ * @ar: radio
++ * @arvif: vif of the frame
++ * @arsta: station of the frame
++ * @skb: the frame, linear
++ * @held_ring: TCL ring the caller holds, or -1
++ *
++ * Only with ext_one_buf set, for a plain TCP frame.
++ *
++ * Return: 0 when the frame is queued, -EAGAIN when it is to be sent the
++ * normal way.
++ */
++int ath11k_dp_tx_one_buf(struct ath11k *ar, struct ath11k_vif *arvif,
++			 struct ath11k_sta *arsta, struct sk_buff *skb,
++			 int held_ring)
++{
++	if (!READ_ONCE(ath11k_ext_one_buf))
++		return -EAGAIN;
++
++	return ath11k_dp_tx_ext(ar, arvif, arsta, skb, held_ring);
++}
++
+ /* A GSO frame from mac80211 is a batch of frames. The TCL takes a TCP batch
+  * whole; any other, and a batch the TCL cannot take, is split into frames
+  * here. The frames share the one status mac80211 expects, and the one airtime
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp_tx.h
+===================================================================
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/dp_tx.h
++++ backports-7.2/drivers/net/wireless/ath/ath11k/dp_tx.h
+@@ -28,6 +28,9 @@ int ath11k_dp_tx_gso(struct ath11k *ar,
+ 		     int held_ring);
+ int ath11k_dp_tx_sg(struct ath11k *ar, struct ath11k_vif *arvif,
+ 		    struct ath11k_sta *arsta, struct sk_buff *skb, int held_ring);
++int ath11k_dp_tx_one_buf(struct ath11k *ar, struct ath11k_vif *arvif,
++			 struct ath11k_sta *arsta, struct sk_buff *skb,
++			 int held_ring);
+ int ath11k_dp_tx_bufs_init(struct ath11k_base *ab, struct dp_tx_ring *tx_ring);
+ void ath11k_dp_tx_bufs_free(struct ath11k_base *ab, struct dp_tx_ring *tx_ring);
+ struct sk_buff *ath11k_dp_tx_buf_put_id(struct ath11k_base *ab,
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
+===================================================================
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/mac.c
++++ backports-7.2/drivers/net/wireless/ath/ath11k/mac.c
+@@ -6645,6 +6645,10 @@ static int ath11k_mac_tx(struct ieee8021
+ 			ieee80211_free_txskb(ar->hw, skb);
+ 			return -ENOMEM;
+ 		}
++	} else if (arsta &&
++		   !ath11k_dp_tx_one_buf(ar, arvif, arsta, skb, held_ring)) {
++		/* TEST: ext_one_buf */
++		return 0;
+ 	}
+ 
+ 	ret = ath11k_dp_tx(ar, arvif, arsta, skb, held_ring);
