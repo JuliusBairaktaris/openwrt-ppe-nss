@@ -352,11 +352,13 @@ static bool edma_rx_frag = true;
  */
 static bool edma_flow_gro = true;
 static u32 edma_flow_gro_segs = 8;
-/* TEST-ONLY: gro_buf (default on) joins a segment to the open aggregate from
- * its receive buffer, without an skb of its own; off builds the segment's skb
- * and coalesces it into the aggregate, as before. Read once per poll.
+/* TEST-ONLY: gro_buf (default off in the test image, so that a fault cannot
+ * crash-loop the router; the bench turns it on after boot) joins a segment to
+ * the open aggregate from its receive buffer, without an skb of its own; off
+ * builds the segment's skb and coalesces it into the aggregate, as before.
+ * Read once per poll.
  */
-static bool edma_gro_buf = true;
+static bool edma_gro_buf;
 /* TEST-ONLY: tx_prefetch (default on) starts the loads of the frames a
  * completion poll releases two completions ahead; read once per poll.
  */
