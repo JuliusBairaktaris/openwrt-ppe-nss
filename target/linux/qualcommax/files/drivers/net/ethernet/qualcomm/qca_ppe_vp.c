@@ -210,6 +210,91 @@ static struct ppe_vp_flow *ppe_vp_flow_lookup(struct qca_ppe_priv *priv,
 	return f;
 }
 
+/* The switch qca_ppe_vp_flow_tso() asks, while it has virtual ports, and the
+ * port a CPU last found for a netdev there.
+ */
+static struct qca_ppe_priv __rcu *ppe_vp_query;
+
+struct ppe_vp_query_last {
+	const struct net_device *dev;
+	unsigned int id;
+};
+
+static DEFINE_PER_CPU(struct ppe_vp_query_last, ppe_vp_query_last);
+
+/**
+ * qca_ppe_vp_flow_tso - whether the PPE takes a TCP stream's frames whole
+ * @dev: the bridge port the stream's frames arrive on
+ * @dest: the destination address of their Ethernet header
+ * @v6: the stream is of IPv6
+ * @saddr: its source address, 4 or 16 bytes
+ * @daddr: its destination address, 4 or 16 bytes
+ * @sport: its source port
+ * @dport: its destination port
+ *
+ * True when ppe_vp_hook() would hand a GSO frame of the stream to the engine
+ * now: the stream is a flow the PPE forwards with @dev's virtual port as its
+ * ingress, addressed to the bridge, the port takes GSO frames, and the flow is
+ * not held on the host's path. The engine cuts such a frame into its segments
+ * itself, whatever form the frame has, and adds the encapsulation of the
+ * egress (VLAN, PPPoE) to each. A frame the hook does not take, if the flow
+ * leaves meanwhile, takes the host's path and its segmentation there, which
+ * handles any form. Called from softirq context under RCU.
+ */
+bool qca_ppe_vp_flow_tso(const struct net_device *dev, const u8 *dest, bool v6,
+			 const void *saddr, const void *daddr, __be16 sport,
+			 __be16 dport)
+{
+	struct qca_ppe_priv *priv = rcu_dereference(ppe_vp_query);
+	struct ppe_vp_query_last *last;
+	struct ppe_vp_key key = {};
+	struct ppe_vp *vp = NULL;
+	struct ppe_vp_flow *f;
+	unsigned long hold;
+	unsigned int id;
+
+	if (!priv || !READ_ONCE(priv->vp_ingress) || !READ_ONCE(priv->vp_gso))
+		return false;
+
+	last = this_cpu_ptr(&ppe_vp_query_last);
+	if (last->dev == dev) {
+		vp = rcu_dereference(priv->vp[last->id]);
+		if (vp && vp->dev != dev)
+			vp = NULL;
+	}
+	for (id = priv->data->first_vport; !vp && id < PPE_MAX_VPORT; id++) {
+		vp = rcu_dereference(priv->vp[id]);
+		if (vp && vp->dev != dev)
+			vp = NULL;
+	}
+	if (!vp)
+		return false;
+	last->dev = dev;
+	last->id = vp->id;
+
+	if (!ether_addr_equal(dest, vp->br->dev_addr))
+		return false;
+
+	key.proto = IPPROTO_TCP;
+	key.v6 = v6;
+	memcpy(&key.addr.v6[0], saddr, v6 ? sizeof(struct in6_addr) : 4);
+	if (v6)
+		memcpy(&key.addr.v6[1], daddr, sizeof(struct in6_addr));
+	else
+		memcpy(&key.addr.v4[1], daddr, 4);
+	key.port[0] = sport;
+	key.port[1] = dport;
+	key.vp = vp->id;
+
+	f = ppe_vp_flow_lookup(priv, &key);
+	if (!f)
+		return false;
+
+	hold = READ_ONCE(f->hold);
+	return !hold || !time_before(jiffies, hold);
+}
+EXPORT_SYMBOL_GPL(qca_ppe_vp_flow_tso);
+
 /**
  * ppe_vp_flow_add - make a flow's frames stealable
  * @priv: the switch
@@ -843,9 +928,12 @@ int ppe_vp_init(struct qca_ppe_priv *priv)
 	if (ret) {
 		free_percpu(priv->vp_cache);
 		kvfree(priv->vp_hash);
+		return ret;
 	}
 
-	return ret;
+	rcu_assign_pointer(ppe_vp_query, priv);
+
+	return 0;
 }
 
 /**
@@ -858,6 +946,10 @@ int ppe_vp_init(struct qca_ppe_priv *priv)
 void ppe_vp_stop(struct qca_ppe_priv *priv)
 {
 	unsigned int id;
+
+	/* No query reads the switch once this returns: its tables go next. */
+	RCU_INIT_POINTER(ppe_vp_query, NULL);
+	synchronize_rcu();
 
 	unregister_netdevice_notifier(&priv->vp_nb);
 
