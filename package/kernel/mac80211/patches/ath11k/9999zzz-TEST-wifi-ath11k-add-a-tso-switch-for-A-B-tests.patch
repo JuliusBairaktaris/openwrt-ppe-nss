@@ -1,0 +1,132 @@
+TEST: wifi: ath11k: add a tso switch for A/B tests
+
+Test only, dropped before this is upstreamed. Add the module parameter
+tso (bool, 0644, default on). At load it decides whether the netdevs
+offer scatter-gather, TSO and frame lists; for each frame, off sends a
+TCP batch segmented in software and a frame with fragments made linear,
+as the stack would, so both paths can be compared in one boot.
+
+The test image also starts with the receive merge (rx_merge) and the
+switches of the changes new in it off (rx_refill_chunk, txq_wake_check,
+rx_merge_egress, rx_buf_join, rx_sync_buf), so that a fault in one cannot
+crash-loop the router; the bench turns them on after boot.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+--- a/drivers/net/wireless/ath/ath11k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_tx.c
+@@ -16,6 +16,15 @@
+ #include "peer.h"
+ #include "mac.h"
+ 
++/* TEST-ONLY switch for the A/B of the TCL segmentation and scatter-gather
++ * against the software path; dropped before this is upstreamed. Read when the
++ * radio is registered, for the netdev features, and for each frame: off, a
++ * batch is segmented and a frame with fragments made linear in the driver.
++ */
++static bool ath11k_tso = true;
++module_param_named(tso, ath11k_tso, bool, 0644);
++MODULE_PARM_DESC(tso, "Offer TSO and scatter-gather, and send frames from MSDU extension descriptors (default: on)");
++
+ /* TEST-ONLY switch for the A/B of frame list aggregates against the stack
+  * splitting them before the driver; read when the radio is registered.
+  * Dropped before this is upstreamed.
+@@ -33,7 +42,7 @@ bool ath11k_dp_tx_fraglist_wanted(struct
+ /* Whether the netdevs of this device offer TSO and scatter-gather */
+ bool ath11k_dp_tx_tso_wanted(struct ath11k_base *ab)
+ {
+-	return ab->hw_params.tx_tso;
++	return ab->hw_params.tx_tso && READ_ONCE(ath11k_tso);
+ }
+ 
+ static enum hal_tcl_encap_type
+@@ -714,7 +723,7 @@ static int ath11k_dp_tx_ext(struct ath11
+ 	unsigned int pad;
+ 	int i, j;
+ 
+-	if (!ab->hw_params.tx_tso ||
++	if (!READ_ONCE(ath11k_tso) || !ab->hw_params.tx_tso ||
+ 	    !(info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP) ||
+ 	    ath11k_dp_tx_get_encap_type(arvif, skb) != HAL_TCL_ENCAP_TYPE_ETHERNET ||
+ 	    (!tso && skb_has_frag_list(skb)) ||
+--- a/drivers/net/wireless/ath/ath11k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
+@@ -639,10 +639,10 @@ MODULE_PARM_DESC(rx_refill_early,
+ /* TEST-ONLY switch for the A/B of the refill that takes the buffer table
+  * lock once per chunk of buffers; dropped before this is upstreamed.
+  */
+-static bool ath11k_rx_refill_chunk = true;
++static bool ath11k_rx_refill_chunk;
+ module_param_named(rx_refill_chunk, ath11k_rx_refill_chunk, bool, 0644);
+ MODULE_PARM_DESC(rx_refill_chunk,
+-		 "Give the refill buffers their ids under one hold of the buffer table lock per chunk (default: on)");
++		 "Give the refill buffers their ids under one hold of the buffer table lock per chunk (default: off)");
+ 
+ /* The refill takes buffer ids for this many buffers under one hold of the
+  * buffer table lock, which the reaps of every REO ring take too.
+@@ -653,10 +653,10 @@ MODULE_PARM_DESC(rx_refill_chunk,
+  * buffer the device writes; off cleans the whole buffer, the shared info
+  * space included. Dropped before this is upstreamed.
+  */
+-static bool ath11k_rx_sync_buf = true;
++static bool ath11k_rx_sync_buf;
+ module_param_named(rx_sync_buf, ath11k_rx_sync_buf, bool, 0644);
+ MODULE_PARM_DESC(rx_sync_buf,
+-		 "Clean only the bytes of a refill buffer the device writes before it gets the buffer (default: on)");
++		 "Clean only the bytes of a refill buffer the device writes before it gets the buffer (default: off)");
+ 
+ /* A buffer for the refill of @rx_ring, as its table entry, and the address
+  * the device writes it at, or NULL. A buffer of the page pool gets no skb:
+@@ -3347,10 +3347,10 @@ free_out:
+ /* TEST-ONLY switch for the A/B of the merge of the TCP segments a station
+  * sends; dropped before this is upstreamed.
+  */
+-static bool ath11k_rx_merge = true;
++static bool ath11k_rx_merge;
+ module_param_named(rx_merge, ath11k_rx_merge, bool, 0644);
+ MODULE_PARM_DESC(rx_merge,
+-		 "Merge the consecutive TCP segments of a stream of a station in a REO reap into one frame (default: on)");
++		 "Merge the consecutive TCP segments of a stream of a station in a REO reap into one frame (default: off)");
+ 
+ /* The headers of a TCP segment in an Ethernet frame. */
+ struct ath11k_dp_rx_tcp {
+@@ -3683,10 +3683,10 @@ static bool ath11k_dp_rx_merge_join(stru
+ /* TEST-ONLY switch for the A/B of the join of a segment from its receive
+  * buffer, without an skb of its own; dropped before this is upstreamed.
+  */
+-static bool ath11k_rx_buf_join = true;
++static bool ath11k_rx_buf_join;
+ module_param_named(rx_buf_join, ath11k_rx_buf_join, bool, 0644);
+ MODULE_PARM_DESC(rx_buf_join,
+-		 "Join a TCP segment to the run of its stream from its receive buffer, without an skb of its own (default: on)");
++		 "Join a TCP segment to the run of its stream from its receive buffer, without an skb of its own (default: off)");
+ 
+ /* Appends segment @t of the MSDU in buffer @va, whose receive state is @rxcb,
+  * received with @status, to a run with fragments when it is the run's next
+@@ -3733,10 +3733,10 @@ static bool ath11k_dp_rx_merge_join_buf(
+ /* TEST-ONLY switch for the A/B of the run form picked by the bridge port a
+  * run leaves by; dropped before this is upstreamed.
+  */
+-static bool ath11k_rx_merge_egress = true;
++static bool ath11k_rx_merge_egress;
+ module_param_named(rx_merge_egress, ath11k_rx_merge_egress, bool, 0644);
+ MODULE_PARM_DESC(rx_merge_egress,
+-		 "Merge a bridged TCP stream into a frame with fragments when the bridge port it leaves by segments it in hardware (default: on)");
++		 "Merge a bridged TCP stream into a frame with fragments when the bridge port it leaves by segments it in hardware (default: off)");
+ 
+ /* The bridge port a run of @t received on @dev leaves by, as the bridge's own
+  * address table says for its destination: the bridge @dev is a port of, the
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -10382,10 +10382,10 @@ static void ath11k_mac_txq_work(struct w
+ /* TEST-ONLY switch for the A/B of the wake that skips the atomics when the
+  * push is already due; dropped before this is upstreamed.
+  */
+-static bool ath11k_txq_wake_check = true;
++static bool ath11k_txq_wake_check;
+ module_param_named(txq_wake_check, ath11k_txq_wake_check, bool, 0644);
+ MODULE_PARM_DESC(txq_wake_check,
+-		 "Wake a TXQ without an atomic when its AC is marked and its push work pending (default: on)");
++		 "Wake a TXQ without an atomic when its AC is marked and its push work pending (default: off)");
+ 
+ static void ath11k_mac_op_wake_tx_queue(struct ieee80211_hw *hw,
+ 					struct ieee80211_txq *txq)
