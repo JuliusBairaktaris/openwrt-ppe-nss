@@ -957,11 +957,11 @@ static void edma_rx_slow(struct edma_queue *q, struct sk_buff *skb,
 		}
 	}
 
+	/* An aggregate takes the same way as a single frame, so it cannot
+	 * pass the frames of its flow that GRO still holds for the poll.
+	 */
 	edma_rx_netstats(netdev, segs, bytes);
-	if (skb_is_gso(skb))
-		netif_receive_skb(skb);
-	else
-		napi_gro_receive(&q->napi, skb);
+	napi_gro_receive(&q->napi, skb);
 }
 
 /* The headers of a TCP data segment of an IPv4 or IPv6 frame that carries
