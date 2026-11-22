@@ -1,0 +1,50 @@
+From: Julius Bairaktaris <julius@bairaktaris.de>
+Subject: [PATCH] wifi: ath11k: write the TCL command of an extension descriptor frame after its TLV header
+
+ath11k_hal_srng_src_get_next_entry() returns a u32 pointer, so adding
+sizeof(struct hal_tlv_hdr) to it moves 16 bytes into the entry, not 4.
+The extension descriptor send path did that, and wrote its TCL data
+command 12 bytes past where the normal path (which adds to a void
+pointer) and the TCL expect it. A TCL data ring entry is the 4 byte TLV
+header and the 28 byte command (hal.c), so the TCL read for such a frame
+the buffer address, cookie and descriptor type left in the entry by the
+frame that used it before, followed by the first words of the new
+command in place of its lengths and flags; the last 12 bytes of the
+command went into the TLV header and buffer address of the next entry,
+or past the end of the ring for its last entry.
+
+That matches what the bench showed for extension descriptor frames: the
+frame is not transmitted, its own cookie never completes, and the
+firmware later releases a cookie of an older frame.
+
+Write the command after the TLV header, as the normal path does.
+
+Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+Index: backports-7.2/drivers/net/wireless/ath/ath11k/dp_tx.c
+===================================================================
+--- backports-7.2.orig/drivers/net/wireless/ath/ath11k/dp_tx.c
++++ backports-7.2/drivers/net/wireless/ath/ath11k/dp_tx.c
+@@ -1145,6 +1145,8 @@ static int ath11k_dp_tx_ext(struct ath11
+ 	ti.data_len = sizeof(struct hal_tx_msdu_ext);
+ 
+ 	for (i = 0; i < n; i++) {
++		void *desc;
++
+ 		ti.desc_id = FIELD_PREP(DP_TX_DESC_ID_MAC_ID, ar->pdev_idx) |
+ 			     FIELD_PREP(DP_TX_DESC_ID_MSDU_ID,
+ 					ath11k_dp_tx_id_cookie(tx_ring, ids[i])) |
+@@ -1154,9 +1156,10 @@ static int ath11k_dp_tx_ext(struct ath11
+ 		ti.paddr = tx_ring->ext_paddr +
+ 			   ath11k_dp_tx_ext_off(tx_ring, slots[i]);
+ 		tx_ring->id_addr[ids[i]] = ti.paddr;
+-		ath11k_hal_tx_cmd_desc_setup(ab,
+-					     ath11k_hal_srng_src_get_next_entry(ab, tcl_ring) +
+-					     sizeof(struct hal_tlv_hdr), &ti);
++		/* the command follows the TLV header of the ring entry */
++		desc = ath11k_hal_srng_src_get_next_entry(ab, tcl_ring);
++		ath11k_hal_tx_cmd_desc_setup(ab, desc + sizeof(struct hal_tlv_hdr),
++					     &ti);
+ 	}
+ 
+ 	if (held_ring < 0) {
