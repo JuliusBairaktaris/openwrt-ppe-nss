@@ -359,20 +359,24 @@ static bool edma_rx_frag = true;
  */
 static bool edma_flow_gro = true;
 static u32 edma_flow_gro_segs = 8;
-/* TEST-ONLY: gro_buf (default on) joins a segment to the open aggregate from
- * its receive buffer, without an skb of its own; off builds the segment's skb
- * and coalesces it into the aggregate, as before. Read once per poll.
+/* TEST-ONLY: gro_buf (default off in the test image, so that a fault cannot
+ * crash-loop the router; the bench turns it on after boot) joins a segment to
+ * the open aggregate from its receive buffer, without an skb of its own; off
+ * builds the segment's skb and coalesces it into the aggregate, as before.
+ * Read once per poll.
  */
-static bool edma_gro_buf = true;
+static bool edma_gro_buf;
 /* TEST-ONLY: tx_prefetch (default on) starts the loads of the frames a
  * completion poll releases two completions ahead; read once per poll.
  */
 static bool edma_tx_prefetch = true;
-/* TEST-ONLY: tx_shadow (default on) releases a transmit frame with the
- * addresses and lengths kept beside its descriptors in cached memory; off
- * reads them back from the descriptors. Read once per poll.
+/* TEST-ONLY: tx_shadow (default off in the test image, so that a fault cannot
+ * crash-loop the router; the bench turns it on after boot) releases a
+ * transmit frame with the addresses and lengths kept beside its descriptors
+ * in cached memory; off reads them back from the descriptors. Read once per
+ * poll.
  */
-static bool edma_tx_shadow = true;
+static bool edma_tx_shadow;
 static struct dentry *edma_dbg;
 
 /* Fills the ring with every buffer the ring has room for. The buffers the
