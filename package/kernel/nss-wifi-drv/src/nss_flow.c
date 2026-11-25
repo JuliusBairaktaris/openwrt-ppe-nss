@@ -32,6 +32,7 @@
 #include <linux/soc/qcom/nss_wifi.h>
 #include <net/flow_offload.h>
 #include <net/netfilter/nf_conntrack.h>
+#include <net/netfilter/nf_conntrack_acct.h>
 #include <net/netfilter/nf_flow_table.h>
 #include <net/dsa.h>
 #include <net/pkt_cls.h>
@@ -115,6 +116,7 @@ struct nss_flow_entry {
 	enum flow_offload_tuple_dir pppoe_dir;	/* the side that is PPPoE */
 	u64 lastused;
 	u64 cnt[4];	/* flow rx, flow tx, return rx, return tx */
+	struct nf_conn *ct;	/* held for the counters; none when bridged */
 	union {
 		struct nss_ipv4_5tuple t4;
 		struct nss_ipv6_5tuple t6;
@@ -929,13 +931,23 @@ static void nss_flow_withdraw(struct nss_core *core, struct nss_flow_entry *e)
 	e->installed = false;
 }
 
+/* The receive poll may still be adding a record to the connection. */
+static void nss_flow_free_rcu(struct rcu_head *head)
+{
+	struct nss_flow_entry *e = container_of(head, struct nss_flow_entry, rcu);
+
+	if (e->ct)
+		nf_ct_put(e->ct);
+	kfree(e);
+}
+
 static void nss_flow_forget(struct nss_core *core, struct nss_flow_entry *e)
 {
 	rhashtable_remove_fast(&nss_flow_table, &e->node, nss_flow_ht_params);
 	nss_flow_withdraw(core, e);
 	if (e->pppoe)
 		nss_flow_pppoe_put(core, e->pppoe);
-	kfree_rcu(e, rcu);
+	call_rcu(&e->rcu, nss_flow_free_rcu);
 }
 
 static int nss_flow_replace(struct nss_core *core, struct flow_cls_offload *f)
@@ -1027,6 +1039,14 @@ static int nss_flow_replace(struct nss_core *core, struct flow_cls_offload *f)
 		goto drop;
 	}
 
+	/* The firmware's last record of a connection can arrive after the
+	 * flow table has let go of it, so the entry holds its own reference.
+	 */
+	if (!e->ct) {
+		nf_conntrack_get(&flow->ct->ct_general);
+		e->ct = flow->ct;
+	}
+
 	ret = nss_flow_pppoe_take(core, e);
 	if (ret) {
 		nss_flow_reject_at(NSS_FLOW_REJECT_FIRMWARE, ret, f, -ret);
@@ -1090,6 +1110,24 @@ static bool nss_flow_is_v6(const struct nss_flow_entry *e,
 	       e->t6.return_ident == r->return_ident;
 }
 
+/* Add what a record says the firmware forwarded since its previous record
+ * to the connection's counters. A rule's flow end is where the original
+ * direction comes from and its return end the reply, so what the firmware
+ * received from each end is that direction's traffic.
+ */
+static void nss_flow_credit(const struct nss_flow_entry *e, u32 flow_pkts,
+			    u32 flow_bytes, u32 return_pkts, u32 return_bytes)
+{
+	if (!e->ct)
+		return;
+
+	if (flow_pkts)
+		nf_ct_acct_add(e->ct, IP_CT_DIR_ORIGINAL, flow_pkts, flow_bytes);
+	if (return_pkts)
+		nf_ct_acct_add(e->ct, IP_CT_DIR_REPLY, return_pkts,
+			       return_bytes);
+}
+
 /* A record from the firmware's sweep marks its connection recently used if
  * any of its four counters moved since the previous sweep, and gone if the
  * firmware flushed or evicted it, so that no destroy follows for it.
@@ -1120,6 +1158,9 @@ static void nss_flow_sync_mark_v4(const struct nss_ipv4_conn_sync *r)
 		e->cnt[1] += r->flow_tx_packet_count;
 		e->cnt[2] += r->return_rx_packet_count;
 		e->cnt[3] += r->return_tx_packet_count;
+		nss_flow_credit(e, r->flow_rx_packet_count, r->flow_rx_byte_count,
+				r->return_rx_packet_count,
+				r->return_rx_byte_count);
 		break;
 	}
 	rhashtable_walk_stop(&iter);
@@ -1152,6 +1193,9 @@ static void nss_flow_sync_mark_v6(const struct nss_ipv6_conn_sync *r)
 		e->cnt[1] += r->flow_tx_packet_count;
 		e->cnt[2] += r->return_rx_packet_count;
 		e->cnt[3] += r->return_tx_packet_count;
+		nss_flow_credit(e, r->flow_rx_packet_count, r->flow_rx_byte_count,
+				r->return_rx_packet_count,
+				r->return_rx_byte_count);
 		break;
 	}
 	rhashtable_walk_stop(&iter);
@@ -1162,6 +1206,11 @@ static void nss_flow_sync_mark_v6(const struct nss_ipv6_conn_sync *r)
  * with a sync carrying the reason. Its rule is gone: a destroy for it is
  * refused, and the flow table's next refresh has to push it again. From the
  * receive poll, so the table is read under RCU without a walker.
+ *
+ * The sync also carries what the connection moved since its last record,
+ * and for a short transfer that can be all of it: the firmware flushes a
+ * TCP connection at its FIN, before any sweep came round to it, and the
+ * flow table asks nothing of a flow it is closing.
  */
 void nss_flow_notify(const struct nss_cmn_msg *ncm, u32 len)
 {
@@ -1171,6 +1220,7 @@ void nss_flow_notify(const struct nss_cmn_msg *ncm, u32 len)
 	const struct bucket_table *tbl;
 	struct nss_flow_entry *e;
 	struct rhash_head *pos;
+	u32 fp, fb, rp, rb;	/* received from the flow and the return end */
 	u32 i;
 
 	m4 = container_of_const(ncm, struct nss_ipv4_msg, cm);
@@ -1184,12 +1234,20 @@ void nss_flow_notify(const struct nss_cmn_msg *ncm, u32 len)
 		    (m4->msg.conn_stats.reason != NSS_IPV4_RULE_SYNC_REASON_FLUSH &&
 		     m4->msg.conn_stats.reason != NSS_IPV4_RULE_SYNC_REASON_EVICT))
 			return;
+		fp = m4->msg.conn_stats.flow_rx_packet_count;
+		fb = m4->msg.conn_stats.flow_rx_byte_count;
+		rp = m4->msg.conn_stats.return_rx_packet_count;
+		rb = m4->msg.conn_stats.return_rx_byte_count;
 	} else if (iface == NSS_INTERFACE_IPV6) {
 		if (ncm->type != NSS_IPV6_RX_CONN_STATS_SYNC_MSG ||
 		    len < offsetofend(struct nss_ipv6_msg, msg.conn_stats) ||
 		    (m6->msg.conn_stats.reason != NSS_IPV6_RULE_SYNC_REASON_FLUSH &&
 		     m6->msg.conn_stats.reason != NSS_IPV6_RULE_SYNC_REASON_EVICT))
 			return;
+		fp = m6->msg.conn_stats.flow_rx_packet_count;
+		fb = m6->msg.conn_stats.flow_rx_byte_count;
+		rp = m6->msg.conn_stats.return_rx_packet_count;
+		rb = m6->msg.conn_stats.return_rx_byte_count;
 	} else {
 		return;
 	}
@@ -1198,11 +1256,17 @@ void nss_flow_notify(const struct nss_cmn_msg *ncm, u32 len)
 	for (tbl = rht_dereference_rcu(nss_flow_table.tbl, &nss_flow_table);
 	     tbl; tbl = rht_dereference_rcu(tbl->future_tbl, &nss_flow_table))
 		for (i = 0; i < tbl->size; i++)
-			rht_for_each_entry_rcu(e, pos, tbl, i, node)
+			rht_for_each_entry_rcu(e, pos, tbl, i, node) {
 				if (iface == NSS_INTERFACE_IPV4 ?
-				    nss_flow_is_v4(e, &m4->msg.conn_stats) :
-				    nss_flow_is_v6(e, &m6->msg.conn_stats))
-					WRITE_ONCE(e->installed, false);
+				    !nss_flow_is_v4(e, &m4->msg.conn_stats) :
+				    !nss_flow_is_v6(e, &m6->msg.conn_stats))
+					continue;
+				/* Once: a sweep may have seen it go first. */
+				if (!READ_ONCE(e->installed))
+					continue;
+				WRITE_ONCE(e->installed, false);
+				nss_flow_credit(e, fp, fb, rp, rb);
+			}
 	rcu_read_unlock();
 }
 
@@ -1627,7 +1691,7 @@ void nss_flow_flush(void)
 			continue;
 		rhashtable_remove_fast(&nss_flow_table, &e->node,
 				       nss_flow_ht_params);
-		kfree_rcu(e, rcu);
+		call_rcu(&e->rcu, nss_flow_free_rcu);
 	}
 	rhashtable_walk_stop(&iter);
 	rhashtable_walk_exit(&iter);
@@ -1656,7 +1720,11 @@ int nss_flow_init(void)
 
 static void nss_flow_free(void *ptr, void *arg)
 {
-	kfree(ptr);
+	struct nss_flow_entry *e = ptr;
+
+	if (e->ct)
+		nf_ct_put(e->ct);
+	kfree(e);
 }
 
 void nss_flow_exit(void)
@@ -1666,5 +1734,7 @@ void nss_flow_exit(void)
 
 	flow_indr_dev_unregister(nss_flow_indr_cb, &nss_flow_blocks, NULL);
 	rhashtable_free_and_destroy(&nss_flow_table, nss_flow_free, NULL);
+	/* The entries already forgotten are freed from callbacks in here. */
+	rcu_barrier();
 	nss_flow_ready = false;
 }
