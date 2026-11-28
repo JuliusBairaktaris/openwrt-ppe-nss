@@ -1199,8 +1199,18 @@ MODULE_PARM_DESC(cpu_xmit,
  * driver only queues them on the device. The device has to take Ethernet
  * frames as the nexthop builds them, with no tag or session to push.
  */
-static bool ppe_cpu_xmit_ok(const struct ppe_flow_data *data)
+static bool ppe_cpu_xmit_ok(struct qca_ppe_priv *priv,
+			    const struct ppe_flow_data *data)
 {
+	/* Only while the host receives from the CPU port. A running NSS core
+	 * receives from it instead, and hands a frame it does not forward to
+	 * the host as a receive on the port the frame came in on: already
+	 * translated, with this flow's egress addresses, where nothing
+	 * forwards it. The carrier callback is set while such a core runs.
+	 */
+	if (rcu_access_pointer(priv->fw_carries))
+		return false;
+
 	return ppe_cpu_xmit && data->odev->type == ARPHRD_ETHER &&
 	       !data->vlan_valid && !data->pppoe_valid;
 }
@@ -2066,7 +2076,7 @@ static int ppe_flow_alloc_egress(struct qca_ppe_priv *priv,
 	bool push;
 
 	port = ppe_flow_port_by_ifindex(priv, data->odev->ifindex);
-	if (port < 0 && ppe_cpu_xmit_ok(data)) {
+	if (port < 0 && ppe_cpu_xmit_ok(priv, data)) {
 		port = QCA_PPE_CPU_PORT;
 		entry->xdev = data->odev->ifindex;
 	}
